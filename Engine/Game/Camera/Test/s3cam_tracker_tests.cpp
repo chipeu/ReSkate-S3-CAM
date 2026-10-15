@@ -30,7 +30,7 @@ ScalarTracker::Settings base() {
 }
 
 void convergence() {
-    const float dt = 1.0f / 120.0f;
+    const float dt = fixed_step;
     ScalarTracker t;
     t.reset(0);
     const auto s = base(); // overshoot_zeroes_velocity is on
@@ -41,7 +41,7 @@ void convergence() {
     // A moving target reversed mid-flight must not carry velocity past it.
     ScalarTracker u;
     u.reset(0);
-    for (int i = 0; i < 120; ++i) u.update(5.0f, dt, s);
+    for (int i = 0; i < 60; ++i) u.update(5.0f, dt, s);
     expect(u.position() > 1.5f && u.velocity() > 0, "moving past the new target before the reversal");
     float low = u.position();
     for (int i = 0; i < 2000; ++i) low = std::min(low, u.update(1.0f, dt, s));
@@ -50,7 +50,7 @@ void convergence() {
 }
 
 void clamps() {
-    const float dt = 1.0f / 120.0f;
+    const float dt = fixed_step;
     ScalarTracker t;
     t.reset(0);
     auto s = base();
@@ -76,7 +76,7 @@ void clamps() {
 }
 
 void umbra_penumbra() {
-    const float dt = 1.0f / 120.0f;
+    const float dt = fixed_step;
     const auto s = base();
     ScalarTracker inside;
     inside.reset(0);
@@ -103,7 +103,7 @@ void umbra_penumbra() {
 }
 
 void angle_wrapping() {
-    const float dt = 1.0f / 120.0f;
+    const float dt = fixed_step;
     AngleTracker::Settings s;
     s.speed_clamp_degrees = 720;
     s.acceleration_min_degrees = s.acceleration_max_degrees = 5000;
@@ -135,7 +135,7 @@ void angle_wrapping() {
     slow.speed_clamp_degrees = 90;
     slow.acceleration_min_degrees = slow.acceleration_max_degrees = 100000;
     slow.delta_penumbra_degrees = 10;
-    for (int i = 0; i < 120; ++i) w.update(pi - 0.01f, dt, slow);
+    for (int i = 0; i < 60; ++i) w.update(pi - 0.01f, dt, slow);
     expect(near(w.position(), 90 * degrees, 0.05f), "speed clamp is in degrees per second");
 }
 

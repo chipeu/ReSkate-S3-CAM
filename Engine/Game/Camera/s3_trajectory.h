@@ -29,6 +29,7 @@ struct GroundHit {
 // The game backs it with a physics ray (Rust: world_query::line); tests back it with analytic ground.
 template <class Query>
 concept GroundQuery = std::invocable<Query&, const Vec3&, const Vec3&> &&
+                      std::is_nothrow_invocable_v<Query&, const Vec3&, const Vec3&> && // CameraMan::update is noexcept
                       std::convertible_to<std::invoke_result_t<Query&, const Vec3&, const Vec3&>, std::optional<GroundHit>>;
 
 struct TrajectorySettings {

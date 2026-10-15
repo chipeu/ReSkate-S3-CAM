@@ -32,9 +32,9 @@
 // Order of operations per FIXED step (CLAUDE.md hard rule 4):
 //   prepare (air / landing, then incline) -> graph select -> shot blend -> rig -> orientation and
 //   framing -> shake -> write.
-// update() takes the real frame dt, runs as many fixed steps as the accumulator holds (CLAUDE.md
-// hard rule 5; the subject is interpolated between the previous and current snapshot across them)
-// and returns the pose interpolated between the last two steps. Trackers, blends and shake never
+// update() takes the real frame dt, runs as many fixed 1/60 s steps (s3_math.h fixed_step, the Rust
+// camera STEP) as the accumulator holds (CLAUDE.md hard rule 5; the subject is interpolated between
+// the previous and current snapshot across them) and returns the pose interpolated between the last two steps. Trackers, blends and shake never
 // see the frame dt.
 //
 // Conventions: world is Y up. Heading 0 looks down +Z and grows toward -X (heading = atan2(-x, z)).
@@ -185,19 +185,24 @@ public:
             cut_to(subject, ground);
             dbg.reset = true;
         } else {
-            const float step = 1.0f / settings_.fixed_hz;
+            const float step = fixed_step;
             const float carry = acc_;
-            acc_ += dt;
+            // Clamp BEFORE the int cast: a huge dt would overflow it (undefined) and freeze the camera.
+            const float limit = static_cast<float>(pipe.max_steps_per_update + 1) * step;
+            const bool capped = carry + dt >= limit; // a long stall: the steps are capped below
+            acc_ = std::min(carry + dt, limit);
             int steps = static_cast<int>(std::floor(acc_ / step));
-            if (steps > pipe.max_steps_per_update) { // a long stall: drop the surplus rather than spiral
-                const float fraction = acc_ - static_cast<float>(steps) * step;
+            if (steps > pipe.max_steps_per_update) { // drop the surplus rather than spiral
+                const float fraction = std::max(0.0f, acc_ - static_cast<float>(steps) * step);
                 steps = pipe.max_steps_per_update;
                 acc_ = static_cast<float>(steps) * step + fraction;
             }
             for (int i = 1; i <= steps; ++i) {
                 // Where in this frame's interval the step lands: the sim clock lags the snapshot clock
                 // by the accumulator carried in, so the subject is interpolated, never extrapolated.
-                const float f = dt > 0.0f ? clamp01((static_cast<float>(i) * step - carry) / dt) : 1.0f;
+                // When the cap dropped steps the survivors cover (0, 1] evenly instead of stopping short.
+                const float f = capped ? static_cast<float>(i) / static_cast<float>(steps)
+                                       : dt > 0.0f ? clamp01((static_cast<float>(i) * step - carry) / dt) : 1.0f;
                 const SubjectSnapshot sub_snap = blend_snapshot(cur_snap_, subject, f);
                 step_once(sub_snap, ground, false);
             }
@@ -267,6 +272,13 @@ private:
         const Vec3 com = add(root, {0, p.com_height, 0});
         return {add(root, {0, p.head_height, 0}), root, board, com, board, trajectory, root, board, com, root};
     }
+    // The point the rig orbits (Rust: subject.anchors[shot.anchor], manager.rs bind_anchor). It does not
+    // depend on the shot's reference weights, so a shot change cannot move the camera's height; the
+    // weighted reference point below only feeds the framing.
+    Vec3 anchor_point(const SubjectSnapshot& s) const noexcept {
+        const SubjectPointSettings& p = settings_.points;
+        return add(s.position, {0.0f, p.anchor_height - p.board_drop, 0.0f});
+    }
     // Weighted mean of the reference points (reference_point() in shot.rs); the board if the weights vanish.
     static Vec3 weighted_point(const std::array<Vec3, 10>& points, const Shot& shot) noexcept {
         Vec3 sum{0, 0, 0};
@@ -312,7 +324,7 @@ private:
     void step_once(const SubjectSnapshot& s, Query& ground, bool snap) noexcept {
         using camera_detail::finite3;
         const CameraSettings& cs = settings_;
-        const float dt = 1.0f / cs.fixed_hz;
+        const float dt = fixed_step;
         const bool native = cs.preset == CameraPreset::NativePlus;
         const bool air = s.air();
         const bool grounded = !air;
@@ -324,17 +336,19 @@ private:
         const float horizontal_speed = length({s.velocity[0], 0.0f, s.velocity[2]});
 
         if (snap) {
-            // A cut has no previous shot, but the anchor height below needs this frame's reference
-            // weights: resolve the shot the graph would pick first.
+            // A cut has no previous shot, but the framing below needs this frame's shot: resolve the
+            // one the graph would pick first.
             graph_.reset();
             const GraphOutput first = graph_.select(graph_input(s, dt, false, 0.0f, speed, normal), cs.graph);
             graph_.reset();
             angle_ = cs.angle;
-            leaf_ = resolve_shot(first.shot, angle_, first.chase_blend);
+            id_ = first.shot;
+            shots_ = lookup_shots(id_, angle_);
+            leaf_ = blend_shots(shots_, first.chase_blend);
             current_ = from_ = leaf_;
         }
         const std::array<Vec3, 10> points = reference_points(s);
-        const Vec3 reference = weighted_point(points, current_);
+        const Vec3 anchor_pt = anchor_point(s);
 
         // ---- forward acceleration -> pump / push (decision 2)
         if (!accel_ready_) {
@@ -366,6 +380,7 @@ private:
         const bool entered_air = air && (!was_air_ || snap);
         if (entered_air) {
             air_time_ = 0.0f;
+            flight_max_height_ = 0.0f;
             takeoff_surface_y_ = s.position[1] - last_clearance_;
             repredict_timer_ = 0.0f;
             predict(s, ground);
@@ -386,10 +401,10 @@ private:
         air_in.trajectory_time = air_time_;
         air_in.velocity = s.velocity;
         air_in.ground_normal = normal;
-        air_in.anchor_height = reference[1];
+        air_in.anchor_height = anchor_pt[1];
         air_in.follow_anchor_in_air = current_.follow_subject_in_air;
         air_in.snap_height = snap;
-        if (snap) air_.reset(reference[1], grounded);
+        if (snap) air_.reset(anchor_pt[1], grounded);
         const AirOutput air_out = air_.update(dt, air_in, cs.air);
         if (air_out.landing) {
             shake_.landing_impulse(air_out.landing->normal, air_out.landing->velocity, cs.shake);
@@ -399,14 +414,17 @@ private:
         incline_degrees_ = incline_of(s, normal);
 
         // ---- graph select
-        const float max_height = air && prediction_.status != TrajectoryStatus::Invalid
-                                     ? std::max(0.0f, prediction_.predicted_max_height + prediction_offset_)
-                                     : 0.0f;
+        // The apex is latched over the flight: after the apex a re-prediction reports the current
+        // height as its apex, which would flip Big back to Normal on the way down.
+        if (air && prediction_.status != TrajectoryStatus::Invalid)
+            flight_max_height_ = std::max(flight_max_height_, prediction_.predicted_max_height + prediction_offset_);
+        const float max_height = air ? flight_max_height_ : 0.0f;
         const GraphOutput pick = graph_.select(graph_input(s, dt, touchdown, max_height, speed, normal), cs.graph);
 
         // ---- shot blend (shot_manager.rs: previous = interpolated at the change, eased by elapsed/duration)
         const bool changed = snap || pick.shot != id_ || cs.angle != angle_;
-        leaf_ = resolve_shot(pick.shot, cs.angle, pick.chase_blend);
+        if (changed) shots_ = lookup_shots(pick.shot, cs.angle); // cached until the selection changes
+        leaf_ = blend_shots(shots_, pick.chase_blend);
         if (changed) {
             from_ = snap ? leaf_ : current_;
             shot_elapsed_ = 0.0f;
@@ -418,7 +436,7 @@ private:
         shot_fraction_ = shot_duration_ <= 0.0f ? 1.0f : clamp01(shot_elapsed_ / shot_duration_);
         current_ = interpolate(from_, leaf_, shot_fraction_);
         current_.position_heading = blend_angle(from_.position_heading, leaf_.position_heading, sine_blend(shot_fraction_));
-        const Vec3 reference_now = weighted_point(points, current_); // the blended weights, for framing
+        const Vec3 reference_now = weighted_point(points, current_); // the blended weights: framing only
 
         // ---- rig (FullS3) / native layers (NativePlus), orientation and framing
         StepOut out;
@@ -427,7 +445,7 @@ private:
         const float roll_step = std::min(1.0f, cs.orientation.roll_response * dt);
         if (!native) {
             RigInput ri;
-            ri.anchor.position = reference_now;
+            ri.anchor.position = anchor_pt;
             ri.anchor.reference_height = air_out.reference_height;
             ri.anchor.velocity = s.velocity;
             ri.anchor.push_state = push_state;
@@ -443,7 +461,9 @@ private:
             ri.compass.crouching = s.physics_state == physics_state::crouch;
             ri.heading_from_compass = true;
             ri.shot_heading = current_.position_heading;
+            ri.heading_smoothing = current_.smoothing[0];   // manager_rig.rs bind_shot: direction smoothing
             ri.elevation_target = current_.position_elevation;
+            ri.elevation_smoothing = current_.smoothing[1]; // and elevation smoothing
             ri.distance.target = current_.distance;
             ri.distance.fast = air || pick.landing_active || s.bailing; // TUNE: the fast set where the view must keep up
             ri.distance.wipeout = s.bailing;
@@ -474,7 +494,10 @@ private:
                 pitch_target = std::asin(std::min(to_ref[1] / to_len, ceiling));
             }
             yaw_target = wrap_angle(yaw_target + current_.framing[1]);
-            pitch_target = std::clamp(pitch_target - current_.framing[2], -89.0f * degrees, 89.0f * degrees); // authored negative pitch looks up (21-low-camera.md)
+            // frame_composer.rs: pitch = -framing[2] is applied in the look basis (columns right, up, at),
+            // which tilts the view DOWN by that angle, so a positive authored pitch looks up from the
+            // camera-to-reference line and a negative one (the Low shots) looks down.
+            pitch_target = std::clamp(pitch_target + current_.framing[2], -89.0f * degrees, 89.0f * degrees);
             if (snap) {
                 pan_.reset(yaw_target);
                 tilt_.reset(pitch_target);
@@ -492,7 +515,7 @@ private:
         } else {
             if (snap) roll_ = current_.framing[0];
             else roll_ += (current_.framing[0] - roll_) * roll_step;
-            const float hold = cs.native_plus.air_hold ? air_out.reference_height - reference[1] : 0.0f;
+            const float hold = cs.native_plus.air_hold ? air_out.reference_height - anchor_pt[1] : 0.0f;
             // Critically damped spring, semi-implicit Euler (stable: omega * dt << 1).
             const float omega = 1.0f / cs.native_plus.dip_peak_time;
             dip_v_ += (-2.0f * omega * dip_v_ - omega * omega * dip_x_) * dt;
@@ -519,7 +542,7 @@ private:
         last_push_state_ = push_state;
         last_push_kick_ = push_kick;
         kick_in_update_ = kick_in_update_ || push_kick;
-        last_hold_ = air_out.reference_height - reference[1];
+        last_hold_ = air_out.reference_height - anchor_pt[1];
         if (out.finite()) {
             prev_out_ = curr_out_;
             curr_out_ = out;
@@ -589,7 +612,7 @@ private:
     // The frame from the last two steps, interpolated by the accumulator.
     void publish(FrameDebug dbg, const NativePose* native_pose) noexcept {
         using namespace camera_detail;
-        const float alpha = clamp01(acc_ * settings_.fixed_hz);
+        const float alpha = clamp01(acc_ * fixed_hz);
         StepOut o;
         o.pos = lerp(prev_out_.pos, curr_out_.pos, alpha);
         o.yaw = blend_angle(prev_out_.yaw, curr_out_.yaw, alpha);
@@ -643,7 +666,7 @@ private:
         dbg.shot_fraction = shot_fraction_;
         dbg.chase_blend = last_pick_.chase_blend;
         dbg.prediction_valid = prediction_.landed();
-        dbg.predicted_max_height = was_air_ ? std::max(0.0f, prediction_.predicted_max_height + prediction_offset_) : 0.0f;
+        dbg.predicted_max_height = was_air_ ? flight_max_height_ : 0.0f;
         dbg.predicted_air_time = prediction_.landed() ? prediction_time_base_ + prediction_.predicted_air_time : 0.0f;
         dbg.predicted_landing_delta = prediction_.landed() ? prediction_.predicted_landing_height + prediction_offset_ : 0.0f;
         dbg.air_hold_delta = last_hold_;
@@ -674,6 +697,7 @@ private:
 
     // shot blend
     Shot from_{}, leaf_{}, current_{};
+    ResolvedShots shots_{}; // the table shots of id_ / angle_, looked up on a shot change only
     ShotId id_ = ShotId::Chase;
     CameraAngle angle_ = CameraAngle::Low;
     float shot_elapsed_ = 0.0f, shot_duration_ = 0.0f, shot_fraction_ = 1.0f;
@@ -691,6 +715,7 @@ private:
     // air / prediction
     bool was_air_ = false;
     float air_time_ = 0.0f, repredict_timer_ = 0.0f;
+    float flight_max_height_ = 0.0f; // m above the takeoff surface: the highest predicted apex this flight (latched)
     float takeoff_surface_y_ = 0.0f, last_clearance_ = 0.95f;
     Vec3 last_ground_normal_{0, 1, 0};
     TrajectoryPrediction prediction_{};

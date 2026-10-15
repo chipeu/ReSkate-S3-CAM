@@ -17,7 +17,7 @@ void expect(bool condition, std::string_view what) {
 }
 bool near(float a, float b, float tolerance = 1e-4f) { return std::abs(a - b) <= tolerance; }
 
-constexpr float dt = 1.0f / 120.0f;
+constexpr float dt = fixed_step; // the camera's 60 Hz step
 constexpr float g = 10.1f;
 constexpr float board_clearance = 0.9f; // the anchor rides this far above the surface
 
@@ -33,7 +33,7 @@ struct Jump {
         launch.position = {0, 0, 0}; // surface level; the anchor adds board_clearance
         launch.velocity = {0, vy, forward_speed};
         const float surface = landing_surface_y;
-        const auto ground = [surface](const Vec3& a, const Vec3& b) -> std::optional<GroundHit> {
+        const auto ground = [surface](const Vec3& a, const Vec3& b) noexcept -> std::optional<GroundHit> {
             if (a[1] >= surface && b[1] < surface) {
                 const float f = (a[1] - surface) / (a[1] - b[1]);
                 return GroundHit{lerp(a, b, f), {0, 1, 0}};
@@ -70,7 +70,7 @@ Flight fly(const Jump& jump, const AirSettings& set, Tweak&& tweak) {
     const float air_time = p.predicted_air_time;
     f.air.reset(board_clearance);
     // 0.25 s of riding.
-    for (int i = 0; i < 30; ++i) {
+    for (int i = 0; i < 15; ++i) {
         AirInput in;
         in.anchor_height = board_clearance;
         in.velocity = {0, 0, jump.forward_speed};
@@ -346,6 +346,50 @@ void miss_and_invalid() {
     expect(near(a.update(dt, in, broken).reference_height, 0.5f), "invalid settings leave the height alone");
 }
 
+// A one-step prediction Miss in the middle of a flight must not re-base the transition: the end of
+// every (re)computed transition stays relative to the takeoff height (taken once per flight).
+void miss_mid_flight_keeps_takeoff_base() {
+    const AirSettings set;
+    AirHeight a;
+    a.reset(1.0f); // takeoff height 1.0
+    float previous = 1.0f, miss_step = 0.0f, end_at_miss = 0.0f;
+    for (int i = 0; i < 50; ++i) {
+        const float t = static_cast<float>(i) * dt;
+        AirInput in;
+        in.grounded = false;
+        in.anchor_height = 1.0f;
+        in.trajectory_time = t;
+        in.trajectory_duration = 1.0f;
+        in.velocity = {0, -1, 5};
+        in.trajectory_valid = i != 29; // a single-step Miss at about 0.48 s
+        in.landing_height_delta = i < 29 ? -2.0f : i < 40 ? -2.05f : -2.10f;
+        const AirOutput out = a.update(dt, in, set);
+        if (i == 29) end_at_miss = a.transition_end();
+        if (i == 29) miss_step = std::abs(out.reference_height - previous);
+        previous = out.reference_height;
+        if (i == 29) expect(out.transitioning && !out.landing, "miss: the transition carries on through the Miss step");
+    }
+    expect(near(end_at_miss, -1.0f, 1e-3f), "miss: the Miss step holds the current target (takeoff 1.0 + delta -2.0)");
+    expect(near(a.transition_end(), 1.0f - 2.10f, 1e-3f), "miss: after the Miss the end is takeoff + the new delta (-1.10), not re-based");
+    expect(miss_step < 0.05f, "miss: the height keeps easing on the Miss step (no jump)");
+    // Grounded again: the next flight takes its own base.
+    AirInput land;
+    land.anchor_height = 0.0f;
+    land.velocity = {0, -5, 5};
+    a.update(dt, land, set);
+    a.update(dt, land, set);
+    expect(near(a.height(), 0.0f, 1e-3f), "miss: touchdown follows the anchor");
+    AirInput hop;
+    hop.grounded = false;
+    hop.anchor_height = 0.0f;
+    hop.trajectory_valid = true;
+    hop.trajectory_duration = 0.5f;
+    hop.landing_height_delta = -1.0f;
+    hop.velocity = {0, 2, 5};
+    a.update(dt, hop, set);
+    expect(near(a.transition_end(), -1.0f, 1e-3f), "miss: the next flight re-bases on its own takeoff height (0.0)");
+}
+
 void reset_snaps() {
     const AirSettings set;
     Jump jump;
@@ -385,6 +429,7 @@ int main() {
     landing_fires_once();
     landing_edge_cases();
     miss_and_invalid();
+    miss_mid_flight_keeps_takeoff_base();
     reset_snaps();
     if (failures == 0) std::printf("s3cam_air_tests: all passed\n");
     return failures == 0 ? 0 : 1;

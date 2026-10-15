@@ -30,8 +30,8 @@ float peak(float distance, float speed = 15.0f, float impulse_speed = 0.0f) {
     Shake shake;
     if (impulse_speed > 0) shake.landing_impulse(up, head_on(impulse_speed), s);
     float best = 0;
-    for (int i = 0; i < 120; ++i) {
-        const ShakeOutput o = shake.update(1.0f / 120, speed, distance, true, s);
+    for (int i = 0; i < 60; ++i) { // 1 s of the 60 Hz fixed step
+        const ShakeOutput o = shake.update(fixed_step, speed, distance, true, s);
         best = std::max({best, std::abs(o.pitch), std::abs(o.yaw), std::abs(o.roll), std::abs(o.translation[0]),
                          std::abs(o.translation[1]), std::abs(o.translation[2])});
     }
@@ -109,7 +109,7 @@ void decay() {
     const ShakeSettings s;
     Shake shake;
     shake.landing_impulse(up, head_on(12), s);
-    shake.update(1.0f / 120, 0, 1, true, s);
+    shake.update(fixed_step, 0, 1, true, s);
     expect(near(shake.impulse(), s.one_shot_magnitude * (1 - s.one_shot_decay), 1e-5f), "one update multiplies by (1 - decay)");
     // decay is per update: a different dt must not change it
     Shake slow;
@@ -120,7 +120,7 @@ void decay() {
     bool monotone = true;
     int updates = 1;
     while (shake.impulse() > 0.0f && updates < 5000) {
-        shake.update(1.0f / 120, 0, 1, true, s);
+        shake.update(fixed_step, 0, 1, true, s);
         ++updates;
         if (shake.impulse() > previous) monotone = false;
         previous = shake.impulse();
@@ -133,7 +133,7 @@ void decay() {
     fast.one_shot_magnitude = 0.0051f; // just above the snap threshold
     Shake tiny;
     tiny.landing_impulse(up, head_on(12), fast);
-    tiny.update(1.0f / 120, 0, 1, true, fast);
+    tiny.update(fixed_step, 0, 1, true, fast);
     expect(tiny.impulse() == 0.0f, "values under 0.005 snap to 0");
 }
 
@@ -162,7 +162,7 @@ void frequency_and_curves() {
     none.amplitude_top_speed = 0;
     Shake flat;
     float best = 0;
-    for (int i = 0; i < 120; ++i) best = std::max(best, std::abs(flat.update(1.0f / 120, 15, 1, true, none).pitch));
+    for (int i = 0; i < 60; ++i) best = std::max(best, std::abs(flat.update(fixed_step, 15, 1, true, none).pitch));
     expect(best == 0.0f, "top speed 0 means amplitude_min (0 by default)");
 }
 
@@ -197,7 +197,7 @@ void weight_fade() {
     expect(shake.weight() == 0.0f, "weight clamps at 0");
     Shake off;
     off.landing_impulse(up, head_on(12), s);
-    const ShakeOutput o = off.update(1.0f / 120, 15, 1, false, s);
+    const ShakeOutput o = off.update(fixed_step, 15, 1, false, s);
     expect(o.pitch == 0 && o.yaw == 0 && o.roll == 0 && o.translation[0] == 0, "disabled shake outputs nothing");
 }
 

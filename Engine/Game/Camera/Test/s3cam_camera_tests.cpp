@@ -42,7 +42,7 @@ constexpr float ride_height = 0.95f; // root above the ground riding
 constexpr float ride_speed = 6.0f;
 
 // Flat ground at y = 0: the segment crosses it going down.
-std::optional<GroundHit> flat_ground(const Vec3& a, const Vec3& b) {
+std::optional<GroundHit> flat_ground(const Vec3& a, const Vec3& b) noexcept {
     if (a[1] >= 0.0f && b[1] < 0.0f) {
         const float f = a[1] / (a[1] - b[1]);
         return GroundHit{lerp(a, b, f), {0, 1, 0}};
@@ -391,25 +391,23 @@ void test_fixed_step_accumulator() {
     cam.update(1.0f / 60.0f, session.at(0.0f), flat_ground);
     int total = 0;
     for (int i = 1; i <= 144; ++i) total += cam.update(1.0f / 144.0f, session.at(static_cast<float>(i) / 144.0f), flat_ground).debug.steps;
-    expect(total == 120 || total == 119, "1 s of 144 fps frames runs 120 fixed steps");
+    expect(total == 60 || total == 59, "1 s of 144 fps frames runs 60 fixed steps");
     CameraMan c30;
     c30.update(1.0f / 30.0f, session.at(0.0f), flat_ground);
     total = 0;
     for (int i = 1; i <= 30; ++i) total += c30.update(1.0f / 30.0f, session.at(static_cast<float>(i) / 30.0f), flat_ground).debug.steps;
-    expect(total == 120 || total == 119, "1 s of 30 fps frames runs 120 fixed steps");
+    expect(total == 60 || total == 59, "1 s of 30 fps frames runs 60 fixed steps");
     // A stall is capped, not spiralled.
     const Frame& stalled = cam.update(5.0f, session.at(7.0f), flat_ground);
     expect(stalled.debug.steps <= cam.settings().pipeline.max_steps_per_update, "a 5 s stall runs at most max_steps_per_update steps");
-    expect(stalled.debug.accumulator < 1.0f / 119.0f, "and leaves less than one step in the accumulator");
-    // Other fixed rates.
-    CameraSettings s90;
-    s90.fixed_hz = 90.0f;
-    CameraMan c90;
-    c90.set_settings(s90);
-    c90.update(1.0f / 60.0f, session.at(0.0f), flat_ground);
+    expect(stalled.debug.accumulator < 1.0f / 59.0f, "and leaves less than one step in the accumulator");
+    // The step rate is the Rust camera STEP, exactly 1/60 s, and not a tunable.
+    expect(fixed_hz == 60.0f && fixed_step == 1.0f / 60.0f && rig_step == fixed_step, "the fixed step is exactly 60 Hz (manager_state.rs STEP)");
+    CameraMan c60;
+    c60.update(1.0f / 60.0f, session.at(0.0f), flat_ground);
     total = 0;
-    for (int i = 1; i <= 60; ++i) total += c90.update(1.0f / 60.0f, session.at(static_cast<float>(i) / 60.0f), flat_ground).debug.steps;
-    expect(total == 90 || total == 89, "fixed_hz = 90 runs 90 steps per second");
+    for (int i = 1; i <= 60; ++i) total += c60.update(1.0f / 60.0f, session.at(static_cast<float>(i) / 60.0f), flat_ground).debug.steps;
+    expect(total == 60 || total == 59, "60 fps frames run one fixed step each");
 }
 
 void test_fov() {
@@ -442,11 +440,8 @@ void test_fov() {
 void test_settings() {
     CameraSettings s;
     expect(s.valid(), "default CameraSettings are valid");
-    expect(s.fixed_hz == 120.0f && s.preset == CameraPreset::FullS3 && s.angle == CameraAngle::Low, "defaults: 120 Hz, FullS3, Low");
+    expect(s.preset == CameraPreset::FullS3 && s.angle == CameraAngle::Low, "defaults: FullS3, Low");
     CameraSettings bad = s;
-    bad.fixed_hz = 0.0f;
-    expect(!bad.valid(), "fixed_hz 0 is invalid");
-    bad = s;
     bad.rig.distance.min_distance = std::nanf("");
     expect(!bad.valid(), "a NaN rig setting makes the aggregate invalid");
     bad = s;
@@ -473,6 +468,184 @@ void test_settings() {
     // A frame with invalid settings never appears: the camera still produces finite frames.
     const Frame& f = cam.update(1.0f / 60.0f, Session{}.at(0.5f), flat_ground);
     expect(finite_frame(f) && f.valid, "frames are valid after a rejected settings change");
+}
+
+// ---------------------------------------------------------------- Gate 1 fix card
+
+SubjectSnapshot standing() {
+    SubjectSnapshot s;
+    s.valid = true;
+    s.position = {0.0f, ride_height, 0.0f};
+    s.ground_clearance = ride_height;
+    return s;
+}
+float elevation_angle_degrees(const Vec3& direction) { return std::asin(std::clamp(normalized(direction)[1], -1.0f, 1.0f)) / degrees; }
+
+// Standing camera heights above the ground (the ground is y = 0): 21-low-camera.md / hails §1.3
+// give Low about 0.59 m and High about 1.85 m. The orbit anchor is root - board_drop + anchor_height
+// and does not depend on the shot's reference weights.
+void test_standing_camera_heights() {
+    float heights[2] = {};
+    int k = 0;
+    for (const CameraAngle angle : {CameraAngle::Low, CameraAngle::High}) {
+        CameraSettings cs;
+        cs.angle = angle;
+        CameraMan cam;
+        cam.set_settings(cs);
+        float y = 0.0f;
+        for (int i = 0; i < 240; ++i) y = cam.update(1.0f / 60.0f, standing(), flat_ground).pos[1];
+        heights[k++] = y;
+    }
+    std::printf("  standing camera height: Low %.3f m, High %.3f m above the ground\n", static_cast<double>(heights[0]),
+                static_cast<double>(heights[1]));
+    expect(near(heights[0], 0.59f, 0.1f), "standing Low camera is about 0.59 m above the ground (21-low-camera.md)");
+    expect(near(heights[1], 1.85f, 0.1f), "standing High camera is about 1.85 m above the ground (21-low-camera.md)");
+    // The anchor height setting moves the camera one for one, whatever the shot.
+    CameraSettings raised;
+    raised.points.anchor_height += 0.2f;
+    CameraMan cam;
+    cam.set_settings(raised);
+    float y = 0.0f;
+    for (int i = 0; i < 240; ++i) y = cam.update(1.0f / 60.0f, standing(), flat_ground).pos[1];
+    expect(near(y, heights[0] + 0.2f, 0.01f), "anchor_height raises the camera one for one");
+}
+
+// frame_composer.rs single(): pitch = -framing[2] is applied in the look basis (columns right, up,
+// at). The at column of the framing basis is (0, -sin pitch, cos pitch), so a framing pitch of -4
+// degrees (chase_flat_slow) tilts the view 4 degrees DOWN from the camera -> reference line and a
+// positive one (high_chase, +3 degrees) tilts it UP.
+// Hand-computed for a standing skater (root y = 0.95, board 0.9 below, anchor 0.32 above the board):
+//   Low : anchor y 0.37, camera 1.8 m back at 7 degrees: y = 0.37 + 1.8 sin7 = 0.5894, 1.7866 m behind.
+//         Reference = board (0.05) + board_offset 0.9 = 0.95. Line pitch = atan((0.95-0.5894)/1.7866) = +11.41 deg.
+//         View pitch = 11.41 - 4 = +7.41 deg.
+//   High: camera y = 0.37 + 3.0 sin30 = 1.87, 2.598 m behind; reference = 0.05 + 1.0 = 1.05.
+//         Line pitch = atan((1.05-1.87)/2.598) = -17.52 deg. View pitch = -17.52 + 3 = -14.52 deg.
+void test_framing_pitch_sign() {
+    const SubjectSnapshot s = standing();
+    for (const CameraAngle angle : {CameraAngle::Low, CameraAngle::High}) {
+        CameraSettings cs;
+        cs.angle = angle;
+        CameraMan cam;
+        cam.set_settings(cs);
+        const Frame f = cam.update(1.0f / 60.0f, s, flat_ground); // the cut frame: every tracker on its target
+        const bool low = angle == CameraAngle::Low;
+        const float authored = low ? -4.0f : 3.0f;
+        const Vec3 look_target = {0.0f, low ? 0.95f : 1.05f, 0.0f}; // reference point + board offset
+        const Vec3 line = sub(look_target, f.pos);
+        const Vec3 view = scale(f.back, -1.0f);
+        const float line_pitch = elevation_angle_degrees(line);
+        const float view_pitch = elevation_angle_degrees(view);
+        const char* name = low ? "Low" : "High";
+        if (!near(view_pitch, line_pitch + authored, 0.15f))
+            std::printf("  %s: line %.2f view %.2f authored %.2f\n", name, static_cast<double>(line_pitch), static_cast<double>(view_pitch), static_cast<double>(authored));
+        expect(near(line_pitch, low ? 11.41f : -17.52f, 0.1f), std::string(name) + ": camera -> reference line matches the hand computation");
+        expect(near(view_pitch, low ? 7.41f : -14.52f, 0.15f), std::string(name) + ": view pitch = line pitch + authored framing pitch (frame_composer.rs)");
+        expect((view_pitch < line_pitch) == low, std::string(name) + ": negative authored pitch looks down, positive looks up");
+        expect(near(f.pos[0], 0.0f, 1e-3f), std::string(name) + ": no sideways drift");
+    }
+}
+
+// The shot's apex is latched over the flight: after the apex a re-prediction reports the current
+// height as its apex, which used to flip AirBig back to AirNormal on the way down.
+void test_big_air_latched() {
+    for (const float apex : {1.7f, 3.2f}) {
+        for (const float fps : {60.0f, 144.0f}) {
+            Session session;
+            session.jump_speed = std::sqrt(2.0f * g * apex);
+            session.length = session.land_time() + 1.0f;
+            session.grind_start = session.grind_end = 100.0f;
+            session.manual_start = session.manual_end = 100.0f;
+            session.bail_time = 100.0f;
+            CameraMan cam;
+            const Recording r = record(cam, session, fps);
+            int big_runs = 0, normal_after_big = 0;
+            bool seen_big = false, seen_landing = false;
+            float latched_max = 0.0f, latch_dip = 0.0f;
+            for (const Frame& f : r.frames) {
+                if (f.shot == ShotId::AirBig) {
+                    if (!seen_big) ++big_runs;
+                    seen_big = true;
+                    if (f.debug.airborne) {
+                        latch_dip = std::max(latch_dip, latched_max - f.debug.predicted_max_height);
+                        latched_max = std::max(latched_max, f.debug.predicted_max_height);
+                    }
+                } else if (seen_big && f.shot == ShotId::AirNormal) {
+                    ++normal_after_big;
+                }
+                if (f.shot == ShotId::Landing) seen_landing = true;
+            }
+            const std::string tag = "apex " + std::to_string(apex).substr(0, 3) + " m @" + std::to_string(static_cast<int>(fps)) + " fps: ";
+            std::size_t air_big = 0, air_normal = 0;
+            for (const ShotId id : r.sequence) {
+                air_big += id == ShotId::AirBig;
+                air_normal += id == ShotId::AirNormal;
+            }
+            expect(big_runs == 1 && air_big == 1, tag + "AirBig is selected exactly once");
+            expect(normal_after_big == 0 && air_normal == 0, tag + "AirBig never drops to AirNormal before Landing");
+            expect(seen_landing, tag + "the flight ends in the Landing shot");
+            expect(latch_dip < 1e-4f, tag + "the reported apex (debug.predicted_max_height) never decreases during the flight");
+            expect(near(latched_max, apex, 0.15f), tag + "the latched apex is the real one");
+        }
+    }
+}
+
+// A huge dt used to overflow the int cast of acc_ / step and freeze the camera forever.
+void test_huge_dt_resumes() {
+    for (const float huge : {1.0e9f, 3.0e38f, 20000000.0f}) {
+        CameraMan cam;
+        const Session session;
+        for (int i = 0; i < 60; ++i) cam.update(1.0f / 60.0f, session.at(static_cast<float>(i) / 60.0f), flat_ground);
+        // The skater moved 6 m in the stall; the camera takes the capped steps and catches up.
+        const SubjectSnapshot later = session.at(2.0f);
+        const Frame& stalled = cam.update(huge, later, flat_ground);
+        expect(!stalled.debug.held && finite_frame(stalled) && orthonormal(stalled), "huge dt: a finite, orthonormal frame");
+        expect(stalled.debug.steps >= 1 && stalled.debug.steps <= cam.settings().pipeline.max_steps_per_update, "huge dt: the steps are capped, not zero");
+        expect(stalled.debug.accumulator >= 0.0f && stalled.debug.accumulator < 2.0f / 60.0f, "huge dt: the accumulator is bounded");
+        const float stalled_distance = length(sub(stalled.pos, later.position));
+        // The capped steps spread over (0, 1] of the subject interpolation, so the last one sees the
+        // new position; without that the camera would stay at the old place.
+        expect(stalled_distance < 5.0f, "huge dt: the capped steps reach the new subject position");
+        int steps = 0;
+        float distance = 0.0f;
+        for (int i = 1; i <= 120; ++i) {
+            const float t = 2.0f + static_cast<float>(i) / 60.0f;
+            const Frame& f = cam.update(1.0f / 60.0f, session.at(t), flat_ground);
+            steps += f.debug.steps;
+            distance = length(sub(f.pos, session.at(t).position));
+            expect(finite_frame(f), "huge dt: frames after the stall are finite");
+        }
+        expect(steps >= 118 && steps <= 121, "huge dt: normal frames run one step each again (the camera resumed)");
+        expect(distance > 1.0f && distance < 3.5f, "huge dt: the camera is back at its shot distance behind the skater");
+    }
+    // A merely long stall (5 s) also spreads its capped steps over the whole frame interval.
+    CameraMan cam;
+    const Session session;
+    for (int i = 0; i < 60; ++i) cam.update(1.0f / 60.0f, session.at(static_cast<float>(i) / 60.0f), flat_ground);
+    const Frame& f = cam.update(5.0f, session.at(2.0f), flat_ground);
+    expect(f.debug.steps == cam.settings().pipeline.max_steps_per_update, "a 5 s stall runs exactly max_steps_per_update steps");
+    expect(length(sub(f.pos, session.at(2.0f).position)) < 5.0f, "a 5 s stall still lands near the new subject position");
+}
+
+// With the anchor independent of the shot weights, landing from a flat ollie leaves no height bounce
+// (the Gate 1 notes measured about 0.12 m while the air / landing weights moved the weighted point).
+void test_anchor_independent_of_weights() {
+    CameraMan cam;
+    const Session session;
+    const float anchor_y = ride_height - 0.9f + 0.32f; // root - board_drop + anchor_height
+    float worst = 0.0f, worst_ground = 0.0f;
+    for (int i = 0; i < 480; ++i) {
+        const float t = static_cast<float>(i) / 60.0f;
+        const Frame& f = cam.update(1.0f / 60.0f, session.at(t), flat_ground);
+        if (t < 1.0f) continue;
+        if (t > session.land_time() + 0.0f && t < session.land_time() + 1.5f) {
+            const float orbit_y = f.pos[1] - f.debug.distance * std::sin(f.debug.elevation); // anchor the rig orbits
+            worst = std::max(worst, std::abs(orbit_y - anchor_y));
+        }
+        if (t < session.jump_time - 0.05f) worst_ground = std::max(worst_ground, std::abs(f.pos[1] - f.debug.distance * std::sin(f.debug.elevation) - anchor_y));
+    }
+    expect(worst_ground < 0.01f, "riding: the orbit anchor sits at root - board_drop + anchor_height");
+    if (worst > 0.03f) std::printf("  landing anchor deviation %.3f m\n", static_cast<double>(worst));
+    expect(worst < 0.03f, "landing from an ollie: no height bounce from the shot weights changing (anchor within 3 cm)");
 }
 
 // ---------------------------------------------------------------- shake and landing impulse
@@ -702,6 +875,11 @@ int main() {
     test_fps_agree();
     test_shot_framing_and_air_hold();
     test_big_air_shot();
+    test_standing_camera_heights();
+    test_framing_pitch_sign();
+    test_big_air_latched();
+    test_huge_dt_resumes();
+    test_anchor_independent_of_weights();
     test_bail_while_onboard_flag();
     test_low_vs_high();
     test_reset_snaps();

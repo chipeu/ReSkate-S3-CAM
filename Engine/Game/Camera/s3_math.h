@@ -15,6 +15,13 @@ inline constexpr float pi = 3.14159265358979f;
 inline constexpr float tau = 6.28318530717959f;
 inline constexpr float degrees = pi / 180.0f; // multiply degrees by this for radians
 
+// The camera's fixed step. The Rust camera STEP is exactly 1/60 s (manager_state.rs, f32 bits
+// 0x3c888889) and every per-step constant ported from it (impulse decay, filter_blend_value, the
+// tracker / pan / tilt / dead-zone smoothing, the compass weights) is per 1/60 s, so S3Cam runs its
+// fixed step at exactly 60 Hz and interpolates the output. This is not a user tunable.
+inline constexpr float fixed_hz = 60.0f;
+inline constexpr float fixed_step = 1.0f / 60.0f;
+
 using Vec3 = std::array<float, 3>;
 inline Vec3 add(const Vec3& a, const Vec3& b) { return {a[0] + b[0], a[1] + b[1], a[2] + b[2]}; }
 inline Vec3 sub(const Vec3& a, const Vec3& b) { return {a[0] - b[0], a[1] - b[1], a[2] - b[2]}; }

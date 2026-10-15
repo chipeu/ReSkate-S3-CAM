@@ -17,7 +17,7 @@ void expect(bool condition, std::string_view what) {
     std::printf("FAIL: %.*s\n", static_cast<int>(what.size()), what.data());
 }
 
-constexpr float dt = 1.0f / 120.0f;
+constexpr float dt = fixed_step; // the camera's 60 Hz step
 
 GraphInput ride(float speed = 6.0f) {
     GraphInput in;
@@ -84,6 +84,24 @@ void test_every_shot_reachable() {
     for (std::size_t i = 0; i < shot_id_count; ++i) expect(seen.count(static_cast<ShotId>(i)) == 1, "each ShotId was selected");
 }
 
+// The cached shot lookup (CameraMan resolves the table once per shot change) blends exactly like resolve_shot.
+void test_cached_shot_lookup() {
+    for (const CameraAngle angle : {CameraAngle::Low, CameraAngle::High}) {
+        for (std::size_t i = 0; i < shot_id_count; ++i) {
+            const ShotId id = static_cast<ShotId>(i);
+            const ResolvedShots shots = lookup_shots(id, angle);
+            expect(shots.a != nullptr && shots.b != nullptr, "every shot id resolves to table shots in both angles");
+            for (const float blend : {0.0f, 0.37f, 1.0f}) {
+                const Shot cached = blend_shots(shots, blend);
+                const Shot direct = resolve_shot(id, angle, blend);
+                expect(cached.distance == direct.distance && cached.position_elevation == direct.position_elevation &&
+                           cached.smoothing == direct.smoothing && cached.framing == direct.framing,
+                       "cached lookup + blend equals resolve_shot");
+            }
+        }
+    }
+}
+
 void test_landing_window() {
     const GraphSettings s; // window 0.25 s
     ShotGraph g;
@@ -102,6 +120,7 @@ void test_landing_window() {
     }
     const float seconds = static_cast<float>(active) * dt;
     expect(std::abs(seconds - 0.25f) <= dt * 1.01f, "landing: the window is 0.25 s, to within one step");
+    expect(active == 15, "landing: at 60 Hz the 0.25 s window is exactly 15 steps");
     expect(out.shot == ShotId::Chase && !out.landing_active, "landing: back to chase after the window");
 
     // Priority inside the window: bailing wins, air does not.
@@ -120,11 +139,11 @@ void test_landing_window() {
     in.touchdown = true;
     g3.select(in, s);
     in.touchdown = false;
-    run(g3, in, s, 20);
+    run(g3, in, s, 10);
     in.touchdown = true;
     g3.select(in, s);
     in.touchdown = false;
-    run(g3, in, s, 20);
+    run(g3, in, s, 10);
     expect(g3.shot() == ShotId::Landing, "landing: a new touchdown restarts the window");
     // A custom window length.
     GraphSettings longer;
@@ -133,9 +152,9 @@ void test_landing_window() {
     in.touchdown = true;
     g4.select(in, longer);
     in.touchdown = false;
-    run(g4, in, longer, 40);
+    run(g4, in, longer, 20);
     expect(g4.shot() == ShotId::Landing, "landing: the window follows the setting (still active at 0.33 s of 0.5)");
-    run(g4, in, longer, 30);
+    run(g4, in, longer, 15);
     expect(g4.shot() == ShotId::Chase, "landing: and ends after 0.5 s");
 }
 
@@ -217,7 +236,7 @@ void test_chase_blend() {
     // Not scaled by dt: the filter is per fixed step. (Same step count -> same value whatever the caller's dt says.)
     ShotGraph a, b;
     GraphInput in_a = ride(6.0f), in_b = ride(6.0f);
-    in_a.dt = 1.0f / 120.0f;
+    in_a.dt = fixed_step;
     in_b.dt = 1.0f / 60.0f;
     run(a, ride(3.0f), s, 10);
     run(b, ride(3.0f), s, 10);
@@ -309,6 +328,7 @@ void test_settings_and_guards() {
 int main() {
     test_priority_order();
     test_every_shot_reachable();
+    test_cached_shot_lookup();
     test_landing_window();
     test_air_hysteresis();
     test_manual_hysteresis();

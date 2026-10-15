@@ -26,7 +26,7 @@ struct Ground {
     Solid solid;
     Normal normal_at;
     int calls = 0;
-    std::optional<GroundHit> operator()(const Vec3& a, const Vec3& b) {
+    std::optional<GroundHit> operator()(const Vec3& a, const Vec3& b) noexcept {
         ++calls;
         if (solid(a) || !solid(b)) return std::nullopt;
         Vec3 lo = a, hi = b;
@@ -159,7 +159,7 @@ void miss() {
     expect(predict_trajectory(launch, ground, shorter).segments_tested == 30, "miss: custom horizon");
 
     // A query that never hits sees no ground at all.
-    const TrajectoryPrediction none = predict_trajectory(launch, [](const Vec3&, const Vec3&) { return std::optional<GroundHit>{}; });
+    const TrajectoryPrediction none = predict_trajectory(launch, [](const Vec3&, const Vec3&) noexcept { return std::optional<GroundHit>{}; });
     expect(none.status == TrajectoryStatus::Miss, "miss: plain lambda query works");
 
     // Launching straight into the ground: the apex is clipped to the part of the flight that happened.
@@ -168,9 +168,18 @@ void miss() {
     expect(down.landed() && down.apex_time == 0.0f && down.predicted_max_height == 0.0f, "downward launch has no climb");
 }
 
+// CameraMan::update is noexcept, so a world query that may throw is rejected at compile time.
+void query_must_be_nothrow() {
+    const auto may_throw = [](const Vec3&, const Vec3&) { return std::optional<GroundHit>{}; };
+    const auto no_throw = [](const Vec3&, const Vec3&) noexcept { return std::optional<GroundHit>{}; };
+    static_assert(!GroundQuery<decltype(may_throw)>, "a potentially throwing query must not satisfy GroundQuery");
+    static_assert(GroundQuery<decltype(no_throw)>, "a noexcept query satisfies GroundQuery");
+    expect(true, "GroundQuery requires a noexcept invocable (compile-time)");
+}
+
 void invalid_input() {
     int calls = 0;
-    auto counting = [&](const Vec3&, const Vec3&) {
+    auto counting = [&](const Vec3&, const Vec3&) noexcept {
         ++calls;
         return std::optional<GroundHit>{};
     };
@@ -189,7 +198,7 @@ void invalid_input() {
 
     // A query that returns a non-finite point is ignored rather than poisoning the result.
     const TrajectoryPrediction poisoned = predict_trajectory({{0, 1, 0}, {0, 1, 0}, {0, 1, 0}, 1},
-        [&](const Vec3&, const Vec3&) { return std::optional<GroundHit>{GroundHit{{nan, 0, 0}, {0, 1, 0}}}; });
+        [&](const Vec3&, const Vec3&) noexcept { return std::optional<GroundHit>{GroundHit{{nan, 0, 0}, {0, 1, 0}}}; });
     expect(poisoned.status == TrajectoryStatus::Miss && std::isfinite(poisoned.predicted_air_time), "non-finite contact is ignored");
 }
 
@@ -226,6 +235,7 @@ int main() {
     stair_set();
     quarter_pipe();
     miss();
+    query_must_be_nothrow();
     invalid_input();
     incline();
     if (failures == 0) std::printf("s3cam trajectory tests passed\n");

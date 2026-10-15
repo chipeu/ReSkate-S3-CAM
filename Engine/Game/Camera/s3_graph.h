@@ -117,7 +117,7 @@ struct GraphSettings {
 
 // The conditions, already reduced from the subject by the caller (CameraMan).
 struct GraphInput {
-    float dt = 1.0f / 120.0f;      // s, the fixed step
+    float dt = fixed_step;         // s, the fixed step (60 Hz)
     bool bailing = false;          // IsWipingOut
     bool air = false;              // IsInOnBoardAir (physics state 200 / 201)
     bool grinding = false;         // SkaterIsGrinding (state 400-499)
@@ -262,13 +262,27 @@ inline constexpr ShotPair shot_pair(ShotId id, CameraAngle angle) noexcept {
 // The leaf shot for a selection: the named table shot, or for Chase the slow/fast pair blended by
 // `chase_blend` through interpolate() (which eases once more, as the Rust blend tree does). Falls
 // back to a default Shot if the table lacks a name (cannot happen with the built-in table).
-inline Shot resolve_shot(ShotId id, CameraAngle angle, float chase_blend = 0.0f) {
+inline Shot resolve_shot(ShotId id, CameraAngle angle, float chase_blend = 0.0f);
+
+// The two table shots of a selection, looked up once (the table scan is linear) so a caller can
+// cache them while the selection stays the same and blend every step with blend_shots().
+struct ResolvedShots {
+    const Shot* a = nullptr;
+    const Shot* b = nullptr; // equal to `a` when the selection has a single shot
+};
+inline ResolvedShots lookup_shots(ShotId id, CameraAngle angle) {
     const ShotPair pair = shot_pair(id, angle);
     const Shot* a = find_shot(pair.a);
-    const Shot* b = find_shot(pair.b);
-    if (!a) return b ? *b : Shot{};
-    if (!b || pair.a == pair.b) return *a;
-    return interpolate(*a, *b, clamp01(chase_blend));
+    const Shot* b = pair.a == pair.b ? a : find_shot(pair.b);
+    return {a, b};
+}
+inline Shot blend_shots(const ResolvedShots& shots, float chase_blend = 0.0f) {
+    if (!shots.a) return shots.b ? *shots.b : Shot{};
+    if (!shots.b || shots.a == shots.b) return *shots.a;
+    return interpolate(*shots.a, *shots.b, clamp01(chase_blend));
+}
+inline Shot resolve_shot(ShotId id, CameraAngle angle, float chase_blend) {
+    return blend_shots(lookup_shots(id, angle), chase_blend);
 }
 
 } // namespace dingosdk::s3cam

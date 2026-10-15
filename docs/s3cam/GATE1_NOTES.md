@@ -31,7 +31,7 @@ reference that an implementer made on purpose, and the reasons given.
 - Not ported: the `flags&2` snap branch (replaced by an explicit `snap_height`), the `flag_656`
   smoothing, the `flag_608` offset decay, positioner/avoidance (T8), the 9-heading compass array,
   and the landing gate `positioner.flags & 0x80`.
-- Compass blend weights are converted from per-1/60 s to the 120 Hz step.
+- ~~Compass blend weights are converted from per-1/60 s to the 120 Hz step.~~ Superseded: the step is now 60 Hz, so the weights apply directly.
 - The distance target is clamped to the minimum distance (in Rust only collision uses it).
 - The anchor roles (`push_state`, `push_kick`, `pump_acceleration`, `no_lag`) are names given by
   the implementer to unnamed native getters. T6 binds them to SubjectSnapshot.
@@ -41,9 +41,9 @@ reference that an implementer made on purpose, and the reasons given.
   order. Hysteresis, `landing_min_air_time` (0.1 s), the transition times and the thresholds are
   TUNE. High has no up/down, landing or ledge shots: High Landing reuses `high_chase`.
 - **Subject:** interpolated between snapshots and never extrapolated, so it lags by up to one fixed step.
-- **Orientation:** looks at the weighted reference point; pan/tilt via AngleTracker with smoothing
+- **Orientation:** looks at the weighted reference point (framing only; since Gate 1 the orbit anchor is separate, root − board_drop + `anchor_height` 0.32); pan/tilt via AngleTracker with smoothing
   `1-(1-s)^2` capped at 0.9. The two-quaternion slerp, the pan umbra curve and the minimum pan
-  smoothing are not ported. Negative authored pitch looks up (Low-camera doc).
+  smoothing are not ported. ~~Negative authored pitch looks up.~~ Fixed at Gate 1: positive authored pitch looks up, as in `frame_composer.rs`.
 - **`board_offset`:** the implementer's reading is that it lifts only the look target (without it
   the head is cut off). It is the main framing assumption; check it in game.
 - **Heading:** `position_heading` is blended in transitions (Rust doesn't, which would pop on ledge shots).
@@ -59,8 +59,7 @@ reference that an implementer made on purpose, and the reasons given.
 - **NativePlus:** roll is shot roll + shake roll; the air hold shifts world Y only; FOV passes through.
 - **FOV formula** `2·atan(35/(2·lens))/sqrt(aspect+1)` gives 66.6° at 16:9 (`manager_frame.rs`).
   Whether the game's +0xac wants vertical degrees is still to check at T9.
-- **Measured:** the air weights put the anchor about 0.24 m above the board weights, so there's
-  about 0.12 m of bounce around landing (continuous). Re-tune at T12.
+- ~~Measured: about 0.12 m bounce around landing from the weights.~~ Gone since Gate 1: the anchor no longer depends on the weights (test `test_anchor_independent_of_weights`).
 
 ## Gate 1 review (independent reviewer, 2026-10-15): pass with fixes
 No blockers. Core ports were checked line by line against the Rust and found faithful. Fixes
@@ -80,3 +79,12 @@ Carried into later cards as acceptance items:
   stair-step (60 Hz physics at 144 fps) session test.
 - **T8:** a physics ray may hit the takeoff surface at t≈0. Lift the launch point (~5 cm, via
   `launch_clearance`) or ignore a first-segment hit while v·n > 0.
+
+### Gate 1 fixes: results
+- All 11 suites pass (g++ strict, clang, ASan/UBSan) with regression tests for findings 1–7.
+- Standing camera height: **Low 0.589 m, High 1.870 m** (published: 0.59, 1.85).
+- Scripted session (shot sequence unchanged at 30/60/144 fps): max step 0.300 / 0.167 / 0.069 m;
+  lowest camera 0.56 m (was 0.26).
+- Heading and elevation now use the shot's own smoothing (about 0.98 near the target for the chase
+  shots, as in the Rust): much heavier than before. The authored smoothing values are TUNE; check
+  the feel first at T12.

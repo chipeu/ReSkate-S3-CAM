@@ -22,7 +22,7 @@ namespace dingosdk::s3cam {
 struct AirSettings {
     float max_ignored_drop = 3.0f;      // m. A landing more than this below takeoff gets no transition (manager_air.rs)
     float change_threshold = 0.001f;    // m. A landing-height change above this recomputes the transition (1 mm)
-    float min_remaining_time = 1.0f / 120.0f; // s. Do not arm a transition with less flight than this left
+    float min_remaining_time = fixed_step; // s. Do not arm a transition with less flight than this left
     bool hold_height_in_air = true;     // true: the reference height does not rise with the board (Rust height mode 1)
 
     bool valid() const noexcept {
@@ -102,11 +102,21 @@ public:
                 out.landing = LandingEvent{prev_normal_, prev_velocity_};
             // Deviation: Rust lets an unfinished transition run on after landing; cut it so the
             // camera follows the anchor from the touchdown step on.
-            tracking_ = armed_ = moved_ = false;
+            in_flight_ = tracking_ = armed_ = moved_ = false;
             transition_time_ = transition_duration_ = 0.0f;
-        } else if (in.trajectory_valid && std::isfinite(in.landing_height_delta) &&
-                   std::isfinite(in.trajectory_duration) && in.trajectory_duration > 0.0f &&
-                   std::isfinite(in.trajectory_time)) {
+        } else {
+            if (!in_flight_) {
+                // First airborne step of the flight: the height now is the takeoff reference height
+                // every (re)computed end is relative to. Taken once per flight; a later prediction
+                // Miss does not re-base it.
+                in_flight_ = true;
+                base_height_ = height_;
+            }
+            weight = weight_; // held across a step with no usable prediction
+        }
+        if (!ground && in.trajectory_valid && std::isfinite(in.landing_height_delta) &&
+            std::isfinite(in.trajectory_duration) && in.trajectory_duration > 0.0f &&
+            std::isfinite(in.trajectory_time)) {
             weight = clamp01(in.trajectory_time / in.trajectory_duration);
             bool recompute = false;
             if (tracking_) {
@@ -117,7 +127,6 @@ public:
             } else {
                 tracking_ = true;
                 moved_ = false;
-                base_height_ = height_; // the takeoff reference height every (re)computed end is relative to
             }
             previous_delta_ = in.landing_height_delta;
             const float remaining = in.trajectory_duration - in.trajectory_time;
@@ -134,10 +143,9 @@ public:
                 transition_time_ = 0.0f;
                 armed_ = true;
             }
-        } else {
-            tracking_ = false; // no usable prediction: forget it so the next valid one is a fresh start
-            moved_ = false;
         }
+        // No usable prediction this step (a Miss or Invalid): hold the current target. The transition,
+        // the tracking state and the base height all carry on until the board is grounded.
 
         step_height(dt, in, set, ground, weight);
         weight_ = weight;
@@ -191,6 +199,7 @@ private:
     float transition_start_ = 0.0f, transition_end_ = 0.0f;
     float transition_duration_ = 0.0f, transition_time_ = 0.0f;
     float base_height_ = 0.0f, previous_delta_ = 0.0f, weight_ = 0.0f;
+    bool in_flight_ = false;   // an airborne step has happened since the last touchdown (base_height_ is taken)
     bool tracking_ = false, armed_ = false, moved_ = false;
     bool prev_grounded_ = true; // true so the first step cannot report a landing
     Vec3 prev_velocity_{0, 0, 0};

@@ -158,8 +158,8 @@ void heading_tracker() {
     for (int i = 0; i < 60; ++i) idle.update(dt, off, set);
     expect(near(idle.tracked(), 0.0f) && near(idle.current(), 0.25f), "inactive heading holds; offset is added");
     AngleRigSettings bad = set;
-    bad.avoidance_smoothing = 2.0f;
-    expect(!bad.valid(), "avoidance smoothing above 1 is invalid");
+    bad.max_elevation_degrees = 90.0f;
+    expect(!bad.valid(), "an elevation limit of 90 degrees is invalid");
 }
 
 void elevation_tracker() {
@@ -168,9 +168,94 @@ void elevation_tracker() {
     e.reset(0.0f);
     for (int i = 0; i < 600; ++i) e.update(dt, 10.0f * degrees, set);
     expect(near(e.position(), 10.0f * degrees, 0.01f), "elevation converges");
-    for (int i = 0; i < 1200; ++i) e.update(dt, 89.0f * degrees, set);
+    for (int i = 0; i < 1200; ++i) e.update(dt, 89.0f * degrees, set, 0.0f); // smoothing 0: the whole step
     expect(e.position() <= set.max_elevation_degrees * degrees + 1e-4f, "elevation target is clamped to the limit");
     expect(e.position() > 70.0f * degrees, "elevation reaches the clamp");
+}
+
+// Per-shot smoothing (manager_rig.rs bind_shot + rig_tracking.rs update_heading / update_elevation):
+// h = 1 - shot.smoothing[0]; the rig stores h * h and the tracker is bound to 1 - h * h. Heading
+// then fades that toward min(that, 0.8) as the error grows to pi / 4.
+void shot_smoothing_drives_heading_and_elevation() {
+    expect(near(rig_angle_smoothing(0.85f), 0.9775f, 1e-6f), "shot smoothing 0.85 -> tracker smoothing 1 - 0.15^2");
+    expect(near(rig_angle_smoothing(0.0f), 0.0f) && near(rig_angle_smoothing(1.0f), 1.0f), "shot smoothing 0 takes the step, 1 holds");
+
+    // Hand-computed first step from rest (double precision, written out from the tracker maths).
+    const auto heading_step = [](double shot, double error_deg) {
+        const double d = 3.0, p = 40.0, a_min = 400.0, a_max = 900.0; // AngleRigSettings::heading_defaults, degrees
+        const double deg = 3.14159265358979 / 180.0;
+        const double delta = error_deg * deg;
+        const double fraction = error_deg < d ? 1.0 : error_deg < p ? 1.0 - (error_deg - d) / (p - d) : 0.0;
+        const double limit = (a_min + (a_max - a_min) * fraction) * deg;
+        const double accel = std::min(delta * 3600.0, limit);
+        const double velocity = accel / 60.0;
+        const double h = 1.0 - shot;
+        const double base = 1.0 - h * h;
+        const double capped = std::min(base, 0.8);
+        const double quarter = 3.14159265358979 / 4.0;
+        const double smoothing = delta < quarter ? base + (capped - base) * (delta / quarter) : capped;
+        return velocity / 60.0 * (1.0 - smoothing);
+    };
+    const AngleRigSettings hs = AngleRigSettings::heading_defaults();
+    float moved[3] = {};
+    const float shots[3] = {0.2f, 0.85f, 0.95f};
+    for (int k = 0; k < 3; ++k) {
+        HeadingTracker h;
+        h.reset(0.0f);
+        HeadingInput in;
+        in.target = 5.0f * degrees;
+        in.shot_smoothing = shots[k];
+        h.update(dt, in, hs);
+        moved[k] = h.tracked();
+        const double want = heading_step(static_cast<double>(shots[k]), 5.0);
+        expect(std::abs(static_cast<double>(moved[k]) - want) < 1e-7, "heading first step matches the Rust smoothing formula");
+    }
+    expect(moved[0] > moved[1] * 1.5f && moved[1] > moved[2], "a smoother shot responds more slowly in heading");
+
+    const auto elevation_step = [](double shot, double error_deg) {
+        const double d = 1.0, p = 20.0, a_min = 200.0, a_max = 400.0; // elevation_defaults
+        const double deg = 3.14159265358979 / 180.0;
+        const double fraction = error_deg < d ? 1.0 : error_deg < p ? 1.0 - (error_deg - d) / (p - d) : 0.0;
+        const double limit = (a_min + (a_max - a_min) * fraction) * deg;
+        const double accel = std::min(error_deg * deg * 3600.0, limit);
+        const double h = 1.0 - shot;
+        return accel / 60.0 / 60.0 * (h * h);
+    };
+    const AngleRigSettings es = AngleRigSettings::elevation_defaults();
+    float emoved[2] = {};
+    const float eshots[2] = {0.5f, 0.85f};
+    for (int k = 0; k < 2; ++k) {
+        ElevationTracker e;
+        e.reset(0.0f);
+        e.update(dt, 5.0f * degrees, es, eshots[k]);
+        emoved[k] = e.position();
+        expect(std::abs(static_cast<double>(emoved[k]) - elevation_step(static_cast<double>(eshots[k]), 5.0)) < 1e-8,
+               "elevation first step matches the Rust smoothing formula");
+    }
+    expect(emoved[0] > emoved[1] * 5.0f, "a smoother shot responds more slowly in elevation");
+
+    // Through the whole rig: RigInput carries the blended shot's smoothing[0] / [1].
+    const RigSettings set;
+    Rig loose, tight;
+    RigInput in;
+    in.compass.forward = {0, 0, 1};
+    in.shot_heading = pi;
+    in.elevation_target = 0.0f;
+    loose.reset(in, set);
+    tight.reset(in, set);
+    RigInput go = in;
+    go.shot_heading = pi + 20.0f * degrees;
+    go.elevation_target = 10.0f * degrees;
+    RigInput loose_in = go, tight_in = go;
+    loose_in.heading_smoothing = loose_in.elevation_smoothing = 0.3f;
+    tight_in.heading_smoothing = tight_in.elevation_smoothing = 0.9f;
+    RigOutput lo, ti;
+    for (int i = 0; i < 20; ++i) {
+        lo = loose.update(dt, loose_in, set);
+        ti = tight.update(dt, tight_in, set);
+    }
+    expect(std::abs(wrap_angle(lo.heading - pi)) > std::abs(wrap_angle(ti.heading - pi)) * 2.0f, "Rig: the shot's direction smoothing sets the heading response");
+    expect(lo.elevation > ti.elevation * 2.0f, "Rig: the shot's elevation smoothing sets the elevation response");
 }
 
 void distance_tracker() {
@@ -288,7 +373,7 @@ void reset_snaps_everything() {
     expect(near(out.distance, 2.5f, 0.01f) && near(out.anchor[0], 0.0f, 0.01f), "rig starts settled");
 
     // Fling the subject, turn it, change every target: the rig is mid-motion everywhere.
-    for (int i = 1; i <= 90; ++i) {
+    for (int i = 1; i <= 45; ++i) {
         const float t = static_cast<float>(i) * dt;
         in.anchor.position = {10.0f * t, 0.5f, -4.0f * t};
         in.anchor.reference_height = 0.5f;
@@ -338,6 +423,7 @@ int main() {
     pump_and_fade();
     heading_tracker();
     elevation_tracker();
+    shot_smoothing_drives_heading_and_elevation();
     distance_tracker();
     compass_lineup();
     deadzone();

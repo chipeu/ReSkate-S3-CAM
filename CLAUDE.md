@@ -209,3 +209,5 @@ with file:line and a concrete failure scenario. Do not edit code.
   clang. Next: T5 (rig + air), then T6 (graph + CameraMan) and Gate 1.
 - 2026-10-15: T5 and T6 done and reviewed; 11 pure test suites pass (ASan/UBSan, clang). The
   scripted session gives the same shot sequence at 30/60/144 fps, max step 0.34 m. Next: Gate 1 review.
+- 2026-10-15: Gate 1 passed with fixes (independent review); fixes 1–7 in, 11 suites green. Standing
+  heights Low 0.589 / High 1.870 m. Next: Phase 2 (T7 subject, T8 collision, T9 ownership, T10, T11).

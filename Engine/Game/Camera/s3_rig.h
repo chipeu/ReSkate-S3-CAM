@@ -19,12 +19,12 @@
 
 // The S3Cam rig (card T5): where the camera orbits (anchor, with push/pump lag), which way it looks
 // from (heading, elevation) and how far (distance). Pure, header-only, no allocation. Call
-// Rig::update() on the fixed rig step (120 Hz, CLAUDE.md hard rule 5); the lag and tracker settings
-// are per-step quantities tuned for that rate. World is Y up; heading 0 looks down +Z and grows
+// Rig::update() on the fixed rig step (60 Hz, CLAUDE.md hard rule 5); the lag and tracker settings
+// are per-step quantities (per 1/60 s, as in the Rust). World is Y up; heading 0 looks down +Z and grows
 // toward -X (heading(v) = atan2(-x, z), compass.rs).
 namespace dingosdk::s3cam {
 
-inline constexpr float rig_step = 1.0f / 120.0f;
+inline constexpr float rig_step = fixed_step;
 
 // ---------------------------------------------------------------- lag curve (PointGraph<8>)
 
@@ -182,14 +182,22 @@ private:
 
 // ---------------------------------------------------------------- heading and elevation
 
+// The tracker smoothing the rig derives from a shot's direction / elevation smoothing
+// (manager_rig.rs bind_shot + rig_tracking.rs update_heading / update_elevation): with h = 1 - s the
+// rig field is h * h, and the tracker is bound to 1 - h * h. 0 = take the whole step, 1 = hold.
+// Per 1/60 s step, like every other smoothing constant here.
+inline float rig_angle_smoothing(float shot_smoothing) noexcept {
+    const float h = 1.0f - clamp01(shot_smoothing);
+    return 1.0f - h * h;
+}
+inline constexpr float default_shot_smoothing = 0.8f; // Shot::new (s3_shot.h)
+
 struct AngleRigSettings {
-    AngleTrackerSettings tracker;      // smoothing_min/max here are ignored: they are derived (below)
-    float avoidance_smoothing = 0.9f;  // Avoidance{Heading,Elevation}Smoothing; the tracker smoothing is 1 - this
+    AngleTrackerSettings tracker;      // smoothing_min/max here are ignored: they come from the shot (rig_angle_smoothing)
     float max_elevation_degrees = 80.0f; // elevation target clamp (rig_positioning.rs clamp_elevation)
 
     bool valid() const noexcept {
-        return ::dingosdk::s3cam::valid(tracker) && std::isfinite(avoidance_smoothing) && avoidance_smoothing >= 0.0f &&
-               avoidance_smoothing <= 1.0f && std::isfinite(max_elevation_degrees) && max_elevation_degrees > 0.0f &&
+        return ::dingosdk::s3cam::valid(tracker) && std::isfinite(max_elevation_degrees) && max_elevation_degrees > 0.0f &&
                max_elevation_degrees < 90.0f;
     }
 
@@ -200,7 +208,6 @@ struct AngleRigSettings {
         s.tracker.speed_clamp_degrees = 200.0f;
         s.tracker.acceleration_min_degrees = 400.0f;
         s.tracker.acceleration_max_degrees = 900.0f;
-        s.avoidance_smoothing = 0.9f;
         return s;
     }
     static AngleRigSettings elevation_defaults() {
@@ -210,7 +217,6 @@ struct AngleRigSettings {
         s.tracker.speed_clamp_degrees = 60.0f;
         s.tracker.acceleration_min_degrees = 200.0f;
         s.tracker.acceleration_max_degrees = 400.0f;
-        s.avoidance_smoothing = 0.9f;
         return s;
     }
 };
@@ -220,6 +226,7 @@ struct HeadingInput {
     float offset = 0.0f;       // radians added on top of the tracked heading (stick offset)
     bool active = true;        // rig flags_517 bit 0x20: heading update enabled
     bool boost = false;        // heading_acceleration_state > 0: acceleration clamp doubled, update enabled
+    float shot_smoothing = default_shot_smoothing; // the blended shot's smoothing[0] (direction), 0..1
 };
 
 class HeadingTracker {
@@ -231,9 +238,9 @@ public:
         if (!set.valid() || !(dt > 0.0f) || !std::isfinite(in.target)) return current();
         if (!in.active && !in.boost) return current();
         const float error = std::abs(wrap_angle(wrap_angle(in.target) - current()));
-        // Smoothing grows toward 1 - avoidance_smoothing as the error shrinks and is capped at 0.8
-        // for big errors, so the camera hurries when it is far off and settles gently (82E03C18).
-        const float base = 1.0f - set.avoidance_smoothing;
+        // The shot sets the smoothing for a small error; it is capped at 0.8 for big errors, so the
+        // camera hurries when it is far off and settles gently (82E03C18).
+        const float base = rig_angle_smoothing(in.shot_smoothing);
         const float capped = std::min(base, 0.8f);
         const float quarter_turn = pi / 4;
         const float smoothing = error < quarter_turn ? base + (capped - base) * (error / quarter_turn) : capped;
@@ -259,11 +266,13 @@ private:
 class ElevationTracker {
 public:
     void reset(float radians) noexcept { tracker_.reset(radians); }
-    float update(float dt, float target, const AngleRigSettings& set) noexcept {
+    // `shot_smoothing` is the blended shot's smoothing[1] (elevation), 0..1.
+    float update(float dt, float target, const AngleRigSettings& set,
+                 float shot_smoothing = default_shot_smoothing) noexcept {
         if (!set.valid() || !(dt > 0.0f) || !std::isfinite(target)) return tracker_.position();
         const float limit = set.max_elevation_degrees * degrees;
         AngleTrackerSettings ts = set.tracker;
-        ts.smoothing_min = ts.smoothing_max = clamp01(1.0f - set.avoidance_smoothing);
+        ts.smoothing_min = ts.smoothing_max = clamp01(rig_angle_smoothing(shot_smoothing));
         return tracker_.update(std::clamp(wrap_angle(target), -limit, limit), dt, ts);
     }
     float position() const noexcept { return tracker_.position(); }
@@ -347,7 +356,7 @@ struct CompassSettings {
     float min_deadzone_speed = 1.0f;    // m/s. At or below it the dead-zone is full size
     float max_deadzone_speed = 6.0f;    // m/s. At or above it the dead-zone is gone
     float max_deadzone_size = 0.3f;     // m, the dead-zone radius at low speed; TUNE
-    float deadzone_smoothing = 0.9f;    // 0..1, how slowly the dead-zone radius changes per step; TUNE
+    float deadzone_smoothing = 0.9f;    // 0..1, how slowly the dead-zone radius changes per 1/60 s step (the fixed step); TUNE
 
     bool valid() const noexcept {
         const auto frac = [](float v) { return std::isfinite(v) && v >= 0.0f && v <= 1.0f; };
@@ -403,9 +412,9 @@ public:
         if (speed > set.stopped_speed) {
             const Vec3 travel = normalized(damped_velocity_);
             if (length(travel) > 0.0f)
-                heading_ = blend_angle(heading_, heading_of(travel), per_step(set.heading_response, dt));
+                heading_ = blend_angle(heading_, heading_of(travel), set.heading_response); // per 1/60 s step
         } else if (!in.crouching && stopped_time_ >= set.time_before_lineup) {
-            heading_ = blend_angle(heading_, heading_of(in.forward), per_step(set.lineup_speed, dt));
+            heading_ = blend_angle(heading_, heading_of(in.forward), set.lineup_speed); // per 1/60 s step
         }
         return heading_;
     }
@@ -415,10 +424,6 @@ public:
 
 private:
     static bool finite3(const Vec3& v) noexcept { return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]); }
-    // Rust runs the compass at exactly 1/60 s per call; convert a per-1/60 s share to this step.
-    static float per_step(float weight, float dt) noexcept {
-        return weight >= 1.0f ? 1.0f : 1.0f - std::pow(1.0f - weight, dt * 60.0f);
-    }
     // compass_movement.rs update_deadzone: the point trails the subject, staying within the radius.
     void update_deadzone(float dt, float x, float z) noexcept {
         const float old_x = deadzone_position_[0], old_z = deadzone_position_[1];
@@ -463,7 +468,9 @@ struct RigInput {
     float heading_offset = 0.0f;
     bool heading_active = true;
     bool heading_boost = false;
+    float heading_smoothing = default_shot_smoothing;   // the blended shot's smoothing[0] (direction)
     float elevation_target = 0.0f; // radians
+    float elevation_smoothing = default_shot_smoothing; // the blended shot's smoothing[1] (elevation)
     DistanceInput distance;
 };
 
@@ -499,8 +506,9 @@ public:
             h.offset = in.heading_offset;
             h.active = in.heading_active;
             h.boost = in.heading_boost;
+            h.shot_smoothing = in.heading_smoothing;
             heading_.update(dt, h, set.heading);
-            elevation_.update(dt, in.elevation_target, set.elevation);
+            elevation_.update(dt, in.elevation_target, set.elevation, in.elevation_smoothing);
             distance_.update(dt, in.distance, set.distance);
         }
         RigOutput out;

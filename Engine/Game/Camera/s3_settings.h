@@ -44,13 +44,14 @@ struct OrientationSettings {
 // has no skeleton). All metres, TUNE.
 struct SubjectPointSettings {
     float board_drop = 0.9f;           // root -> board (SPIKES.md: board is ~0.9 m below the root riding)
+    float anchor_height = 0.32f;       // board -> orbit anchor (Rust: subject.anchors[shot.anchor]); sets the standing camera height (Low ~0.59 m, High ~1.85 m above the ground); TUNE
     float head_height = 0.7f;          // root -> head
     float com_height = 0.05f;          // root -> centre of mass
     float trajectory_lookahead = 0.25f; // s ahead on the ballistic arc the "Trajectory" point sits while airborne
 
     bool valid() const noexcept {
         const auto ok = [](float v, float lo, float hi) { return std::isfinite(v) && v >= lo && v <= hi; };
-        return ok(board_drop, 0.0f, 3.0f) && ok(head_height, -3.0f, 3.0f) && ok(com_height, -3.0f, 3.0f) &&
+        return ok(board_drop, 0.0f, 3.0f) && ok(anchor_height, -3.0f, 3.0f) && ok(head_height, -3.0f, 3.0f) && ok(com_height, -3.0f, 3.0f) &&
                ok(trajectory_lookahead, 0.0f, 2.0f);
     }
 };
@@ -80,7 +81,7 @@ struct PipelineSettings {
     float teleport_distance = 10.0f;    // m, a snapshot farther than this from the last one is a cut: the camera resets; TUNE
     float resume_reset_time = 0.5f;     // s, after this long without a usable snapshot the camera resets when data returns; TUNE
     float no_lag_after_reset = 0.2f;    // s, the anchor follows with no lag this long after a reset (decision 2: "just reset"); TUNE
-    int max_steps_per_update = 16;      // fixed steps one update may run; extra time is dropped (spiral-of-death guard)
+    int max_steps_per_update = 16;      // fixed (1/60 s) steps one update may run; extra time is dropped (spiral-of-death guard)
     float shake_distance_scale = 1.0f;  // multiplies the camera distance fed to the shake fade; 1 = the real distance
 
     bool valid() const noexcept {
@@ -95,7 +96,6 @@ struct PipelineSettings {
 struct CameraSettings {
     CameraPreset preset = CameraPreset::FullS3;
     CameraAngle angle = CameraAngle::Low; // S3 Low / S3 High (the shot set)
-    float fixed_hz = 120.0f;              // fixed step rate for trackers, blends and shake (CLAUDE.md hard rule 5)
     float fov_override_deg = 0.0f;        // > 0 replaces the computed (or native) field of view; 0 = off
     bool shake_enabled = true;            // master switch for the shake layer in both presets
 
@@ -110,8 +110,7 @@ struct CameraSettings {
     PipelineSettings pipeline;
 
     bool valid() const noexcept {
-        return std::isfinite(fixed_hz) && fixed_hz >= 30.0f && fixed_hz <= 480.0f && std::isfinite(fov_override_deg) &&
-               fov_override_deg >= 0.0f && fov_override_deg < 180.0f && rig.valid() && orientation.valid() && air.valid() &&
+        return std::isfinite(fov_override_deg) && fov_override_deg >= 0.0f && fov_override_deg < 180.0f && rig.valid() && orientation.valid() && air.valid() &&
                shake.valid() && trajectory.valid() && graph.valid() && points.valid() && native_plus.valid() &&
                pipeline.valid();
     }
