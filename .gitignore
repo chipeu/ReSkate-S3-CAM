@@ -27,5 +27,6 @@ analysis/raw/**/*.res
 
 # Local research and extended documentation are not shipped.
 /analysis/
-/docs/
+/docs/*
+!/docs/s3cam/
 /release
