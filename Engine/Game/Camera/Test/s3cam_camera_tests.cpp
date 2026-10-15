@@ -82,10 +82,10 @@ struct Session {
         float y = ride_height, vy = 0.0f;
         std::uint32_t state = physics_state::ride;
         if (t >= jump_time && t < land_time()) {
-            const float tau = t - jump_time;
-            y = ride_height + jump_speed * tau - 0.5f * g * tau * tau;
-            vy = jump_speed - g * tau;
-            state = tau < 0.08f ? physics_state::pop : physics_state::air;
+            const float since_jump = t - jump_time;
+            y = ride_height + jump_speed * since_jump - 0.5f * g * since_jump * since_jump;
+            vy = jump_speed - g * since_jump;
+            state = since_jump < 0.08f ? physics_state::pop : physics_state::air;
         }
         if (t >= grind_start && t < grind_end) {
             state = 400;

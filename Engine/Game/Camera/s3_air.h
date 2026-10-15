@@ -9,6 +9,7 @@
 #include "Engine/Game/Camera/s3_math.h"
 #include "Engine/Game/Camera/s3_trajectory.h"
 
+#include <algorithm>
 #include <cmath>
 #include <optional>
 
@@ -179,7 +180,9 @@ private:
         float target = old_height;
         const bool blending = !in.snap_height && transitioning();
         if (blending) {
-            const float fraction = clamp01(transition_time_ / transition_duration_);
+            // transitioning() already means duration > 0; the floor only keeps MSVC's optimizer from
+            // seeing a zero divisor on an inlined path (C4723).
+            const float fraction = clamp01(transition_time_ / std::max(transition_duration_, 1e-6f));
             target = transition_start_ + fraction * (transition_end_ - transition_start_);
             if (moved_) {
                 const float pull = weight * weight; // the prediction is unsettled: lean on the anchor

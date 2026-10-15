@@ -202,7 +202,7 @@ public:
                 // by the accumulator carried in, so the subject is interpolated, never extrapolated.
                 // When the cap dropped steps the survivors cover (0, 1] evenly instead of stopping short.
                 const float f = capped ? static_cast<float>(i) / static_cast<float>(steps)
-                                       : dt > 0.0f ? clamp01((static_cast<float>(i) * step - carry) / dt) : 1.0f;
+                                       : dt > 0.0f ? clamp01((static_cast<float>(i) * step - carry) / std::max(dt, 1e-9f)) : 1.0f;
                 const SubjectSnapshot sub_snap = blend_snapshot(cur_snap_, subject, f);
                 step_once(sub_snap, ground, false);
             }
@@ -433,7 +433,7 @@ private:
             angle_ = cs.angle;
         }
         shot_elapsed_ += dt;
-        shot_fraction_ = shot_duration_ <= 0.0f ? 1.0f : clamp01(shot_elapsed_ / shot_duration_);
+        shot_fraction_ = shot_duration_ <= 0.0f ? 1.0f : clamp01(shot_elapsed_ / std::max(shot_duration_, 1e-6f));
         current_ = interpolate(from_, leaf_, shot_fraction_);
         current_.position_heading = blend_angle(from_.position_heading, leaf_.position_heading, sine_blend(shot_fraction_));
         const Vec3 reference_now = weighted_point(points, current_); // the blended weights: framing only

@@ -88,6 +88,10 @@ before Aescher builds it:
 
 - Pure headers in `Engine/Game/Camera/` compile and run with g++ and clang:
   `g++ -std=c++20 -Wall -Wextra -Wconversion -Wsign-conversion -Wshadow -I. Engine/Game/Camera/Test/<test>.cpp`
+- MSVC-only warnings the Linux pass misses (both seen at Phase 2): **C4459**, a local or parameter that
+  shares a name with a namespace-scope one the TU can see (`s3cam::tau`, a test's global `g`, also
+  inside templates the test instantiates); and **C4723**, a release-build "potential divide by 0" where
+  the optimizer inlines a guarded division. Give guarded divisors a visible floor (`std::max(d, eps)`).
 - Windows sources get a syntax-only MinGW pass: `sh docs/s3cam/linux_syntax_check.sh <files…>`
   (needs `g++-mingw-w64-x86-64-posix`). It catches compile errors, not MSVC warnings.
 - Aescher then builds with MSVC, runs `ctest`, plays the requested test lines, and sends back
