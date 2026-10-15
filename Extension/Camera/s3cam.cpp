@@ -446,6 +446,7 @@ std::array<float, 16> s3cam_pose(const SourceTrial& trial, const std::array<floa
     }
     r.base_fov = r.native_fov > 0 ? r.native_fov : r.fallback_fov;
     native.fov_deg = r.base_fov;
+    extras.base_fov_deg = r.base_fov; // the camera core's speed / big-air FOV terms ride on the game's own FOV
 
     LARGE_INTEGER begin{}, end{};
     QueryPerformanceCounter(&begin);

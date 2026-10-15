@@ -220,3 +220,8 @@ with file:line and a concrete failure scenario. Do not edit code.
   tick without control, logs the flow states (hand-back spike), landings and per-second costs.
   Alloc-free rays with the start-hit skip. Syntax-checked only. Next: Aescher's alpha run
   (docs/s3cam/PHASE2.md), then T8 collision, T10/T11 settings and page.
+- 2026-10-15: Alpha 2 from Aescher's first in-game feedback: crossfades and game-FOV matching (Opus,
+  glue), root extrapolation between physics steps, look / shoulder / follow / FOV / speed shake /
+  collision in the core (Sonnet, reviewed; s3cam_layers suite), S3 CAMERA tab + saved settings
+  (Sonnet, reviewed), R3 height and the L3 side bind. Next: Aescher's Alpha 2 run (PHASE2.md),
+  map/customisation hand-back from its log.

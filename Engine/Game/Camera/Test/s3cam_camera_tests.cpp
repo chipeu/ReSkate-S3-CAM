@@ -428,7 +428,10 @@ void test_fov() {
     // A bad aspect keeps the last good one.
     ex.aspect = std::nanf("");
     const float kept = c2.update(1.0f / 60.0f, s, flat_ground, ex).fov_deg;
-    expect(near(kept, fov43, 1e-3f), "a NaN aspect keeps the last good aspect");
+    // Alpha 2: the speed term of the fov extras eases in from the cut (0.6 deg at 6 m/s, about 0.03 deg
+    // after one step), so this compares with a tolerance that covers it, still far below the
+    // difference between the two aspects (which is several degrees).
+    expect(near(kept, fov43, 0.05f), "a NaN aspect keeps the last good aspect");
     // Override.
     CameraSettings o;
     o.fov_override_deg = 72.5f;
@@ -705,6 +708,10 @@ NativePose native_for(const SubjectSnapshot& s, bool follow_height) {
 void test_native_plus_follows_native() {
     CameraSettings np;
     np.preset = CameraPreset::NativePlus;
+    // Alpha 2: the speed and air fov terms ride on top of the native fov (covered in s3cam_layers_tests);
+    // they are off here so this test keeps checking the pass-through of the native value itself.
+    np.fov.speed_fov = false;
+    np.fov.air_fov = false;
     CameraMan cam;
     expect(cam.set_settings(np), "NativePlus settings accepted");
     const Session session;
