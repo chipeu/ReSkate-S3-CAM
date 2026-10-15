@@ -32,7 +32,9 @@ constexpr std::uintptr_t client_flow_state_offset = 0xc4; // Runtime/client_tick
 // deck) to well below anything the camera cares about.
 constexpr float ground_ray_above = 0.1f, ground_ray_below = 10.0f;
 // The trajectory's first chord starts on the takeoff surface and touches it at once: a hit this
-// close to a chord's start is skipped by casting again from a little further along.
+// close to the start of a chord that RISES is skipped by casting again from a little further along.
+// Only rising chords: the first in-game run skipped a falling chord that started just above the
+// floor, cast the next one from below it and predicted landings 8-9 m down on flat ollies.
 constexpr float start_hit_skip = 0.02f, start_hit_restart = 0.03f;
 // The skater's root moves once per physics step (60 Hz). Rendering faster, the frames between two
 // steps would see it stand still and then jump, which reads as a choppy camera at speed and in big
@@ -46,6 +48,13 @@ constexpr float plausible_fov_min = 10.0f, plausible_fov_max = 150.0f;
 // The game's camera this far from the skater while S3Cam owns the view: the game has moved it to a
 // screen of its own (map, customisation); S3Cam hands back at once and does not take it again there.
 constexpr float native_away_distance = 25.0f;
+// Manual detection (no native signal found, SPIKES.md): the board's pitch against the ground under
+// it, from its frontmost and rearmost physics bodies (debug_noclip_bodies parts 0-8, position at
+// +0x50 like the root body's). A manual or nose manual holds one end up. TUNE.
+constexpr std::uintptr_t body_position_offset = 0x50;
+constexpr std::size_t board_body_count = 9;
+constexpr float manual_on_degrees = 7.0f, manual_off_degrees = 4.0f;
+constexpr double manual_on_time = 0.15, manual_off_time = 0.1;
 
 struct Settings {
     std::mutex mutex;
@@ -75,6 +84,12 @@ struct Watch {
     // Extrapolation between physics steps (max_extrapolation).
     Vec3 physics_root{};
     double root_changed_at{};
+    // Manual detection.
+    float board_pitch{};      // degrees against the ground, + front end up
+    bool board_pitch_ok{};
+    bool manual{};
+    double manual_candidate_since{};
+    bool manual_candidate{};
     // s3cam_note_flow
     bool flow_known{};
     std::uint32_t flow_state{}, flow_mode{};
@@ -123,6 +138,12 @@ struct Run {
     float landed_air{}, landed_drop{}, landing_impulse{}, landing_speed{};
     bool landing_pending{};
     std::uint32_t landings{};
+    // Per flight: the largest frame-to-frame changes, to find what twitches in big airs.
+    bool frame_seen{};
+    float prev_fov{};
+    Vec3 prev_back{}, prev_pos{}, prev_step{};
+    float flight_fov_jump{}, flight_turn{}, flight_jerk{}, flight_look{}, flight_pull{}, flight_fov_min{}, flight_fov_max{};
+    float flight_yaw_trick{};
 };
 Run& run() {
     static auto* value = new Run;
@@ -165,7 +186,7 @@ Vec3 normal_at(const Vec3& hit) noexcept {
 }
 std::optional<s3cam::GroundHit> ground_query(const Vec3& from, const Vec3& to) noexcept {
     auto hit = cast(from, to);
-    if (hit && s3cam::length(s3cam::sub(*hit, from)) < start_hit_skip) {
+    if (hit && to[1] > from[1] && s3cam::length(s3cam::sub(*hit, from)) < start_hit_skip) {
         const auto direction = s3cam::normalized(s3cam::sub(to, from));
         const auto restart = s3cam::add(from, s3cam::scale(direction, start_hit_restart));
         if (s3cam::dot(s3cam::sub(to, restart), direction) <= 0) return std::nullopt;
@@ -214,9 +235,11 @@ void log_landing(const Run& r) {
     };
     logging::log(Level::info, Channel::skater,
         "s3cam landing #{}: air {:.2f} s (predicted {}), drop {:+.2f} m (predicted {}), apex {}, "
-        "speed {:.1f} m/s, shake impulse peak {:.3f}",
+        "speed {:.1f} m/s, shake impulse peak {:.3f} | in the air: fov {:.1f}-{:.1f} (largest step {:.2f}), "
+        "largest turn {:.2f} deg/frame, largest jerk {:.3f} m, landing look {:.2f}, collision pull {:.2f} m",
         r.landings, r.landed_air, predicted(r.predicted_air, "s", false), r.landed_drop, predicted(r.predicted_drop, "m", true),
-        predicted(r.predicted_height, "m", false), r.landing_speed, r.landing_impulse);
+        predicted(r.predicted_height, "m", false), r.landing_speed, r.landing_impulse, r.flight_fov_min, r.flight_fov_max,
+        r.flight_fov_jump, r.flight_turn, r.flight_jerk, r.flight_look, r.flight_pull);
 }
 
 // Shot changes, takeoffs and landings, from the frame's debug values.
@@ -226,6 +249,27 @@ void watch_frame(Run& r, const Watch& w, const s3cam::Frame& frame, double now) 
         logging::log(Level::info, Channel::skater, "s3cam shot {} -> {} (state {}, speed {:.1f})",
             r.shot.empty() ? std::string_view("none") : r.shot, d.shot_name, w.state, d.speed);
     r.shot = d.shot_name;
+    // Frame-to-frame motion of the output, tracked through each flight.
+    const Vec3 step_now = r.frame_seen ? s3cam::sub(frame.pos, r.prev_pos) : Vec3{0, 0, 0};
+    if (d.airborne && !r.airborne) {
+        r.flight_fov_jump = r.flight_turn = r.flight_jerk = r.flight_look = r.flight_pull = 0.0f;
+        r.flight_fov_min = r.flight_fov_max = frame.fov_deg;
+    }
+    if (d.airborne && r.frame_seen) {
+        r.flight_fov_jump = std::max(r.flight_fov_jump, std::abs(frame.fov_deg - r.prev_fov));
+        r.flight_fov_min = std::min(r.flight_fov_min, frame.fov_deg);
+        r.flight_fov_max = std::max(r.flight_fov_max, frame.fov_deg);
+        r.flight_turn = std::max(r.flight_turn,
+            std::acos(std::clamp(s3cam::dot(frame.back, r.prev_back), -1.0f, 1.0f)) / s3cam::degrees);
+        r.flight_jerk = std::max(r.flight_jerk, s3cam::length(s3cam::sub(step_now, r.prev_step)));
+        r.flight_look = std::max(r.flight_look, d.landing_look_weight);
+        r.flight_pull = std::max(r.flight_pull, d.collision_pull);
+    }
+    r.prev_fov = frame.fov_deg;
+    r.prev_back = frame.back;
+    r.prev_step = step_now;
+    r.prev_pos = frame.pos;
+    r.frame_seen = true;
     if (d.airborne && !r.airborne) {
         r.takeoff_at = now;
         r.takeoff_y = w.subject.position[1];
@@ -269,12 +313,13 @@ void report(Run& r, Watch& w, double now) {
         "game camera moved on {} (unreadable {}) | "
         "update {:.3f} ms mean, {:.3f} max, {} rays | state {} shot {} speed {:.1f} clearance {:.2f} normal.y {:.3f} | "
         "dist {:.2f} elev {:.1f} deg lag {:.2f} | fov {:.1f} (game camera {:.1f}, FreeCamera at take {:.1f}) | "
-        "game camera {:.1f} m from the skater | blend {:.2f}",
+        "game camera {:.1f} m from the skater | blend {:.2f} | board pitch {} manual {}",
         now - r.started, r.frames, r.steps, r.held, r.resets, r.failed, w.unreadable, w.root_repeats, r.native_moved,
         r.native_unreadable,
         r.frames ? r.update_ms / r.frames : 0.0, r.update_ms_max, w.rays - r.rays_at_report, w.state, d.shot_name, d.speed,
         w.subject.ground_clearance, w.subject.ground_normal[1], d.distance, d.elevation / s3cam::degrees, d.anchor_lag,
-        f.fov_deg, r.native_fov, r.fallback_fov, r.native_distance, r.blend);
+        f.fov_deg, r.native_fov, r.fallback_fov, r.native_distance, r.blend,
+        w.board_pitch_ok ? std::format("{:+.1f} deg", w.board_pitch) : std::string("unreadable"), w.manual ? "on" : "off");
     r.frames = r.steps = r.held = r.resets = r.failed = r.native_moved = r.native_unreadable = 0;
     w.unreadable = w.root_repeats = 0;
     r.update_ms = r.update_ms_max = 0;
@@ -338,6 +383,43 @@ S3CamObservation s3cam_observe(const SourceTrial& trial, std::uintptr_t client) 
                 s3cam::sub(s.position, {0, ground_ray_below, 0}))) {
             s.ground_clearance = s.position[1] - (*ground)[1];
             s.ground_normal = normal_at(*ground);
+        }
+        // Board pitch against the ground: the extreme bodies along the skater's forward.
+        {
+            const Vec3 axis = s3cam::normalized({s.forward[0], 0.0f, s.forward[2]}, {0, 0, 1});
+            Vec3 front{}, back{};
+            float most = -1e9f, least = 1e9f;
+            bool any = false;
+            for (std::size_t i = 0; i < board_body_count; ++i) {
+                Vec3 p{};
+                if (!first_person_read(bodies.parts[i] + body_position_offset, p.data(), sizeof(p)) ||
+                    !std::isfinite(p[0] + p[1] + p[2]))
+                    continue;
+                const float along = s3cam::dot(p, axis);
+                if (along > most) { most = along; front = p; }
+                if (along < least) { least = along; back = p; }
+                any = true;
+            }
+            const Vec3 span = s3cam::sub(front, back);
+            w.board_pitch_ok = any && s3cam::length(span) > 0.3f && s3cam::length(span) < 2.0f;
+            if (w.board_pitch_ok) {
+                const float up = s3cam::dot(s3cam::normalized(span), s3cam::normalized(s.ground_normal, {0, 1, 0}));
+                w.board_pitch = std::asin(std::clamp(up, -1.0f, 1.0f)) / s3cam::degrees;
+            }
+            const bool rolling = onboard && !s3cam::is_air_state(state) && !s3cam::is_grind_state(state);
+            const bool tilted = w.board_pitch_ok && rolling &&
+                std::abs(w.board_pitch) >= (w.manual ? manual_off_degrees : manual_on_degrees);
+            if (tilted != w.manual) {
+                if (!w.manual_candidate) { w.manual_candidate = true; w.manual_candidate_since = now; }
+                if (now - w.manual_candidate_since >= (w.manual ? manual_off_time : manual_on_time)) {
+                    w.manual = tilted;
+                    w.manual_candidate = false;
+                    if (s3cam_options().verbose)
+                        logging::log(Level::info, Channel::skater, "s3cam manual {} (board pitch {:+.1f} deg, state {})",
+                            w.manual ? (w.board_pitch > 0 ? "on (nose up)" : "on (nose down)") : "off", w.board_pitch, state);
+                }
+            } else w.manual_candidate = false;
+            s.manual = w.manual;
         }
         s.valid = true;
         if (s.position == w.last_root) ++w.root_repeats;
