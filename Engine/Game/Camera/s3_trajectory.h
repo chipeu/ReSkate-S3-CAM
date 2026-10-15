@@ -105,7 +105,7 @@ TrajectoryPrediction predict_trajectory(const TrajectoryLaunch& launch, Query&& 
         !std::isfinite(launch.camera_distance))
         return out;
 
-    const float g = settings.gravity;
+    const float gravity = settings.gravity;
     const Vec3& p0 = launch.position;
     const Vec3& v0 = launch.velocity;
     const int steps = static_cast<int>(std::ceil(settings.max_time / settings.step));
@@ -116,7 +116,7 @@ TrajectoryPrediction predict_trajectory(const TrajectoryLaunch& launch, Query&& 
     for (int i = 0; i < steps; ++i) {
         const float t0 = static_cast<float>(i) * settings.step;
         const float t1 = std::min(static_cast<float>(i + 1) * settings.step, settings.max_time);
-        const Vec3 end = at(p0, v0, g, t1);
+        const Vec3 end = at(p0, v0, gravity, t1);
         ++out.segments_tested;
         if (const std::optional<GroundHit> found = query(start, end)) {
             if (finite(found->point)) {
@@ -128,10 +128,10 @@ TrajectoryPrediction predict_trajectory(const TrajectoryLaunch& launch, Query&& 
                 float frac = chord2 > 1e-12f ? clamp01(dot(sub(found->point, start), chord) / chord2) : 0.0f;
                 float t = t0 + (t1 - t0) * frac;
                 for (int k = 0; k < 3; ++k) {
-                    const Vec3 p = at(p0, v0, g, t);
-                    const Vec3 v{v0[0], v0[1] - g * t, v0[2]};
+                    const Vec3 p = at(p0, v0, gravity, t);
+                    const Vec3 v{v0[0], v0[1] - gravity * t, v0[2]};
                     const Vec3 d = sub(p, found->point);
-                    const float slope = dot(v, v) - g * d[1];
+                    const float slope = dot(v, v) - gravity * d[1];
                     if (!(std::abs(slope) > 1e-6f)) break;
                     t = std::clamp(t - dot(d, v) / slope, t0, t1);
                 }
@@ -148,16 +148,16 @@ TrajectoryPrediction predict_trajectory(const TrajectoryLaunch& launch, Query&& 
     out.predicted_air_time = end_time;
 
     // Apex: closed form, clipped to the part of the flight that happened (a ceiling or an early
-    // landing can end the climb before vy/g).
-    out.apex_time = v0[1] > 0.0f ? std::min(v0[1] / g, end_time) : 0.0f;
-    out.apex_position = at(p0, v0, g, out.apex_time);
+    // landing can end the climb before vy/gravity).
+    out.apex_time = v0[1] > 0.0f ? std::min(v0[1] / gravity, end_time) : 0.0f;
+    out.apex_position = at(p0, v0, gravity, out.apex_time);
     out.predicted_max_height = out.apex_position[1] - p0[1];
 
     if (landed) {
         out.landing_position = hit.point;
         out.landing_normal = normalized(hit.normal, {0, 1, 0});
     } else {
-        out.landing_position = at(p0, v0, g, end_time);
+        out.landing_position = at(p0, v0, gravity, end_time);
         out.landing_normal = {0, 1, 0};
     }
     out.predicted_landing_height = out.landing_position[1] - p0[1];
