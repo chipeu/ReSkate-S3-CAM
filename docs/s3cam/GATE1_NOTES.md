@@ -61,3 +61,22 @@ reference that an implementer made on purpose, and the reasons given.
   Whether the game's +0xac wants vertical degrees is still to check at T9.
 - **Measured:** the air weights put the anchor about 0.24 m above the board weights, so there's
   about 0.12 m of bounce around landing (continuous). Re-tune at T12.
+
+## Gate 1 review (independent reviewer, 2026-10-15): pass with fixes
+No blockers. Core ports were checked line by line against the Rust and found faithful. Fixes
+applied in the Gate 1 fix commit:
+1. Framing pitch sign was inverted (`frame_composer.rs:95` `pitch = -framing[2]`).
+2. Heading/elevation smoothing now comes from the shot (`manager_rig.rs:73-76`) instead of a
+   global constant.
+3. The air transition base is taken once per flight (a prediction Miss re-based it mid-air).
+4. The predicted max height is latched per flight (big air flipped back to normal on the way down).
+5. Huge dt overflowed the step cast and froze the camera.
+6. A separate orbit anchor (the camera sat ~0.3 m low against the published standing heights).
+7. The fixed step is now exactly 60 Hz (the Rust `STEP` = 1/60); the plan's 120 Hz was wrong.
+
+Carried into later cards as acceptance items:
+- **T7:** is state 601 airborne? (If it is, each one fires a false landing.) Make the air-state set
+  data-driven. Interpolate snapshots on the publisher's physics time, not the frame fraction; add a
+  stair-step (60 Hz physics at 144 fps) session test.
+- **T8:** a physics ray may hit the takeoff surface at t≈0. Lift the launch point (~5 cm, via
+  `launch_clearance`) or ignore a first-segment hit while v·n > 0.

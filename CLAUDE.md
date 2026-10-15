@@ -121,10 +121,12 @@ before Aescher builds it:
 3. **Threading.** The camera is written **only on the engine thread**, at the render-pose handoff.
    Animation-thread code may only read and snapshot.
 4. **Order of operations** (from Skate 3; don't change it):
-   prepare(air/landing → incline) → graph select → shot blend → rig (fixed 120 Hz substeps) →
+   prepare(air/landing → incline) → graph select → shot blend → rig (fixed 60 Hz steps) →
    orientation/framing → shake → write.
-5. **Fixed timestep** for trackers, blends and shake, with an accumulator. Interpolate the output.
-   Never feed the raw frame dt into per-update Skate 3 filters.
+5. **Fixed timestep of exactly 1/60 s** (the Rust `STEP`, manager_state.rs) for trackers, blends
+   and shake, with an accumulator. Interpolate the output. Every per-step constant ported from the
+   Rust is per 1/60 s. Never feed the raw frame dt into per-update Skate 3 filters. (Gate 1 found
+   the plan's 120 Hz was wrong.)
 6. **Port semantics, not PowerPC quirks.** Keep the umbra/penumbra, clamps, sine blends,
    squared-impulse shaping and update order. Drop `from_bits` constants that only reproduce VMX
    rounding, and use normal float constants with a comment naming the Rust source line.
