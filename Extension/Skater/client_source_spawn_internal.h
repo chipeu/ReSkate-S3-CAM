@@ -109,6 +109,8 @@ struct InteractiveDebug {
     // S3Cam Phase 0 spike S1 (Extension/Camera/s3cam_probe.h): shares Freecam's owned mode-1
     // camera like first person; each tick publishes a fixed chase pose.
     bool s3cam_probe{};
+    // Probe mode 2 (S1b): writes the game's own camera instead; owns nothing.
+    bool s3cam_overlay{};
     ULONGLONG first_person_foot_since{}, first_person_retry_after{};
     // "First person in the camera cycle": after first person could not start, the camera height
     // button switches height as the game does until this time.

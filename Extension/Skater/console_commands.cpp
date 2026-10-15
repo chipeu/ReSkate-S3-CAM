@@ -93,13 +93,18 @@ void register_movement_commands(Commands &registry) {
     free_fov.reset = [](const Model &, const Output &) { request_debug(Debug::set_free_camera_fov, false, 0.0f); };
     registry.add(std::move(free_fov));
     // S3Cam Phase 0 spikes (Extension/Camera/s3cam_probe.h, docs/s3cam/SPIKES.md). Throwaway.
-    auto probe = variable("s3cam_probe", "S3Cam spike: fixed chase camera that logs camera, state and gravity findings",
-        Group::movement, argument("0|1", Type::boolean));
+    auto probe_mode = argument("0|1|2", Type::integer);
+    probe_mode.minimum = 0;
+    probe_mode.maximum = 2;
+    auto probe = variable("s3cam_probe",
+        "S3Cam spike: fixed chase camera that logs findings (1 takes the FreeCamera, 2 writes the game's camera)",
+        Group::movement, probe_mode);
     probe.inspect = [](const Model &m) {
         return boolean_state(m.debug.camera_available || m.debug.s3cam_probe, m.debug.s3cam_probe, m.debug.camera_unavailable);
     };
     probe.run = [](const Model &, const Values &args, const Output &) {
-        request_debug(Debug::set_s3cam_probe, std::get<bool>(args[0]));
+        const auto mode = std::get<std::int64_t>(args[0]);
+        request_debug(Debug::set_s3cam_probe, mode != 0, static_cast<float>(mode));
     };
     probe.reset = [](const Model &, const Output &) { request_debug(Debug::set_s3cam_probe, false); };
     registry.add(std::move(probe));

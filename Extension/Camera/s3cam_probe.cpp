@@ -2,6 +2,7 @@
 #include "Engine/Core/Log/logging.h"
 #include "Engine/Game/Build/20260929/engine.h"
 #include "Engine/Game/Build/20260929/grind_exit.h"
+#include "Engine/Game/Build/20260929/no_bail.h"
 #include "Engine/Game/Build/20260929/skater_state.h"
 #include "Engine/Game/Camera/s3_gravity_fit.h"
 #include "Engine/Game/Camera/s3_probe_pose.h"
@@ -26,6 +27,12 @@ constexpr std::uint32_t no_state = 0xffffffff;
 
 struct Probe {
     bool armed{};
+    // Mode 2 (S1b): instead of selecting the FreeCamera (mode 1), overwrite the game's own camera
+    // after its update. Counters say whether the write stuck and when it was skipped.
+    bool overlay{}, overlay_written{};
+    std::array<float, 16> overlay_last{};
+    std::uint64_t overlay_writes{}, overlay_held{}, overlay_offboard{}, overlay_other_camera{}, overlay_failed{};
+    double overlay_report_at{};
     std::uintptr_t native_camera{};
     int hand{};
     pose::Vec3 heading{0, 0, 1};
@@ -43,9 +50,14 @@ struct Probe {
     std::uint32_t state{no_state};
     double state_since{};
     int stance_switch{-1}; // grind_exit.h stance flag: 1 riding switch (verified for goofy only)
-    // S4: one gravity fit per airborne arc (the samples live in arc(), below).
+    // S4: one gravity fit per airborne arc, of the board root and of the skater root (the samples
+    // live in arc() and root_arc(), below). Only state 201 (KNOWN_AIR) is recorded: run 2 showed
+    // that arcs that include the pop (200) fit anywhere from 2 to 28 m/s2, because the feet still
+    // push the board then.
     bool airborne{};
     float arc_last_height{}, launch_height{}, apex{};
+    std::array<double, 64> root_fits{};
+    std::size_t root_fit_count{};
     std::array<double, 64> fits{};
     std::size_t fit_count{};
 };
@@ -57,6 +69,10 @@ s3cam::ArcRecorder& arc() {
     static auto* value = new s3cam::ArcRecorder; // 16 KB: kept off the engine thread's stack
     return *value;
 }
+s3cam::ArcRecorder& root_arc() {
+    static auto* value = new s3cam::ArcRecorder;
+    return *value;
+}
 
 bool read_native_view(std::uintptr_t base, std::uintptr_t camera, std::array<float, 16>& view) noexcept {
     std::uintptr_t vtable{};
@@ -64,6 +80,13 @@ bool read_native_view(std::uintptr_t base, std::uintptr_t camera, std::array<flo
     // time, through the guarded reader.
     if (!first_person_read(camera, &vtable, 8) || vtable != base + addr::engine::camera_vtable) return false;
     return first_person_read(camera + 0x50, view.data(), sizeof(view)) && valid_flight_transform(view);
+}
+// The game's camera keeps its view rows at +0x50 (right, up, backward, position; read by
+// debug_view_matrix). Writes go through SEH like first_person_write.
+bool write_native_view(std::uintptr_t camera, const std::array<float, 16>& view) noexcept {
+    if (camera < 0x10000 || camera > source_highest - 0x100) return false;
+    __try { std::memcpy(reinterpret_cast<void*>(camera + 0x50), view.data(), sizeof(view)); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 bool view_changed(const std::array<float, 16>& a, const std::array<float, 16>& b) {
     for (const std::size_t i : {0u, 1u, 2u, 4u, 5u, 6u, 8u, 9u, 10u})
@@ -79,6 +102,11 @@ double median(std::array<double, 64> values, std::size_t count) {
 }
 void log_arc(Probe& p, float landing_height) {
     const auto fit = arc().fit();
+    if (const auto root = root_arc().fit()) {
+        if (p.root_fit_count < p.root_fits.size()) p.root_fits[p.root_fit_count++] = root->gravity;
+        logging::log(Level::info, Channel::skater, "s3cam_probe air root: {:.3f} s, g={:.3f} m/s2 rms={:.4f} m over {} samples",
+            root->duration, root->gravity, root->rms, root->samples);
+    }
     if (!fit) {
         logging::log(Level::info, Channel::skater,
             "s3cam_probe air: {} samples, too short to fit; apex {:+.2f} m, landed {:+.2f} m",
@@ -94,7 +122,7 @@ void log_arc(Probe& p, float landing_height) {
 
 bool s3cam_probe_armed() noexcept { return probe().armed; }
 
-void s3cam_probe_arm(const SourceTrial& trial, const SourceCameraSnapshot& native, const std::array<float, 16>& view) {
+void s3cam_probe_arm(const SourceTrial& trial, const SourceCameraSnapshot& native, const std::array<float, 16>& view, bool overlay) {
     SourceReader reader;
     source_require(native.mode == 0 && reader.pointer(native.active) == trial.base + addr::engine::camera_vtable,
         "The S3Cam probe needs the game's own camera (turn off Freecam, first person and spectate first).");
@@ -103,6 +131,7 @@ void s3cam_probe_arm(const SourceTrial& trial, const SourceCameraSnapshot& nativ
     auto& p = probe();
     p = {};
     arc().clear();
+    root_arc().clear();
     p.native_camera = native.active;
     p.hand = hand;
     // Start behind the skater exactly where the game's camera was looking.
@@ -112,10 +141,12 @@ void s3cam_probe_arm(const SourceTrial& trial, const SourceCameraSnapshot& nativ
     p.report_at = p.armed_at + 1;
     p.native_last = view;
     p.native_seen = true;
+    p.overlay = overlay;
+    p.overlay_report_at = p.armed_at + 5;
     p.armed = true;
     logging::log(Level::info, Channel::skater,
-        "s3cam_probe armed: native camera 0x{:x}, handedness {:+d} (right x up = {}backward)",
-        native.active, hand, hand > 0 ? "" : "-");
+        "s3cam_probe armed ({}): native camera 0x{:x}, handedness {:+d} (right x up = {}backward)",
+        overlay ? "mode 2, writes the game's camera" : "mode 1, takes the FreeCamera", native.active, hand, hand > 0 ? "" : "-");
 }
 
 std::array<float, 16> s3cam_probe_pose(const SourceTrial& trial, std::uintptr_t client, const std::array<float, 16>& previous) {
@@ -176,16 +207,20 @@ std::array<float, 16> s3cam_probe_pose(const SourceTrial& trial, std::uintptr_t 
         logging::log(Level::info, Channel::skater, "s3cam_probe stance flag {} -> {} in state {}", p.stance_switch, stance_switch, state);
         p.stance_switch = stance_switch;
     }
-    const auto& air_states = state_addr::board_air_states;
-    const bool air = std::find(air_states.begin(), air_states.end(), state) != air_states.end();
+    const bool air = state == state_addr::board_air_states[1]; // KNOWN_AIR only, see Probe
     if (air && !p.airborne) {
         p.airborne = true;
         arc().clear();
+        root_arc().clear();
         p.launch_height = p.apex = p.arc_last_height = bodies.board_height;
         arc().add(now, bodies.board_height);
+        root_arc().add(now, root[1]);
     } else if (air) {
         // A frame without a new physics step repeats the height; only real steps are samples.
-        if (bodies.board_height != p.arc_last_height) arc().add(now, bodies.board_height);
+        if (bodies.board_height != p.arc_last_height) {
+            arc().add(now, bodies.board_height);
+            root_arc().add(now, root[1]);
+        }
         p.arc_last_height = bodies.board_height;
         p.apex = std::max(p.apex, bodies.board_height);
     } else if (p.airborne) {
@@ -217,17 +252,59 @@ std::array<float, 16> s3cam_probe_pose(const SourceTrial& trial, std::uintptr_t 
     return matrix;
 }
 
+void s3cam_overlay_tick(const SourceTrial& trial, std::uintptr_t client, bool ready) {
+    auto& p = probe();
+    // Menus, the replay editor and loading leave the tick unready: write nothing, so whichever
+    // camera the game selected shows as it would without ReSkate.
+    if (!p.armed || !p.overlay || !ready) return;
+    const auto camera = source_camera_snapshot(trial, client);
+    std::array<float, 16> view{};
+    if (camera.mode != 0 || camera.active != p.native_camera || !read_native_view(trial.base, p.native_camera, view)) {
+        // Freecam, first person, spectate, the Park Editor or a new level's camera is showing.
+        ++p.overlay_other_camera;
+        p.overlay_written = false;
+        return;
+    }
+    // Still exactly our last write: nothing updated the game's camera since (it may only
+    // recompute on some frames, or keep our pose as its state).
+    if (p.overlay_written && view == p.overlay_last) ++p.overlay_held;
+    const auto matrix = s3cam_probe_pose(trial, client, view);
+    if (p.state == addr::no_bail::offboard_physics_state) {
+        // On foot or bailing: the game's camera, right stick included, is left alone.
+        ++p.overlay_offboard;
+        p.overlay_written = false;
+    } else if (write_native_view(p.native_camera, matrix)) {
+        p.overlay_last = matrix;
+        p.overlay_written = true;
+        ++p.overlay_writes;
+    } else {
+        ++p.overlay_failed;
+        p.overlay_written = false;
+    }
+    const auto now = source_flight_now();
+    if (now >= p.overlay_report_at) {
+        p.overlay_report_at = now + 5;
+        logging::log(Level::info, Channel::skater,
+            "s3cam_probe overlay: {} writes, {} found unchanged next tick, {} skipped off board, {} other camera, {} failed",
+            p.overlay_writes, p.overlay_held, p.overlay_offboard, p.overlay_other_camera, p.overlay_failed);
+    }
+}
+
 void s3cam_probe_disarm(const char* reason) noexcept {
     auto& p = probe();
     if (!p.armed) return;
     p.armed = false;
     try {
+        if (p.overlay)
+            logging::log(Level::info, Channel::skater,
+                "s3cam_probe overlay total: {} writes, {} found unchanged next tick, {} skipped off board, {} other camera, {} failed",
+                p.overlay_writes, p.overlay_held, p.overlay_offboard, p.overlay_other_camera, p.overlay_failed);
         logging::log(Level::info, Channel::skater,
             "s3cam_probe summary ({}): {:.1f} s, native camera moved on {}/{} ticks, unreadable {}; "
-            "entity row2.travel mean {:+.2f} over {} samples; gravity median {:.3f} m/s2 over {} arcs",
+            "entity row2.travel mean {:+.2f} over {} samples; gravity median board {:.3f} over {} arcs, root {:.3f} over {} arcs",
             reason ? reason : "stopped", source_flight_now() - p.armed_at, p.total_moved, p.total_ticks,
             p.total_unreadable, p.forward_samples ? p.forward_dot / static_cast<double>(p.forward_samples) : 0.0,
-            p.forward_samples, median(p.fits, p.fit_count), p.fit_count);
+            p.forward_samples, median(p.fits, p.fit_count), p.fit_count, median(p.root_fits, p.root_fit_count), p.root_fit_count);
     } catch (...) {}
 }
 

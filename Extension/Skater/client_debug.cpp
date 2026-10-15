@@ -515,6 +515,7 @@ void debug_action(SourceTrial& trial, std::uintptr_t client, bool can_control, b
         clear_no_bail();
         // Level loads drop temporary modes, never the player's saved choices.
         load_saved_debug(debug);
+        if (debug.s3cam_overlay) { s3cam_probe_disarm("debug restored"); debug.s3cam_overlay = false; }
         // Restore UI first even when the camera's native context is unavailable.
         std::string issue;
         try { debug_restore_ui(trial); }
@@ -674,6 +675,24 @@ void debug_action(SourceTrial& trial, std::uintptr_t client, bool can_control, b
         return;
     }
     if (request.action == overlay::DebugAction::set_s3cam_probe) {
+        if (!request.enabled && debug.s3cam_overlay) {
+            s3cam_probe_disarm("turned off");
+            debug.s3cam_overlay = false;
+            debug.status = "S3Cam probe off.";
+            return;
+        }
+        if (request.enabled && request.value == 2.0f) {
+            if (debug.s3cam_overlay) return;
+            source_require(!debug.s3cam_probe, "Turn off the S3Cam probe (s3cam_probe 0) first.");
+            source_require(can_control && phase, "Wait for the local camera before starting the S3Cam probe.");
+            source_require(!debug.camera_owned && !debug.noclip,
+                "Turn off Freecam, first person and noclip before starting the S3Cam probe.");
+            s3cam_probe_arm(trial, camera, debug_view_matrix(trial, camera), true);
+            debug.s3cam_overlay = true;
+            debug.status = "S3Cam probe mode 2 on: writes the game's own camera. Findings are logged as s3cam_probe.";
+            return;
+        }
+        source_require(!debug.s3cam_overlay, "Turn off the S3Cam probe (s3cam_probe 0) first.");
         if (!request.enabled) {
             if (!debug.s3cam_probe) return;
             debug_restore_camera(trial, client, phase, error); // Also ends the probe.
@@ -949,6 +968,14 @@ overlay::DebugModel on_client_debug_tick(std::uintptr_t base, std::uintptr_t cli
     try { debug_flight_tick(trial, client, can_control, camera_phase_observed, flight_input, error.value, flight_camera); }
     catch (const SourceGuard& guard) { debug_stop_noclip(debug); debug.status = guard.message; }
     catch (...) { debug_stop_noclip(debug); debug.status = "Flight stopped after a native error. Disable Freecam if its view is still active."; }
+    if (debug.s3cam_overlay) {
+        // Runs after the native client update, as the flight tick does: the game's camera has
+        // already moved this frame, and this write is what it renders.
+        try { s3cam_overlay_tick(trial, client, can_control && camera_phase_observed); }
+        catch (const SourceGuard& guard) { debug.status = guard.message; }
+        catch (...) { debug.status = "S3Cam probe mode 2 skipped a frame after a native error."; }
+    }
+    model.s3cam_probe = debug.s3cam_overlay;
     model.available = can_control || debug_has_lease(debug);
     model.park_editor = debug.park_editor;
     model.settings_owned = debug_has_lease(debug);
@@ -963,7 +990,7 @@ overlay::DebugModel on_client_debug_tick(std::uintptr_t base, std::uintptr_t cli
         const auto camera = flight_camera ? *flight_camera : source_camera_snapshot(trial, client);
         const bool owned_view = camera.mode == 1 && camera.active == camera.identity.camera;
         model.free_camera = owned_view && !debug.first_person && !debug.s3cam_probe;
-        model.s3cam_probe = owned_view && debug.s3cam_probe;
+        model.s3cam_probe = (owned_view && debug.s3cam_probe) || debug.s3cam_overlay;
         // Handed back on foot still reads as on, so the toggle can switch it off.
         model.first_person = (owned_view && debug.first_person) || debug.first_person_paused;
         model.first_person_fov = debug.first_person_fov;
