@@ -3,7 +3,8 @@
 Status: **three in-game runs done (2026-10-15).** S2, S3 and **S4 (g ≈ 10.1 m/s²)** answered.
 Ownership: mode 1 shows the pose but freezes the replay editor; mode 2 (run 3) keeps everything
 native, but its write came too late to show. Run 4: the write inside the update is replaced
-by the caller (it applies the update's output). Next: run 5 = **S1d**, write the output. `ctest`: **46/46 passed** (MSVC, Release). Code reading is done (below). Every
+by the caller (it applies the update's output). Run 5: the output does not carry the view; the camera holds a
+second copy at +0x10. Next: run 6 = **S1e**, write both copies. `ctest`: **46/46 passed** (MSVC, Release). Code reading is done (below). Every
 cell marked _pending_ needs a log line from Aescher's PC. Gate 0 is decided from this file.
 
 How the work is split: a Linux cloud session writes code and checks it (pure-math tests with g++ and
@@ -153,9 +154,28 @@ with the best matrix and position offsets and any other copy of the view inside 
 
 | Run 5 question | Answer |
 |---|---|
-| `output scan` line: offset and hits | _pending_ |
-| After ~2 s riding: does the view switch to the chase pose? | _pending_ |
-| Everything else still vanilla? | _pending_ |
+| `output scan` line: offset and hits | **0 hits anywhere in 0x400 bytes**: `output` does not carry the view. **But the camera object has a second copy of its view rows at +0x10** |
+| After ~2 s riding: does the view switch to the chase pose? | no (nothing was written: no offset learned) |
+| Everything else still vanilla? | yes. Aescher also re-ran **mode 1: the chase view shows**, as in runs 1–2 |
+
+### S1e. Write both copies, +0x10 and +0x50
+
+The camera keeps its view rows twice. Run 4 wrote only +0x50, and that write was gone by the
+tick. Mode 2 now writes the rows to **both** copies (fourth lanes kept), in the update's listener
+and again at the tick. At the tick it counts which copy still holds the pose from the listener:
+`still ours at the tick: +0x10 A, +0x50 B`. A copy that survives is the one the game keeps; one
+that is rebuilt every frame is derived from the other (or from data further back).
+
+| Run 6 question | Answer |
+|---|---|
+| Does the view switch to the chase pose? | _pending_ |
+| `+0x10` / `+0x50` survival counts | _pending_ |
+
+**Fallback if S1e fails:** mode 1 is proven to show the pose (runs 1, 2, 5). What it lacks is
+hand-back before the replay editor and menus take the verified phase away. Phase 0 would then end
+on B1 through mode 1, with one more signal to find (the game flow state that `client_tick.cpp`
+checks as `state == 13 || state == 21`: hand back the moment it leaves gameplay, while the
+phase is still verified).
 
 **Verdict (proposed for Gate 0, revised after run 2): own the pose, not the selection.** If S1b
 works, S3Cam writes the game's camera (B1's full control of the pose, without B1's mode switch),

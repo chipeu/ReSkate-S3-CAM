@@ -40,17 +40,10 @@ struct Probe {
     std::uint64_t overlay_writes{}, overlay_held{}, overlay_offboard{}, overlay_other_camera{}, overlay_failed{};
     std::uint64_t updates_seen{}, updates_other_thread{}, updates_stale{};
     double overlay_report_at{};
-    // S1d. Run 4: a write to the camera inside the update was replaced every time before the tick,
-    // so the caller applies the update's `output` to the camera after it returns. Learn where in
-    // `output` the final view rows are (compare each update's output with the camera at the
-    // tick), then write the pose there instead.
-    std::array<unsigned char, 0x400> output_copy{};
-    std::size_t output_size{};
-    bool output_fresh{};
-    std::array<std::uint16_t, 0x400 / 4> matrix_hits{}, position_hits{};
-    std::uint32_t scan_samples{};
-    int output_offset{-1};
-    bool scan_reported{};
+    // S1e. Run 5: the update's output never held the view, but the camera keeps a second copy of
+    // its view rows at +0x10 (identical to +0x50 at the tick). Both are written, in the update's
+    // listener and again at the tick, and the tick counts which still hold our pose.
+    std::uint64_t held_10{}, held_50{}, tick_writes{};
     std::uintptr_t native_camera{};
     int hand{};
     pose::Vec3 heading{0, 0, 1};
@@ -104,13 +97,19 @@ bool write_bytes(std::uintptr_t address, const void* data, std::size_t size) noe
     __try { std::memcpy(reinterpret_cast<void*>(address), data, size); return true; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
-// The 12 rotation/position lanes of a view at `at` equal `view`'s (fourth lanes are metadata).
-bool rows_match(const unsigned char* at, const std::array<float, 16>& view, bool position_only) {
-    std::array<float, 16> v{};
-    std::memcpy(v.data(), at, sizeof(v));
-    for (std::size_t row = position_only ? 3 : 0; row < 4; ++row)
-        for (std::size_t lane = 0; lane < 3; ++lane)
-            if (!(std::abs(v[row * 4 + lane] - view[row * 4 + lane]) <= 1e-4f)) return false;
+// The camera's two copies of its view rows (+0x10 and +0x50): rows replaced, fourth lanes kept.
+constexpr std::array<std::uintptr_t, 2> view_copies{0x10, 0x50};
+bool write_view_rows(std::uintptr_t camera, std::uintptr_t offset, const std::array<float, 16>& view) noexcept {
+    std::array<float, 16> rows{};
+    if (!first_person_read(camera + offset, rows.data(), sizeof(rows))) return false;
+    for (const std::size_t i : {0u, 1u, 2u, 4u, 5u, 6u, 8u, 9u, 10u, 12u, 13u, 14u}) rows[i] = view[i];
+    return write_bytes(camera + offset, rows.data(), sizeof(rows));
+}
+bool holds_rows(std::uintptr_t camera, std::uintptr_t offset, const std::array<float, 16>& view) noexcept {
+    std::array<float, 16> rows{};
+    if (!first_person_read(camera + offset, rows.data(), sizeof(rows))) return false;
+    for (const std::size_t i : {0u, 1u, 2u, 4u, 5u, 6u, 8u, 9u, 10u, 12u, 13u, 14u})
+        if (rows[i] != view[i]) return false;
     return true;
 }
 bool view_changed(const std::array<float, 16>& a, const std::array<float, 16>& b) {
@@ -294,35 +293,10 @@ void s3cam_overlay_tick(const SourceTrial& trial, std::uintptr_t client, bool re
     // Still exactly our last write: nothing updated the game's camera since (it may only
     // recompute on some frames, or keep our pose as its state).
     if (p.overlay_written && view == p.overlay_last) ++p.overlay_held;
-    if (p.output_offset < 0 && p.output_fresh) {
-        // This frame's output against the view the camera ended up with.
-        p.output_fresh = false;
-        ++p.scan_samples;
-        for (std::size_t at = 0; at + 64 <= p.output_size; at += 4) {
-            if (rows_match(p.output_copy.data() + at, view, false)) ++p.matrix_hits[at / 4];
-            if (at + 64 <= p.output_size && rows_match(p.output_copy.data() + at, view, true)) ++p.position_hits[at / 4];
-        }
-        if (p.scan_samples >= 120 && !p.scan_reported) {
-            const auto best = static_cast<std::size_t>(std::max_element(p.matrix_hits.begin(), p.matrix_hits.end()) - p.matrix_hits.begin());
-            const auto best_position = static_cast<std::size_t>(
-                std::max_element(p.position_hits.begin(), p.position_hits.end()) - p.position_hits.begin());
-            // A copy elsewhere in the camera object says where the view is mirrored from.
-            std::array<unsigned char, 0x400> object{};
-            std::string copies;
-            if (first_person_read(p.native_camera, object.data(), object.size()))
-                for (std::size_t at = 0; at + 64 <= object.size(); at += 4)
-                    if (at != 0x50 && rows_match(object.data() + at, view, false)) copies += std::format(" +0x{:x}", at);
-            logging::log(Level::info, Channel::skater,
-                "s3cam_probe output scan over {} updates ({} bytes): view rows best at output+0x{:x} ({} hits), "
-                "position best at output+0x{:x} ({} hits); other copies in the camera:{}",
-                p.scan_samples, p.output_size, best * 4, p.matrix_hits[best], best_position * 4 + 0x30,
-                p.position_hits[best_position], copies.empty() ? " none" : copies);
-            p.scan_reported = true;
-            if (p.matrix_hits[best] >= p.scan_samples * 9 / 10) {
-                p.output_offset = static_cast<int>(best * 4);
-                logging::log(Level::info, Channel::skater, "s3cam_probe now writes the pose at output+0x{:x}", best * 4);
-            }
-        }
+    if (p.overlay_written) {
+        // Which copy still holds the pose written in this frame's camera update?
+        if (holds_rows(p.native_camera, 0x10, p.overlay_last)) ++p.held_10;
+        if (holds_rows(p.native_camera, 0x50, p.overlay_last)) ++p.held_50;
     }
     const auto matrix = s3cam_probe_pose(trial, client, view);
     const auto now = source_flight_now();
@@ -332,40 +306,36 @@ void s3cam_overlay_tick(const SourceTrial& trial, std::uintptr_t client, bool re
         ++p.overlay_offboard;
         p.overlay_written = false;
     } else {
-        // Published for the next native camera update (s3cam_camera_updated).
+        // Published for the next native camera update (s3cam_camera_updated), and written now too:
+        // whichever copy the frame is drawn from after this point gets it.
         p.overlay_last = matrix;
         p.overlay_at = now;
         p.overlay_written = true;
+        bool written = true;
+        for (const auto offset : view_copies) written = write_view_rows(p.native_camera, offset, matrix) && written;
+        if (written) ++p.tick_writes;
+        else ++p.overlay_failed;
     }
     if (now >= p.overlay_report_at) {
         p.overlay_report_at = now + 5;
         logging::log(Level::info, Channel::skater,
             "s3cam_probe overlay: {} writes in the camera update ({} seen, {} other thread, {} stale), "
-            "{} still ours at the tick, {} skipped off board, {} other camera, {} failed",
-            p.overlay_writes, p.updates_seen, p.updates_other_thread, p.updates_stale, p.overlay_held,
+            "{} tick writes; still ours at the tick: +0x10 {}, +0x50 {}; {} skipped off board, {} other camera, {} failed",
+            p.overlay_writes, p.updates_seen, p.updates_other_thread, p.updates_stale, p.tick_writes, p.held_10, p.held_50,
             p.overlay_offboard, p.overlay_other_camera, p.overlay_failed);
     }
 }
 
-void s3cam_camera_updated(std::uintptr_t camera, std::uintptr_t output) noexcept {
+void s3cam_camera_updated(std::uintptr_t camera, std::uintptr_t) noexcept {
     auto& p = probe();
     if (!p.armed || !p.overlay || camera != p.native_camera) return;
     ++p.updates_seen;
     // The probe's state belongs to the debug tick's thread; anything else only counts.
     if (GetCurrentThreadId() != p.overlay_thread) { ++p.updates_other_thread; return; }
-    if (p.output_offset < 0) {
-        // Learning (S1d): keep this update's output for the tick to compare. Nothing is written.
-        for (const std::size_t size : {std::size_t{0x400}, std::size_t{0x200}, std::size_t{0x100}, std::size_t{0x80}})
-            if (first_person_read(output, p.output_copy.data(), size)) { p.output_size = size; p.output_fresh = true; break; }
-        return;
-    }
     if (!p.overlay_written || source_flight_now() - p.overlay_at > 0.1) { ++p.updates_stale; return; }
-    // Rows into the learned place, keeping the output's own fourth lanes.
-    std::array<float, 16> rows{};
-    const auto at = output + static_cast<std::uintptr_t>(p.output_offset);
-    if (!first_person_read(at, rows.data(), sizeof(rows))) { ++p.overlay_failed; return; }
-    for (const std::size_t i : {0u, 1u, 2u, 4u, 5u, 6u, 8u, 9u, 10u, 12u, 13u, 14u}) rows[i] = p.overlay_last[i];
-    if (write_bytes(at, rows.data(), sizeof(rows))) ++p.overlay_writes;
+    bool written = true;
+    for (const auto offset : view_copies) written = write_view_rows(camera, offset, p.overlay_last) && written;
+    if (written) ++p.overlay_writes;
     else ++p.overlay_failed;
 }
 
@@ -378,8 +348,8 @@ void s3cam_probe_disarm(const char* reason) noexcept {
         if (p.overlay)
             logging::log(Level::info, Channel::skater,
                 "s3cam_probe overlay total: {} writes in the camera update ({} seen, {} other thread, {} stale), "
-                "{} still ours at the tick, {} skipped off board, {} other camera, {} failed",
-                p.overlay_writes, p.updates_seen, p.updates_other_thread, p.updates_stale, p.overlay_held,
+                "{} tick writes; still ours at the tick: +0x10 {}, +0x50 {}; {} skipped off board, {} other camera, {} failed",
+                p.overlay_writes, p.updates_seen, p.updates_other_thread, p.updates_stale, p.tick_writes, p.held_10, p.held_50,
                 p.overlay_offboard, p.overlay_other_camera, p.overlay_failed);
         logging::log(Level::info, Channel::skater,
             "s3cam_probe summary ({}): {:.1f} s, native camera moved on {}/{} ticks, unreadable {}; "
