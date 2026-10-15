@@ -109,8 +109,8 @@ How the Skate 3 camera works, pipeline order per frame (`manager.rs`):
      `PumpingMinAcceleration`).
    - **Heading/elevation angle trackers** (`AngleTracker`) are critically-damped-like followers
      with a speed clamp, an acceleration clamp, and an **umbra/penumbra dead-zone**: inside the
-     umbra, full acceleration clamp and smoothing apply, falling off linearly to zero at the
-     penumbra. Heading doubles its acceleration clamp in some states.
+     umbra the *max* acceleration clamp and smoothing apply (heavy smoothing near the target: the
+     dead-zone feel), blending linearly to the *min* values at the penumbra (verified in tracker.rs, T1). Heading doubles its acceleration clamp in some states.
    - **Distance tracker** has normal and fast parameter sets; min distance tightens during a
      wipeout.
    - **Compass** (`compass*.rs`) auto-lines-up behind the direction of travel after
@@ -138,7 +138,7 @@ How the Skate 3 camera works, pipeline order per frame (`manager.rs`):
    - **Speed shake**: amplitude and frequency curves (4×4 Bézier) over skater speed relative to
      `…TopSkaterSpeed`.
    - Rotation and translation come from recorded `.shk` samples (mean removed), scaled by
-     distance: full at ≤ about 2.65 m, fading to 0 by 3.4 m.
+     distance: full at ≤ 2.8 m, fading to 0 by 3.4 m (shake_update.rs constants; T4).
    - The roll axis uses its own `DutchMultiplier`. The weight fades in and out at 5/s.
    - **Broken-bone slow-mo** fires a ×20 impulse.
 8. **Lens**: `fov = f(lens_length, aspect)` (`manager_frame.rs`). Lens 12 for all stock shots.

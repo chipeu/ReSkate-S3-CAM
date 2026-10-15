@@ -202,3 +202,6 @@ with file:line and a concrete failure scenario. Do not edit code.
 - 2026-10-15: Gate 0 approved (SPIKES.md "Gate 0 decision"): mode 1, targeted RE only; full S3 +
   Native+ presets; separate S3 CAMERA page; T19 shelved (no Skate 3 copy). Shared `s3_math.h` +
   tests written by Opus so T1–T4 can run in parallel. Next: T1–T4.
+- 2026-10-15: T1–T4 done (Sonnet implementers, reviewed by Opus against the Rust: umbra semantics and
+  the 2.8 m shake fade confirmed, plan text corrected). All pure tests pass under g++/ASan/UBSan and
+  clang. Next: T5 (rig + air), then T6 (graph + CameraMan) and Gate 1.
