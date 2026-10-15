@@ -229,3 +229,7 @@ with file:line and a concrete failure scenario. Do not edit code.
   speed in tricks, landing shake weighting, manual detector (board pitch), chase-relative manual
   close-up, trick yaw, framing, named presets with import/export (Sonnet x2 + Opus glue, reviewed;
   s3cam_presets suite). Next: Aescher's Alpha 3 run (PHASE2.md).
+- 2026-10-16: Alpha 4 from Alpha 3 feedback: pause detection (replay editor), big-air camera (follow
+  height, rise, keep on screen; Native+ too), manual/grind focus, Low/High positions, plain-named
+  tabbed page, presets cleanup and forward compatibility (Sonnet x2 + Opus glue, reviewed). Next:
+  Aescher's Alpha 4 run.

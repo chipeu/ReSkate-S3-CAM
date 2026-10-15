@@ -196,7 +196,15 @@ void test_fps_agree() {
 }
 
 void test_shot_framing_and_air_hold() {
+    // Alpha 4: this test checks the Alpha 3 framing and air hold, so the new settings that deliberately change them
+    // are neutral here: the grind / manual focus (lower look target), the air height follow and the rise.
+    // s3cam_layers_tests covers those settings on their own.
+    CameraSettings classic;
+    classic.look.manual_focus = classic.look.grind_focus = 1.0f;
+    classic.air_camera.follow_height = 0.0f;
+    classic.air_camera.rise_degrees = 0.0f;
     CameraMan cam;
+    expect(cam.set_settings(classic), "classic settings accepted");
     Session session;
     const Recording r = record(cam, session, 60.0f);
     float worst_angle = 0.0f, ground_y = 0.0f, max_air_rise = -1e9f;
@@ -712,6 +720,11 @@ void test_native_plus_follows_native() {
     // they are off here so this test keeps checking the pass-through of the native value itself.
     np.fov.speed_fov = false;
     np.fov.air_fov = false;
+    // Alpha 4: the big-air layers (height follow, rise, keep-in-frame) are off here so this test keeps checking
+    // the Alpha 1 native layers on their own; s3cam_layers_tests covers the air camera in both presets.
+    np.air_camera.follow_height = 0.0f;
+    np.air_camera.rise_degrees = 0.0f;
+    np.air_camera.keep_in_frame = false;
     CameraMan cam;
     expect(cam.set_settings(np), "NativePlus settings accepted");
     const Session session;
@@ -754,6 +767,11 @@ void test_native_plus_dip_and_shake() {
         np.native_plus.landing_dip = dip;
         np.native_plus.shake = shake;
         np.native_plus.air_hold = false; // isolate the dip
+        // Alpha 4: the big-air layers (height follow, rise, keep-in-frame) are off here so this test keeps checking
+        // the Alpha 1 native layers on their own; s3cam_layers_tests covers the air camera in both presets.
+        np.air_camera.follow_height = 0.0f;
+        np.air_camera.rise_degrees = 0.0f;
+        np.air_camera.keep_in_frame = false;
         CameraMan cam;
         cam.set_settings(np);
         lowest = 0.0f;

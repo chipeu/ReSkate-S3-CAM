@@ -641,6 +641,10 @@ ShakeMeasure measure_shake(const CameraSettings& settings, const Rider& rider, f
     np.preset = CameraPreset::NativePlus;
     np.native_plus.air_hold = false;
     np.native_plus.landing_dip = false;
+    // Alpha 4: the big-air layers move the camera too; this helper measures the shake alone.
+    np.air_camera.follow_height = 0.0f;
+    np.air_camera.rise_degrees = 0.0f;
+    np.air_camera.keep_in_frame = false;
     CameraMan cam = make_camera(np);
     World world;
     world.upper_y = -1000.0f;
@@ -1548,7 +1552,352 @@ void test_landing_impulse_in_game() {
 
 } // namespace
 
+
+// ---------------------------------------------------------------- Alpha 4: big airs, focus, Low / High framing
+
+// A native camera that follows the skater: 2 m behind, 0.5 m above the root, aimed at the root.
+NativePose air_native_pose(const SubjectSnapshot& s) {
+    NativePose pose;
+    pose.position = {s.position[0], s.position[1] + 0.5f, s.position[2] - 2.0f};
+    const Vec3 look = normalized(sub(s.position, pose.position));
+    pose.back = scale(look, -1.0f);
+    pose.right = normalized(cross({0.0f, 1.0f, 0.0f}, pose.back));
+    pose.up = cross(pose.back, pose.right);
+    pose.fov_deg = 60.0f;
+    return pose;
+}
+
+// Angle in degrees between the view direction and the line camera -> point.
+float angle_to_point_deg(const Frame& f, const Vec3& point) {
+    return std::acos(std::clamp(dot(scale(f.back, -1.0f), normalized(sub(point, f.pos))), -1.0f, 1.0f)) / degrees;
+}
+
+struct AirTrace {
+    std::vector<Frame> frames;
+    std::vector<SubjectSnapshot> subjects;
+    float fps = 60.0f;
+};
+// kind 0: a 4 m high jump on the flat; kind 1: a 3 m step-down. The native pose is used in NativePlus.
+AirTrace run_air(const CameraSettings& settings, int kind, float fps, float apex_height = 4.0f) {
+    Rider rider;
+    World world;
+    if (kind == 0) {
+        rider.has_ollie = true;
+        rider.jump_speed = std::sqrt(2.0f * gravity_ms2 * apex_height);
+        rider.ollie_time = 1.0f;
+    } else {
+        rider.has_drop = true;
+        rider.drop_height = 3.0f;
+        world.drop_z = rider.edge_z;
+        world.drop_to = -rider.drop_height;
+    }
+    AirTrace trace;
+    trace.fps = fps;
+    CameraMan cam = make_camera(settings);
+    const int count = static_cast<int>(std::lround(5.0f * fps));
+    for (int i = 0; i < count; ++i) {
+        const SubjectSnapshot s = rider.at(static_cast<float>(i) / fps);
+        const NativePose pose = air_native_pose(s);
+        FrameExtras extras;
+        extras.base_fov_deg = 60.0f;
+        extras.native = &pose;
+        trace.frames.push_back(cam.update(1.0f / fps, s, world, extras));
+        trace.subjects.push_back(s);
+    }
+    return trace;
+}
+
+CameraSettings classic_air(CameraPreset preset) {
+    CameraSettings cs;
+    cs.preset = preset;
+    cs.air_camera.follow_height = 0.0f;
+    cs.air_camera.rise_degrees = 0.0f;
+    cs.air_camera.keep_in_frame = false;
+    return cs;
+}
+
+void test_air_camera_in_frame() {
+    for (const CameraPreset preset : {CameraPreset::FullS3, CameraPreset::NativePlus}) {
+        for (const int kind : {0, 1}) {
+            for (const float fps : {30.0f, 60.0f, 144.0f}) {
+                CameraSettings cs;
+                cs.preset = preset;
+                const AirTrace trace = run_air(cs, kind, fps);
+                float worst_ratio = 0.0f, worst_step = 0.0f;
+                bool frames_ok = true;
+                for (std::size_t i = 0; i < trace.frames.size(); ++i) {
+                    const Frame& f = trace.frames[i];
+                    frames_ok = frames_ok && all_finite_frame(f) && is_orthonormal(f);
+                    const Vec3 root = trace.subjects[i].position;
+                    const Vec3 board = add(root, {0.0f, -cs.points.board_drop, 0.0f});
+                    worst_ratio = std::max({worst_ratio, angle_to_point_deg(f, root) / (0.5f * f.fov_deg), angle_to_point_deg(f, board) / (0.5f * f.fov_deg)});
+                    if (i > 0) worst_step = std::max(worst_step, length(sub(f.pos, trace.frames[i - 1].pos)));
+                }
+                float classic_step = 0.0f;
+                {
+                    const AirTrace before = run_air(classic_air(preset), kind, fps);
+                    for (std::size_t i = 1; i < before.frames.size(); ++i) classic_step = std::max(classic_step, length(sub(before.frames[i].pos, before.frames[i - 1].pos)));
+                }
+                const std::string tag = fps_tag(preset == CameraPreset::FullS3 ? (kind == 0 ? "FullS3 4 m air" : "FullS3 3 m drop") : (kind == 0 ? "NativePlus 4 m air" : "NativePlus 3 m drop"), fps);
+                std::printf("  %sworst angle %.0f%% of the half vertical fov, max camera step %.2f m\n", tag.c_str(), static_cast<double>(worst_ratio * 100.0f), static_cast<double>(worst_step));
+                expect(frames_ok, tag + "frames are frames_ok and orthonormal");
+                expect(worst_ratio <= 1.0f, tag + "the skater and the board stay inside the vertical view in every frame");
+                // The camera follows the skater more now, so it moves more than the held one, but never in a jump.
+                expect(worst_step < 1.6f * classic_step + 0.1f, tag + "and the camera's biggest step stays under 1.6x the Alpha 3 one + 10 cm");
+            }
+        }
+    }
+}
+
+// Worst angle of the skater (root and board) from the view axis over a trace, as a share of the half fov.
+float worst_frame_ratio(const AirTrace& trace, const CameraSettings& cs) {
+    float worst_ratio = 0.0f;
+    for (std::size_t i = 0; i < trace.frames.size(); ++i) {
+        const Frame& f = trace.frames[i];
+        const Vec3 root = trace.subjects[i].position;
+        const Vec3 board = add(root, {0.0f, -cs.points.board_drop, 0.0f});
+        worst_ratio = std::max({worst_ratio, angle_to_point_deg(f, root) / (0.5f * f.fov_deg), angle_to_point_deg(f, board) / (0.5f * f.fov_deg)});
+    }
+    return worst_ratio;
+}
+// Frame index nearest `time` in a trace.
+std::size_t index_at(const AirTrace& trace, float time) { return static_cast<std::size_t>(std::lround(time * trace.fps)); }
+
+void test_air_camera_layers() {
+    constexpr float takeoff = 1.0f;
+    const float apex_time = takeoff + std::sqrt(2.0f * 4.0f / gravity_ms2); // 4 m jump: 0.89 s up
+    for (const CameraPreset preset : {CameraPreset::FullS3, CameraPreset::NativePlus}) {
+        const std::string name = preset == CameraPreset::FullS3 ? "FullS3: " : "NativePlus: ";
+        const CameraSettings plain = classic_air(preset);
+        const AirTrace classic = run_air(plain, 0, 60.0f);
+        const std::size_t apex = index_at(classic, apex_time);
+
+        // All three off = the Alpha 3 camera: the layers report nothing, and the skater does leave the view.
+        float worst_report = 0.0f;
+        for (const Frame& f : classic.frames) worst_report = std::max({worst_report, std::abs(f.debug.air_rise), std::abs(f.debug.keep_pitch_offset)});
+        expect(worst_report == 0.0f, name + "rise 0 and keep off report 0");
+        expect(worst_frame_ratio(classic, plain) > 1.0f, name + "without the air camera the skater leaves the view in a 4 m air (the reported problem)");
+
+        // keep_in_frame alone.
+        CameraSettings keep = plain;
+        keep.air_camera.keep_in_frame = true;
+        const AirTrace kept = run_air(keep, 0, 60.0f), kept_drop = run_air(keep, 1, 60.0f);
+        expect(worst_frame_ratio(kept, keep) <= 1.0f && worst_frame_ratio(kept_drop, keep) <= 1.0f, name + "keep_in_frame alone keeps a 4 m air and a 3 m drop in view");
+        float worst_keep = 0.0f, worst_keep_step = 0.0f;
+        for (std::size_t i = 0; i < kept.frames.size(); ++i) {
+            worst_keep = std::max(worst_keep, std::abs(kept.frames[i].debug.keep_pitch_offset));
+            if (i > 0) worst_keep_step = std::max(worst_keep_step, std::abs(kept.frames[i].debug.keep_pitch_offset - kept.frames[i - 1].debug.keep_pitch_offset));
+        }
+        expect(worst_keep > 5.0f * degrees, name + "keep_in_frame steers the pitch in a 4 m air");
+        expect(worst_keep_step < 5.0f * degrees, name + "and eases it (under 5 deg a frame, no snap)");
+        expect(kept.frames.front().debug.keep_pitch_offset == 0.0f && std::abs(kept.frames.back().debug.keep_pitch_offset) < 0.1f * degrees,
+               name + "it is 0 on the ground before the jump and eased out after the landing");
+
+        // follow_height alone: the reference rises with the skater, without a jump at takeoff or landing.
+        CameraSettings follow = plain;
+        follow.air_camera.follow_height = 1.0f;
+        const AirTrace followed = run_air(follow, 0, 60.0f);
+        const float ref_follow = followed.frames[apex].debug.air_reference_height, ref_plain = classic.frames[apex].debug.air_reference_height;
+        const float anchor_apex = followed.subjects[apex].position[1] - follow.points.board_drop + follow.points.anchor_height;
+        expect(ref_follow > ref_plain + 2.0f && anchor_apex - ref_follow < 0.6f, name + "follow_height 1 puts the reference height near the live anchor at the apex");
+        float worst_ref_step = 0.0f;
+        for (std::size_t i = 1; i < followed.frames.size(); ++i)
+            worst_ref_step = std::max(worst_ref_step, std::abs(followed.frames[i].debug.air_reference_height - followed.frames[i - 1].debug.air_reference_height));
+        expect(worst_ref_step < 0.2f, name + "the reference height has no jump at takeoff or landing (under 20 cm a frame)");
+        if (preset == CameraPreset::NativePlus)
+            expect(followed.frames[apex].debug.air_hold_delta > -0.6f && classic.frames[apex].debug.air_hold_delta < -3.0f,
+                   name + "the air hold offset shrinks with follow_height (scaled by 1 - follow)");
+        CameraSettings half = plain;
+        half.air_camera.follow_height = 0.5f;
+        const float ref_half = run_air(half, 0, 60.0f).frames[apex].debug.air_reference_height;
+        expect(ref_half > ref_plain + 0.3f * (ref_follow - ref_plain) && ref_half < ref_plain + 0.7f * (ref_follow - ref_plain), name + "follow_height 0.5 is in between");
+
+        // rise_degrees alone: the camera is higher and the elevation eases in and out.
+        CameraSettings rise = plain;
+        rise.air_camera.rise_degrees = 15.0f;
+        const AirTrace risen = run_air(rise, 0, 60.0f);
+        const float rise_at_apex = risen.frames[apex].debug.air_rise / degrees;
+        expect(rise_at_apex > 10.0f && rise_at_apex <= 15.0f, name + "a 4 m air rises about rise_degrees at the apex");
+        const std::size_t early = index_at(classic, takeoff + 0.3f); // before the engine's floor clearance (3 m max) lifts both cameras
+        expect(risen.frames[early].pos[1] > classic.frames[early].pos[1] + 0.2f, name + "and the camera is higher there");
+        expect(std::abs(risen.frames.back().debug.air_rise) < 0.1f * degrees, name + "the rise is back to 0 after the landing");
+        float worst_rise_step = 0.0f;
+        for (std::size_t i = 1; i < risen.frames.size(); ++i) worst_rise_step = std::max(worst_rise_step, std::abs(risen.frames[i].debug.air_rise - risen.frames[i - 1].debug.air_rise));
+        expect(worst_rise_step < 1.0f * degrees, name + "the rise eases (under 1 deg a frame)");
+        // The rise scales with the size of the air: a 1 m jump (rise_full_height 2) gets about half of a 4 m one.
+        float small_peak = 0.0f, big_peak = 0.0f;
+        for (const Frame& f : run_air(rise, 0, 60.0f, 1.0f).frames) small_peak = std::max(small_peak, f.debug.air_rise);
+        for (const Frame& f : risen.frames) big_peak = std::max(big_peak, f.debug.air_rise);
+        expect(small_peak > 0.1f * big_peak && small_peak < 0.6f * big_peak, name + "a 1 m jump rises about half as much as a 4 m one");
+        if (preset == CameraPreset::NativePlus) {
+            const Vec3 root = risen.subjects[apex].position;
+            expect(std::abs(angle_to_point_deg(risen.frames[apex], root) - angle_to_point_deg(classic.frames[apex], root)) < 2.0f,
+                   name + "the skater stays in the same screen spot while the native camera rises");
+        }
+
+        // Above the skater looking down near the apex (follow 1 so the rig keeps up) and near the landing of a drop.
+        CameraSettings above = plain;
+        above.air_camera.follow_height = 1.0f;
+        above.air_camera.rise_degrees = 30.0f;
+        const AirTrace over = run_air(above, 0, 60.0f);
+        const Frame& top = over.frames[apex];
+        expect(top.pos[1] > over.subjects[apex].position[1] && view_pitch_deg(top) < -3.0f, name + "near the apex the camera is above the skater and looks down");
+        const AirTrace over_drop = run_air(above, 1, 60.0f);
+        const std::size_t touch = index_at(over_drop, 10.0f / 6.0f + std::sqrt(2.0f * 3.0f / gravity_ms2) - 0.05f);
+        expect(view_pitch_deg(over_drop.frames[touch]) < -3.0f && over_drop.frames[touch].pos[1] > over_drop.subjects[touch].position[1] - 0.3f,
+               name + "near the landing of a 3 m drop the camera is high and looks down");
+    }
+}
+
+// ---- manual / grind focus
+
+// Height of the look target in a manual or a grind for a given focus, FullS3.
+struct FocusRun {
+    std::vector<Frame> frames;
+    float look_y_manual = 0.0f, look_y_grind = 0.0f, board_y = 0.0f;
+    float worst_look_step = 0.0f;
+    std::string manual_shot, grind_shot;
+};
+FocusRun run_focus(float manual_focus, float grind_focus, float fps) {
+    CameraSettings cs;
+    cs.look.manual_focus = manual_focus;
+    cs.look.grind_focus = grind_focus;
+    Script script;
+    script.rider.speed = 7.0f;
+    script.manuals.push_back({2.0f, 6.0f});
+    script.grinds.push_back({9.0f, 12.0f});
+    World world;
+    world.upper_y = -1000.0f;
+    CameraMan cam = make_camera(cs);
+    FocusRun run;
+    drive_between(cam, script, world, 0.0f, 15.0f, fps, run.frames);
+    run.board_y = root_height - cs.points.board_drop;
+    run.look_y_manual = frame_at(run.frames, 5.5f, fps).debug.look_target[1];
+    run.look_y_grind = frame_at(run.frames, 11.5f, fps).debug.look_target[1];
+    run.manual_shot = std::string(frame_at(run.frames, 5.5f, fps).debug.shot_name);
+    run.grind_shot = std::string(frame_at(run.frames, 11.5f, fps).debug.shot_name);
+    for (std::size_t i = 1; i < run.frames.size(); ++i)
+        run.worst_look_step = std::max(run.worst_look_step, std::abs(run.frames[i].debug.look_target[1] - run.frames[i - 1].debug.look_target[1]));
+    return run;
+}
+
+void test_manual_grind_focus() {
+    const FocusRun low = run_focus(0.0f, 0.0f, 60.0f), high = run_focus(1.0f, 1.0f, 60.0f), mid = run_focus(0.5f, 0.5f, 60.0f);
+    expect(low.manual_shot.rfind("manual", 0) == 0 && low.grind_shot.rfind("grind", 0) == 0, "focus: the script reaches a manual shot and a grind shot");
+    expect(close_to(low.look_y_manual, low.board_y, 0.05f), "focus: manual_focus 0 aims the look target at the board");
+    expect(close_to(low.look_y_grind, low.board_y, 0.05f), "focus: grind_focus 0 aims the look target at the board in a grind");
+    expect(high.look_y_manual > low.look_y_manual + 0.4f && high.look_y_grind > low.look_y_grind + 0.4f, "focus: 1 is the usual (hips / upper body) target, well above the board");
+    expect(close_to(mid.look_y_manual, 0.5f * (low.look_y_manual + high.look_y_manual), 0.05f), "focus: 0.5 is halfway in a manual");
+    expect(close_to(mid.look_y_grind, 0.5f * (low.look_y_grind + high.look_y_grind), 0.05f), "focus: 0.5 is halfway in a grind");
+    // The off-the-board shots are unaffected by the focus settings.
+    expect(close_to(frame_at(low.frames, 1.0f, 60.0f).debug.look_target[1], frame_at(high.frames, 1.0f, 60.0f).debug.look_target[1], 1e-4f) &&
+               frame_at(low.frames, 1.0f, 60.0f).debug.focus_weight == 1.0f,
+           "focus: the chase ignores both settings (focus weight 1)");
+    // Entering and leaving ease with the shot transition: no frame moves the target by more than a few cm.
+    for (const float fps : {30.0f, 60.0f, 144.0f}) {
+        const FocusRun run = run_focus(0.0f, 0.0f, fps);
+        const std::string tag = fps_tag("focus", fps);
+        expect(run.worst_look_step < 0.1f * std::max(1.0f, 60.0f / fps), tag + "entering and leaving a manual / grind moves the look target smoothly (under 10 cm per 1/60 s)");
+        expect(close_to(run.frames.back().debug.focus_weight, 1.0f, 0.02f), tag + "back in the chase the focus weight is 1 again");
+        bool partial = false;
+        for (const Frame& f : run.frames) partial = partial || (f.debug.focus_weight > 0.1f && f.debug.focus_weight < 0.9f);
+        expect(partial, tag + "the weight passes through intermediate values (an ease, not a switch)");
+    }
+}
+
+// ---- separate framing for the Low and the High angle
+
+void test_framing_per_angle() {
+    CameraSettings both;
+    both.framing.distance_scale = 1.0f;
+    both.framing_high.distance_scale = 1.0f;
+    const FrameDebug low_ref = settled_debug(both, 6.0f, false);
+    both.angle = CameraAngle::High;
+    const FrameDebug high_ref = settled_debug(both, 6.0f, false);
+    expect(std::abs(high_ref.distance - low_ref.distance) > 0.05f || std::abs(high_ref.elevation - low_ref.elevation) > 0.01f, "angles: High and Low are different shots");
+
+    CameraSettings cs;
+    cs.framing.distance_scale = 0.7f;      // Low
+    cs.framing_high.distance_scale = 1.6f; // High
+    cs.framing.height_degrees = 0.0f;
+    cs.framing_high.height_degrees = 12.0f;
+    cs.angle = CameraAngle::Low;
+    const FrameDebug low = settled_debug(cs, 6.0f, false);
+    cs.angle = CameraAngle::High;
+    const FrameDebug high = settled_debug(cs, 6.0f, false);
+    expect(close_to(low.distance, low_ref.distance * 0.7f, 0.03f), "angles: Low uses framing (distance_scale 0.7)");
+    expect(close_to(high.distance, high_ref.distance * 1.6f, 0.03f), "angles: High uses framing_high (distance_scale 1.6)");
+    expect(close_to(high.elevation - high_ref.elevation, 12.0f * degrees, 0.3f * degrees) && close_to(low.elevation, low_ref.elevation, 0.3f * degrees),
+           "angles: height_degrees is per angle");
+    // framing does not leak into High and framing_high not into Low.
+    CameraSettings only_low;
+    only_low.framing.distance_scale = 2.0f;
+    only_low.angle = CameraAngle::High;
+    expect(close_to(settled_debug(only_low, 6.0f, false).distance, high_ref.distance, 0.02f), "angles: framing does not change the High camera");
+    CameraSettings only_high;
+    only_high.framing_high.distance_scale = 2.0f;
+    expect(close_to(settled_debug(only_high, 6.0f, false).distance, low_ref.distance, 0.02f), "angles: framing_high does not change the Low camera");
+    // The manual close-up is per angle too.
+    CameraSettings manual_cs;
+    manual_cs.framing.manual_distance_scale = 0.5f;
+    manual_cs.framing_high.manual_distance_scale = 1.0f;
+    manual_cs.angle = CameraAngle::Low;
+    const float manual_low = settled_debug(manual_cs, 7.0f, true).distance;
+    manual_cs.angle = CameraAngle::High;
+    const float manual_high = settled_debug(manual_cs, 7.0f, true).distance;
+    CameraSettings manual_ref;
+    manual_ref.angle = CameraAngle::High;
+    expect(close_to(manual_high, settled_debug(manual_ref, 7.0f, true).distance / 0.75f, 0.05f) && manual_low < settled_debug(CameraSettings{}, 7.0f, true).distance,
+           "angles: manual_distance_scale is per angle");
+
+    // Pitch per angle, and switching the angle in the middle of a ride is smooth (distance, height and pitch ease).
+    CameraSettings pitched;
+    pitched.framing.pitch_degrees = 0.0f;
+    pitched.framing_high.pitch_degrees = 10.0f;
+    pitched.framing_high.distance_scale = 1.4f;
+    pitched.framing_high.height_degrees = 8.0f;
+    World world;
+    world.upper_y = -1000.0f;
+    Script script;
+    for (const float fps : {30.0f, 60.0f, 144.0f}) {
+        CameraSettings start = pitched;
+        start.angle = CameraAngle::Low;
+        CameraMan cam = make_camera(start);
+        std::vector<Frame> frames;
+        drive_between(cam, script, world, 0.0f, 3.0f, fps, frames);
+        const std::size_t switch_index = frames.size();
+        CameraSettings after = pitched;
+        after.angle = CameraAngle::High;
+        expect(cam.set_settings(after), "angles: switching the angle mid-ride is accepted");
+        drive_between(cam, script, world, 3.0f, 9.0f, fps, frames);
+        float worst_offset_step = 0.0f, worst_pitch_step = 0.0f;
+        for (std::size_t i = switch_index; i < frames.size(); ++i) {
+            const Vec3 o_now = sub(frames[i].pos, script.at(static_cast<float>(i) / fps).position);
+            const Vec3 o_prev = sub(frames[i - 1].pos, script.at(static_cast<float>(i - 1) / fps).position);
+            worst_offset_step = std::max(worst_offset_step, length(sub(o_now, o_prev)));
+            worst_pitch_step = std::max(worst_pitch_step, std::abs(view_pitch_deg(frames[i]) - view_pitch_deg(frames[i - 1])));
+        }
+        const std::string tag = fps_tag("angle switch", fps);
+        expect(worst_offset_step < 7.5f / fps, tag + "the camera moves at most 7.5 m/s relative to the skater");
+        expect(worst_pitch_step < 30.0f / fps, tag + "and the view pitch turns at most 30 deg/s");
+        // The same switch with a flat High pitch: the settled views differ by the 10 degrees asked (the rig's
+        // elevation tracker is slow, so the reference makes the same switch instead of starting on High).
+        CameraSettings flat_high = after;
+        flat_high.framing_high.pitch_degrees = 0.0f;
+        CameraMan reference = make_camera(start);
+        std::vector<Frame> ref_frames;
+        drive_between(reference, script, world, 0.0f, 3.0f, fps, ref_frames);
+        expect(reference.set_settings(flat_high), "angles: the reference switch is accepted");
+        drive_between(reference, script, world, 3.0f, 9.0f, fps, ref_frames);
+        expect(close_to(view_pitch_deg(frames.back()) - view_pitch_deg(ref_frames.back()), 10.0f, 0.5f), tag + "framing_high.pitch_degrees tilts the High view by about 10 deg");
+    }
+}
+
 int main() {
+    test_manual_grind_focus();
+    test_framing_per_angle();
+    test_air_camera_in_frame();
+    test_air_camera_layers();
     test_fov_speed_term();
     test_fov_air_term();
     test_fov_native_plus();

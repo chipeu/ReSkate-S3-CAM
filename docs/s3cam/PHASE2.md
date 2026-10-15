@@ -140,3 +140,24 @@ landing had a shake impulse of 0 (angle weighting); the map / customisation hand
 4. CAMERA POSITION sliders while riding.
 5. Presets: save one, change things, load it back; export, then import from the clipboard.
 6. Send `logs\ReSkate.log`.
+
+## Alpha 4 (Alpha 3 feedback)
+
+- Replay editor stuck: the pause menu and replay editor report normal play, so S3Cam now detects a
+  pause (skater frozen with speed, or a 0 physics step) and hands back at once.
+- Big airs: the camera follows the skater's height partly (Big air: follow height), swings up to
+  look down at the landing (Big air: camera rise), and keeps the skater on screen (Keep skater on
+  screen); Native+ gets the same, fixing "camera stays on the ground".
+- Manual / grind focus aims at the board (lower body) instead of the hips.
+- Separate camera position for Low and High.
+- Page: plain names, tabs, Enabled / Disabled off board status, FOV override, Landing bounce,
+  blend times; presets: "Skate 3" and "Close & low" built in, newer and older preset files load.
+
+### Alpha 4 test
+
+1. Ride on board, pause, open the replay editor: it must work without stepping off. Resume riding.
+2. Big airs and drops, in Full and Native+: the skater stays on screen and the camera ends up above,
+   looking down at the landing.
+3. Manual and grind: the camera aims lower (board / legs).
+4. Low and High with different positions; R3 switches between them smoothly.
+5. Send `logs\ReSkate.log` (look for `s3cam game paused`).
