@@ -199,3 +199,6 @@ with file:line and a concrete failure scenario. Do not edit code.
 - 2026-10-15: Phase 0 done after six in-game runs (SPIKES.md). Gate 0 proposed: B1 via mode 1 with
   early hand-back; mode 2 (overwrite the game camera) ruled out; g ≈ 10.1; rays 0.02 ms/10. Waiting
   for Aescher's Gate 0 approval before Phase 1.
+- 2026-10-15: Gate 0 approved (SPIKES.md "Gate 0 decision"): mode 1, targeted RE only; full S3 +
+  Native+ presets; separate S3 CAMERA page; T19 shelved (no Skate 3 copy). Shared `s3_math.h` +
+  tests written by Opus so T1–T4 can run in parallel. Next: T1–T4.

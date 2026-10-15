@@ -268,6 +268,17 @@ each end) and logs `air: … g=… rms=…`. The summary prints the median over 
 
 ---
 
+## Gate 0 decision (Aescher, 2026-10-15)
+
+- **Approved: B1 through mode 1, with only targeted RE** (replay/menu hand-back spike at T9,
+  manual detection at T7). No deep reverse engineering of skate.'s camera.
+- **Camera styles: both presets, full Skate 3 by default.** `S3 Low` / `S3 High` is the full S3Cam
+  camera. `skate. Native+` reads the native pose (it keeps running under mode 1) and adds only
+  the S3 layers: air height hold, landing dip and impulse shake, roll.
+- **Settings: a separate S3 CAMERA page** in the ReSkate menu (T11 as planned), plus the console.
+- **No Skate 3 copy:** T19 (the stock-value importer) is shelved. Defaults are hand-tuned from the
+  published Low/High shot values, the Rust reference, Skate 3 footage and Aescher's feel (T12).
+
 ## Gate 0 report (2026-10-15, after six runs)
 
 **Ownership: B1 through mode 1, with early hand-back** (proposed; Aescher decides).
