@@ -19,6 +19,7 @@ struct S3CamObservation {
     bool wants_view{};     // on the board, or bailing (the Wipeout shot)
     double wants_for{};    // s the current wants_view value has held
     std::uint32_t state{}; // physics state (context +0x1414)
+    bool paused{};         // the game is paused (pause menu, replay editor): hand back at once
 };
 // Reads the skater once for this tick; s3cam_pose() reuses the reading. Never throws.
 S3CamObservation s3cam_observe(const SourceTrial& trial, std::uintptr_t client) noexcept;

@@ -55,6 +55,11 @@ constexpr std::uintptr_t body_position_offset = 0x50;
 constexpr std::size_t board_body_count = 9;
 constexpr float manual_on_degrees = 7.0f, manual_off_degrees = 4.0f;
 constexpr double manual_on_time = 0.15, manual_off_time = 0.1;
+// The game paused (pause menu, and the replay editor behind it): the client keeps reporting normal
+// play (state 13, control yes), but the skater stops moving while its physics still holds a speed,
+// or the physics step reads 0. S3Cam hands back at once so the replay editor gets its camera.
+constexpr double pause_after = 0.25;
+constexpr float pause_min_speed = 0.3f;
 
 struct Settings {
     std::mutex mutex;
@@ -84,6 +89,11 @@ struct Watch {
     // Extrapolation between physics steps (max_extrapolation).
     Vec3 physics_root{};
     double root_changed_at{};
+    // Pause detection (pause_after).
+    bool paused{};
+    double step_zero_since{};
+    bool step_zero{};
+    float physics_step{};
     // Manual detection.
     float board_pitch{};      // degrees against the ground, + front end up
     bool board_pitch_ok{};
@@ -313,13 +323,13 @@ void report(Run& r, Watch& w, double now) {
         "game camera moved on {} (unreadable {}) | "
         "update {:.3f} ms mean, {:.3f} max, {} rays | state {} shot {} speed {:.1f} clearance {:.2f} normal.y {:.3f} | "
         "dist {:.2f} elev {:.1f} deg lag {:.2f} | fov {:.1f} (game camera {:.1f}, FreeCamera at take {:.1f}) | "
-        "game camera {:.1f} m from the skater | blend {:.2f} | board pitch {} manual {}",
+        "game camera {:.1f} m from the skater | blend {:.2f} | board pitch {} manual {} | physics step {:.4f}",
         now - r.started, r.frames, r.steps, r.held, r.resets, r.failed, w.unreadable, w.root_repeats, r.native_moved,
         r.native_unreadable,
         r.frames ? r.update_ms / r.frames : 0.0, r.update_ms_max, w.rays - r.rays_at_report, w.state, d.shot_name, d.speed,
         w.subject.ground_clearance, w.subject.ground_normal[1], d.distance, d.elevation / s3cam::degrees, d.anchor_lag,
         f.fov_deg, r.native_fov, r.fallback_fov, r.native_distance, r.blend,
-        w.board_pitch_ok ? std::format("{:+.1f} deg", w.board_pitch) : std::string("unreadable"), w.manual ? "on" : "off");
+        w.board_pitch_ok ? std::format("{:+.1f} deg", w.board_pitch) : std::string("unreadable"), w.manual ? "on" : "off", w.physics_step);
     r.frames = r.steps = r.held = r.resets = r.failed = r.native_moved = r.native_unreadable = 0;
     w.unreadable = w.root_repeats = 0;
     r.update_ms = r.update_ms_max = 0;
@@ -443,9 +453,22 @@ S3CamObservation s3cam_observe(const SourceTrial& trial, std::uintptr_t client) 
             w.state = state;
             w.state_since = now;
         }
+        // Paused: the root has not moved for a while though the body still has speed, or the physics
+        // step is 0.
+        w.physics_step = bodies.seconds;
+        if (bodies.seconds <= 0.0f) {
+            if (!w.step_zero) { w.step_zero = true; w.step_zero_since = now; }
+        } else w.step_zero = false;
+        const bool frozen = now - w.root_changed_at >= pause_after && s3cam::length(velocity) > pause_min_speed;
+        const bool paused = frozen || (w.step_zero && now - w.step_zero_since >= pause_after);
+        if (paused != w.paused && s3cam_options().verbose)
+            logging::log(Level::info, Channel::skater, "s3cam game {} (physics step {:.4f} s, speed {:.1f} m/s)",
+                paused ? "paused" : "running", bodies.seconds, s3cam::length(velocity));
+        w.paused = paused;
         result.valid = w.observed;
         result.state = state;
-        result.wants_view = onboard || ragdoll;
+        result.paused = paused;
+        result.wants_view = (onboard || ragdoll) && !paused;
     } catch (...) {
         ++w.unreadable;
         w.subject.valid = false;

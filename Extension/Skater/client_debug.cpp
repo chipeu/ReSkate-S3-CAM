@@ -763,8 +763,7 @@ void debug_action(SourceTrial& trial, std::uintptr_t client, bool can_control, b
         debug.s3cam_retry_after = 0;
         mark_debug_changed(debug);
         s3cam_note("on");
-        debug.status = "S3Cam on: the Skate 3 camera while you ride. Off the board, in menus and in the replay editor "
-            "the game's camera comes back.";
+        debug.status = "S3Cam on. Off the board, in menus and in the replay editor the game's camera is used.";
         return;
     }
     if (request.action == overlay::DebugAction::set_s3cam_probe) {
@@ -977,7 +976,8 @@ void s3cam_tick(SourceTrial& trial, std::uintptr_t client, bool can_control, boo
             // hand back at once, no crossfade. Without a verified phase the switch waits (the last
             // pose holds) and is tried again every tick.
             const char* screen = !can_control ? "no local control (menu, replay editor or loading)"
-                : s3cam_game_camera_away() ? "the game moved its camera away from the skater (map or customisation)" : nullptr;
+                : s3cam_game_camera_away() ? "the game moved its camera away from the skater (map or customisation)"
+                : seen.valid && seen.paused ? "the game is paused (pause menu or replay editor)" : nullptr;
             if (screen) {
                 if (!phase) return;
                 debug_restore_camera(trial, client, phase, error);
