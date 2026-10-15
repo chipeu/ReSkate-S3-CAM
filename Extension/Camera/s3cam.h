@@ -32,6 +32,20 @@ std::array<float, 16> s3cam_pose(const SourceTrial& trial, const std::array<floa
 // Ends the run and logs its summary; safe when not running.
 void s3cam_end(const char* reason) noexcept;
 bool s3cam_running() noexcept;
+// Crossfade out (true) to the game's camera before handing it back, or back in (false).
+void s3cam_release(bool release) noexcept;
+// The crossfade out has finished (or there is nothing to fade with): hand the view back now.
+bool s3cam_released() noexcept;
+// The FreeCamera's FOV when S3Cam took it: the base FOV when the game camera's cannot be read.
+void s3cam_set_fallback_fov(float fov) noexcept;
+// The game has moved its own camera far from the skater (a map or customisation screen).
+bool s3cam_game_camera_away() noexcept;
+// Before taking: the game's camera is near the skater (true when unknown).
+bool s3cam_game_camera_near(std::uintptr_t base, std::uintptr_t native_camera) noexcept;
+// The game wrote its camera height option (R3): S3 Low / High follows when the option says so.
+void s3cam_game_height(bool high) noexcept;
+// Shoulder side: 0 swaps, +1 right, -1 left (switches the shoulder mode to Manual).
+void s3cam_swap_side(int side) noexcept;
 // Logs what the hand-back logic sees whenever it changes: the client flow state (+0xc4), whether the
 // tick may control and whether the camera phase is verified, and the camera mode. Answers the T9
 // question of what the pause menu and the replay editor look like from the tick.

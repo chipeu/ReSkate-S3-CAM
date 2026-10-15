@@ -56,6 +56,8 @@ void map_page(SkateMenu&, const Model&, const CallbacksV3&);
 void world_page(SkateMenu&, const Model&, const CallbacksV3&);
 void build_page(SkateMenu&, const Model&, const CallbacksV3&);
 void skater_page(SkateMenu&, const Model&, const CallbacksV3&);
+// Extension/UI/Overlay/skate_menu_camera.cpp: S3Cam's switch and every tunable.
+void s3cam_page(SkateMenu&, const Model&, const CallbacksV3&);
 void settings_page(SkateMenu&, const Model&, const CallbacksV3&);
 // Settings > Post FX (skate_menu_world.cpp).
 void graphics_page(SkateMenu&, const Model&, const CallbacksV3&);

@@ -34,6 +34,18 @@ constexpr float ground_ray_above = 0.1f, ground_ray_below = 10.0f;
 // The trajectory's first chord starts on the takeoff surface and touches it at once: a hit this
 // close to a chord's start is skipped by casting again from a little further along.
 constexpr float start_hit_skip = 0.02f, start_hit_restart = 0.03f;
+// The skater's root moves once per physics step (60 Hz). Rendering faster, the frames between two
+// steps would see it stand still and then jump, which reads as a choppy camera at speed and in big
+// airs: between steps the root is carried forward along its velocity, at most this long.
+constexpr double max_extrapolation = 1.0 / 30.0;
+constexpr float extrapolation_gravity = 10.1f; // m/s2, SPIKES.md S4
+// The camera's degree FOV (client_source_spawn.h camera_fov_init: "the camera's degree FOV at
+// +0xac"). Read from the game's own camera too; used only while it looks like a FOV.
+constexpr std::uintptr_t camera_fov_field = 0xac;
+constexpr float plausible_fov_min = 10.0f, plausible_fov_max = 150.0f;
+// The game's camera this far from the skater while S3Cam owns the view: the game has moved it to a
+// screen of its own (map, customisation); S3Cam hands back at once and does not take it again there.
+constexpr float native_away_distance = 25.0f;
 
 struct Settings {
     std::mutex mutex;
@@ -60,6 +72,9 @@ struct Watch {
     std::uint64_t rays{};
     std::uint32_t unreadable{}, root_repeats{};
     Vec3 last_root{};
+    // Extrapolation between physics steps (max_extrapolation).
+    Vec3 physics_root{};
+    double root_changed_at{};
     // s3cam_note_flow
     bool flow_known{};
     std::uint32_t flow_state{}, flow_mode{};
@@ -76,6 +91,14 @@ struct Run {
     double started{}, last_pose{};
     std::uint64_t applied_revision = ~0ull;
     S3CamOptions options;
+
+    // Crossfade with the game's own camera (0 = the game's pose, 1 = S3Cam's): in when taking the
+    // view, out before handing it back on foot, so neither switch snaps. Eased with sine_blend.
+    float blend{}, blend_target = 1.0f;
+    bool native_ok{};
+    // FOV: the game camera's own (when its +0xac reads as a FOV), else the FreeCamera's at take.
+    float native_fov{}, fallback_fov{}, base_fov{};
+    float native_distance = -1.0f; // m, game camera to skater, -1 unknown
 
     // Diagnostics, one line a second.
     double report_at{};
@@ -245,12 +268,13 @@ void report(Run& r, Watch& w, double now) {
         "s3cam t={:.0f} {} fps, {} steps, {} held, {} resets, {} failed, {} unreadable, root repeated on {}, "
         "game camera moved on {} (unreadable {}) | "
         "update {:.3f} ms mean, {:.3f} max, {} rays | state {} shot {} speed {:.1f} clearance {:.2f} normal.y {:.3f} | "
-        "dist {:.2f} elev {:.1f} deg lag {:.2f} | fov {:.1f}",
+        "dist {:.2f} elev {:.1f} deg lag {:.2f} | fov {:.1f} (game camera {:.1f}, FreeCamera at take {:.1f}) | "
+        "game camera {:.1f} m from the skater | blend {:.2f}",
         now - r.started, r.frames, r.steps, r.held, r.resets, r.failed, w.unreadable, w.root_repeats, r.native_moved,
         r.native_unreadable,
         r.frames ? r.update_ms / r.frames : 0.0, r.update_ms_max, w.rays - r.rays_at_report, w.state, d.shot_name, d.speed,
         w.subject.ground_clearance, w.subject.ground_normal[1], d.distance, d.elevation / s3cam::degrees, d.anchor_lag,
-        f.fov_deg);
+        f.fov_deg, r.native_fov, r.fallback_fov, r.native_distance, r.blend);
     r.frames = r.steps = r.held = r.resets = r.failed = r.native_moved = r.native_unreadable = 0;
     w.unreadable = w.root_repeats = 0;
     r.update_ms = r.update_ms_max = 0;
@@ -318,6 +342,14 @@ S3CamObservation s3cam_observe(const SourceTrial& trial, std::uintptr_t client) 
         s.valid = true;
         if (s.position == w.last_root) ++w.root_repeats;
         w.last_root = s.position;
+        if (s.position != w.physics_root) {
+            w.physics_root = s.position;
+            w.root_changed_at = now;
+        } else {
+            const auto ahead = static_cast<float>(std::clamp(now - w.root_changed_at, 0.0, max_extrapolation));
+            s.position = s3cam::add(s.position, s3cam::scale(s.velocity, ahead));
+            if (s3cam::is_air_state(state)) s.position[1] -= 0.5f * extrapolation_gravity * ahead * ahead;
+        }
         w.subject = s;
         w.observed = s3cam::usable(s);
 
@@ -357,6 +389,8 @@ void s3cam_begin(const SourceTrial& trial, std::uintptr_t native_camera, const s
     r.started = r.last_pose = source_flight_now();
     r.report_at = r.started + 1;
     r.rays_at_report = watch().rays;
+    r.blend = 0.0f;
+    r.blend_target = 1.0f;
     r.running = true;
     camera_man().request_reset();
     const auto settings = s3cam_settings();
@@ -396,11 +430,22 @@ std::array<float, 16> s3cam_pose(const SourceTrial& trial, const std::array<floa
     }
     s3cam::NativePose native;
     s3cam::FrameExtras extras;
-    if (read_native(trial.base, r.native_camera, native)) {
+    r.native_ok = read_native(trial.base, r.native_camera, native);
+    if (r.native_ok) {
         extras.native = &native;
         if (native.position != r.native_last) ++r.native_moved;
         r.native_last = native.position;
-    } else ++r.native_unreadable;
+        r.native_distance = s3cam::length(s3cam::sub(native.position, w.subject.position));
+        float value{};
+        r.native_fov = first_person_read(r.native_camera + camera_fov_field, &value, 4) && std::isfinite(value) &&
+            value >= plausible_fov_min && value <= plausible_fov_max ? value : 0.0f;
+    } else {
+        ++r.native_unreadable;
+        r.native_distance = -1.0f;
+        r.native_fov = 0.0f;
+    }
+    r.base_fov = r.native_fov > 0 ? r.native_fov : r.fallback_fov;
+    native.fov_deg = r.base_fov;
 
     LARGE_INTEGER begin{}, end{};
     QueryPerformanceCounter(&begin);
@@ -417,12 +462,30 @@ std::array<float, 16> s3cam_pose(const SourceTrial& trial, const std::array<floa
     if (!frame.valid) { ++r.failed; source_require(false, "S3Cam has no pose yet; holding the view."); }
     watch_frame(r, w, frame, now);
 
+    // Crossfade with the game's camera. Without a readable game camera there is nothing to fade
+    // with: S3Cam's pose shows as it is (and a release completes at once).
+    const float blend_time = r.blend_target > r.blend ? r.options.take_blend_time : r.options.release_blend_time;
+    const float blend_step = blend_time > 0.0f ? static_cast<float>(dt) / std::max(blend_time, 1e-3f) : 1.0f;
+    r.blend = r.blend_target > r.blend ? std::min(r.blend_target, r.blend + blend_step) : std::max(r.blend_target, r.blend - blend_step);
+    if (!r.native_ok) r.blend = r.blend_target;
+    const float mix = r.native_ok ? s3cam::sine_blend(r.blend) : 1.0f;
+    Vec3 right = frame.right, up = frame.up, back = frame.back, pos = frame.pos;
+    if (mix < 1.0f) {
+        right = s3cam::lerp(native.right, right, mix);
+        up = s3cam::lerp(native.up, up, mix);
+        back = s3cam::lerp(native.back, back, mix);
+        pos = s3cam::lerp(native.position, pos, mix);
+        s3cam::camera_detail::orthonormalize(right, up, back);
+    }
     auto matrix = previous;
-    const std::array<const Vec3*, 4> rows{&frame.right, &frame.up, &frame.back, &frame.pos};
+    const std::array<const Vec3*, 4> rows{&right, &up, &back, &pos};
     for (std::size_t row = 0; row < 4; ++row)
         for (std::size_t lane = 0; lane < 3; ++lane) matrix[row * 4 + lane] = (*rows[row])[lane];
     if (!valid_flight_transform(matrix)) { ++r.failed; source_require(false, "S3Cam's pose is invalid; holding the view."); }
-    if (r.options.shot_fov || man.settings().fov_override_deg > 0) fov = frame.fov_deg;
+    if (r.options.shot_fov || man.settings().fov_override_deg > 0) {
+        // The game's FOV at either end of the crossfade, so taking and handing back keep the zoom.
+        fov = r.base_fov > 0 ? r.base_fov + (frame.fov_deg - r.base_fov) * mix : frame.fov_deg;
+    }
     return matrix;
 }
 
@@ -441,6 +504,49 @@ void s3cam_end(const char* reason) noexcept {
 }
 
 bool s3cam_running() noexcept { return run().running; }
+
+void s3cam_release(bool release) noexcept { run().blend_target = release ? 0.0f : 1.0f; }
+bool s3cam_released() noexcept {
+    const auto& r = run();
+    return !r.running || (r.blend_target <= 0.0f && (r.blend <= 0.0f || !r.native_ok));
+}
+void s3cam_set_fallback_fov(float fov) noexcept {
+    run().fallback_fov = std::isfinite(fov) && fov >= plausible_fov_min && fov <= plausible_fov_max ? fov : 0.0f;
+}
+bool s3cam_game_camera_away() noexcept {
+    const auto& r = run();
+    return r.running && r.native_ok && r.native_distance > native_away_distance;
+}
+bool s3cam_game_camera_near(std::uintptr_t base, std::uintptr_t native_camera) noexcept {
+    s3cam::NativePose native;
+    const auto& w = watch();
+    if (!w.observed || !read_native(base, native_camera, native)) return true; // unknown: do not block
+    return s3cam::length(s3cam::sub(native.position, w.subject.position)) <= native_away_distance;
+}
+void s3cam_game_height(bool high) noexcept {
+    auto& store = settings_store();
+    std::lock_guard lock(store.mutex);
+    if (!store.options.follow_game_height) return;
+    const auto angle = high ? s3cam::CameraAngle::High : s3cam::CameraAngle::Low;
+    if (store.camera.angle == angle) return;
+    store.camera.angle = angle;
+    ++store.revision;
+}
+void s3cam_swap_side(int side) noexcept {
+    auto& store = settings_store();
+    std::lock_guard lock(store.mutex);
+    auto& shoulder = store.camera.shoulder;
+    // Swapping from Off or Auto takes manual control: the swap is the player's choice.
+    const int current = shoulder.mode == s3cam::ShoulderSide::Off ? -1 : shoulder.side;
+    shoulder.side = side == 0 ? -current : (side > 0 ? 1 : -1);
+    shoulder.mode = s3cam::ShoulderSide::Manual;
+    ++store.revision;
+}
+std::uint64_t s3cam_settings_revision() noexcept {
+    auto& store = settings_store();
+    std::lock_guard lock(store.mutex);
+    return store.revision;
+}
 
 void s3cam_note_flow(std::uintptr_t client, bool can_control, bool phase, const SourceCameraSnapshot* camera, bool owned) noexcept {
     auto& w = watch();

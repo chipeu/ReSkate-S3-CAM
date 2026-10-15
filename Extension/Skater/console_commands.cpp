@@ -189,7 +189,7 @@ void register_movement_commands(Commands &registry) {
             }
             return update_settings([&](s3cam::CameraSettings &s) { s.fov_override_deg = degrees; }, message);
         });
-    setting("s3cam_shotfov", "S3Cam writes each shot's field of view (0 keeps the camera's own)", argument("0|1", Type::boolean),
+    setting("s3cam_shotfov", "S3Cam drives the field of view (speed and big-air widening; 0 keeps the camera's own)", argument("0|1", Type::boolean),
         [] { return std::string(cam::s3cam_options().shot_fov ? "1" : "0"); },
         [](const Values &args, std::string &) {
             auto options = cam::s3cam_options();
@@ -204,6 +204,34 @@ void register_movement_commands(Commands &registry) {
             options.verbose = std::get<bool>(args[0]);
             cam::s3cam_set_options(options);
             return true;
+        });
+    auto side_argument = argument("swap|left|right");
+    side_argument.choices = {"swap", "left", "right"};
+    auto side = action("s3cam_side", "S3Cam shoulder side: swap (bind it to L3 in the binds), left or right", Group::movement,
+        {side_argument});
+    side.inspect = [](const Model &) {
+        const auto shoulder = cam::s3cam_settings().shoulder;
+        const char *mode = shoulder.mode == s3cam::ShoulderSide::Off ? "off" : shoulder.mode == s3cam::ShoulderSide::Auto ? "auto" : "manual";
+        return State{true, std::string(mode) + (shoulder.side > 0 ? ", right" : ", left"), {}, {}, false};
+    };
+    side.run = [](const Model &, const Values &args, const Output &) {
+        const auto &which = std::get<std::string>(args[0]);
+        cam::s3cam_swap_side(which == "left" ? -1 : which == "right" ? 1 : 0);
+    };
+    registry.add(std::move(side));
+    auto shoulder_argument = argument("off|manual|auto");
+    shoulder_argument.choices = {"off", "manual", "auto"};
+    setting("s3cam_shoulder", "S3Cam shoulder offset: off (centred), manual (s3cam_side / L3) or auto (your stance's toe side)",
+        shoulder_argument,
+        [] {
+            const auto mode = cam::s3cam_settings().shoulder.mode;
+            return std::string(mode == s3cam::ShoulderSide::Off ? "off" : mode == s3cam::ShoulderSide::Auto ? "auto" : "manual");
+        },
+        [update_settings](const Values &args, std::string &message) {
+            const auto &which = std::get<std::string>(args[0]);
+            const auto mode = which == "auto" ? s3cam::ShoulderSide::Auto : which == "manual" ? s3cam::ShoulderSide::Manual
+                                                                                              : s3cam::ShoulderSide::Off;
+            return update_settings([&](s3cam::CameraSettings &c) { c.shoulder.mode = mode; }, message);
         });
     auto dump = action("s3cam_dump", "Show S3Cam's settings and what the camera is doing now", Group::movement);
     dump.inspect = [](const Model &) { return State{true, {}, {}, {}, false}; };

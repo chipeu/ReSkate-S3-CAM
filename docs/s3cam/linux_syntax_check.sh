@@ -29,7 +29,7 @@ cd "$WORK/mirror"
 status=0
 for f in "$@"; do
     echo "== $f"
-    if ! x86_64-w64-mingw32-g++ -std=c++20 -fsyntax-only -I. -I"$WORK/shim" -DNOMINMAX "$f" 2>"$WORK/errors"; then
+    if ! x86_64-w64-mingw32-g++ -std=c++20 -fsyntax-only -I. -IExternal/imgui -I"$WORK/shim" -DNOMINMAX "$f" 2>"$WORK/errors"; then
         grep -E "error" "$WORK/errors" | head -20
         status=1
     fi

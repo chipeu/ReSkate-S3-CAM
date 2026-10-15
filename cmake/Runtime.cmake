@@ -135,6 +135,7 @@ add_library(dingosdk_runtime SHARED
     Extension/Skater/client_noclip.cpp
     Extension/Skater/client_first_person.cpp
     Extension/Camera/s3cam.cpp
+    Extension/Camera/s3cam_config.cpp
     Extension/Camera/s3cam_probe.cpp
     Extension/Skater/client_debug.cpp
     Extension/Skater/ai_skaters.cpp
