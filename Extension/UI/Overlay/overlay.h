@@ -77,6 +77,8 @@ enum class DebugAction {
     set_first_person_camera_cycle,
     reset_first_person_arm,
     set_free_camera_fov,  // 0 = the game's own FOV
+    set_s3cam_probe,      // S3Cam Phase 0 spike S1 (Extension/Camera/s3cam_probe.h)
+    s3cam_ray,            // S3Cam Phase 0 spike S3
     // Keep the last action in sync with the bound in request_scheduler.h.
 };
 
@@ -109,6 +111,7 @@ struct DebugModel {
     bool ui_available = false;
     bool free_camera = false;
     bool first_person = false;
+    bool s3cam_probe = false; // S3Cam Phase 0 spike S1 owns the view
     // Vertical degrees applied to the first-person view; 0 keeps the camera's own.
     float first_person_fov = 0;
     float free_camera_fov = 0;  // 0 = the game's own FOV

@@ -92,6 +92,26 @@ void register_movement_commands(Commands &registry) {
     };
     free_fov.reset = [](const Model &, const Output &) { request_debug(Debug::set_free_camera_fov, false, 0.0f); };
     registry.add(std::move(free_fov));
+    // S3Cam Phase 0 spikes (Extension/Camera/s3cam_probe.h, docs/s3cam/SPIKES.md). Throwaway.
+    auto probe = variable("s3cam_probe", "S3Cam spike: fixed chase camera that logs camera, state and gravity findings",
+        Group::movement, argument("0|1", Type::boolean));
+    probe.inspect = [](const Model &m) {
+        return boolean_state(m.debug.camera_available || m.debug.s3cam_probe, m.debug.s3cam_probe, m.debug.camera_unavailable);
+    };
+    probe.run = [](const Model &, const Values &args, const Output &) {
+        request_debug(Debug::set_s3cam_probe, std::get<bool>(args[0]));
+    };
+    probe.reset = [](const Model &, const Output &) { request_debug(Debug::set_s3cam_probe, false); };
+    registry.add(std::move(probe));
+    auto ray = action("s3cam_ray", "S3Cam spike: cast physics rays around the skater and time them", Group::movement);
+    ray.inspect = [](const Model &m) {
+        return State{m.debug.available, {}, "Waiting for local player controls.", {}, false};
+    };
+    ray.run = [](const Model &, const Values &, const Output &out) {
+        request_debug(Debug::s3cam_ray);
+        out("Casting; the result is in the debug status and the log (s3cam_ray).");
+    };
+    registry.add(std::move(ray));
     auto boost_speed_argument = argument("speed", Type::number);
     boost_speed_argument.minimum = 1;
     boost_speed_argument.maximum = 300;
