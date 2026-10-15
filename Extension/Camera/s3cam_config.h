@@ -5,6 +5,10 @@
 // "S3Cam.<Group>.<Field>". Only player-facing fields are saved; the Skate 3 tracker internals
 // (rig, graph, orientation, air, trajectory, pipeline, points) stay at their code defaults.
 //
+// The field table, the load pass and the text choices are shared with the presets
+// (Extension/Camera/s3cam_preset_format.h, pure and tested on Linux; the presets themselves are
+// Extension/Camera/s3cam_presets.h).
+//
 // Compiled into the runtime target (Extension/Camera/s3cam_config.cpp). The overlay's S3 CAMERA page
 // (Extension/UI/Overlay/skate_menu_camera.cpp) calls s3cam_config_reset() directly: the overlay is a
 // static library linked into the runtime DLL, as for the Music page's calls into music_inject.
