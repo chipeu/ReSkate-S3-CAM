@@ -97,8 +97,10 @@ before Aescher builds it:
 
 ## Run in game
 
-1. Copy the built `ReSkate.dll` (and launcher, if changed) into the ReSkate install folder, the one
-   holding `ReSkateLauncher.exe`. Back up the original first, as `ReSkate.dll.orig`.
+1. Close the game. Copy **both** `ReSkateLauncher.exe` and `ReSkate.dll` from
+   `build/vs2022-x64/Release/` into the ReSkate folder (beside `Skate.exe`). Back up the originals
+   first (`*.orig`). Both are needed: a release launcher can update `ReSkate.dll` back to the
+   official build, while a locally built launcher never replaces anything (README, "Running your build").
 2. Launch with `ReSkateLauncher.exe` → PLAY. **Insert** opens the menu; **~** opens the console.
 3. Logs: `logs\ReSkate.log` beside `Skate.exe`. Read it after every run, and grep for `s3cam`,
    `error` and `fingerprint`.
