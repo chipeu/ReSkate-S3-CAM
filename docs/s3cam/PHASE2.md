@@ -109,3 +109,34 @@ Settings are not saved between launches yet (T10).
 7. Open the map and the skater appearance menu with S3Cam on. Note what shows.
 8. Restart the game: S3Cam and its settings come back.
 9. Send `logs\ReSkate.log`.
+
+## Alpha 3 (from the Alpha 2 log and feedback)
+
+Log findings: the game camera's FOV at +0xac is real (70°, and it moves by itself in bails); 60 fps
+with no repeated roots, so stair-stepping was not the problem; ~2/3 of landings were predicted 8–9 m
+down (the start-hit skip on falling chords), which swung the landing look every 0.1 s; speed measured
+along the spinning entity forward made the speed FOV and dynamic follow twitch in tricks; every
+landing had a shake impulse of 0 (angle weighting); the map / customisation hand-back worked.
+
+| Change | Where |
+|---|---|
+| Start-hit skip only for rising chords | glue |
+| Speed held in the air; horizontal speed for FOV and follow | core |
+| Landing shake weighted by the speed into the ground, 2.2–5.7 m/s | core (`s3_shake.h`) |
+| Manual detector: board pitch vs ground from the extreme board bodies (7° on / 4° off) | glue, logged |
+| Manual close-up: 0.75 × the chase distance, adjustable | core + MANUAL card |
+| Trick yaw: swing to the side while tricking, hold, recentre | core + TRICK YAW card |
+| Camera distance, height, view pitch | core + CAMERA POSITION card |
+| Named presets, import / export (clipboard and files) | PRESETS card |
+| Per-air jitter numbers in the landing line | glue |
+
+### Alpha 3 test
+
+1. Big airs and gaps: FOV and camera smooth? Landing lines now end with the air's FOV range,
+   largest FOV step, turn and jerk; send them.
+2. Manual and nose manual on flat ground: the camera moves closer (log: `s3cam manual on`). Ride up
+   and down ramps without a manual: there must be no `manual on` lines.
+3. Trick yaw: a flip trick in a big air swings the camera round, chain tricks, then let it recentre.
+4. CAMERA POSITION sliders while riding.
+5. Presets: save one, change things, load it back; export, then import from the clipboard.
+6. Send `logs\ReSkate.log`.

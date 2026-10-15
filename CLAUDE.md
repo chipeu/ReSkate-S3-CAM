@@ -225,3 +225,7 @@ with file:line and a concrete failure scenario. Do not edit code.
   collision in the core (Sonnet, reviewed; s3cam_layers suite), S3 CAMERA tab + saved settings
   (Sonnet, reviewed), R3 height and the L3 side bind. Next: Aescher's Alpha 2 run (PHASE2.md),
   map/customisation hand-back from its log.
+- 2026-10-16: Alpha 3 from the Alpha 2 log: falling-chord start-hit bug (8-9 m predictions), steady
+  speed in tricks, landing shake weighting, manual detector (board pitch), chase-relative manual
+  close-up, trick yaw, framing, named presets with import/export (Sonnet x2 + Opus glue, reviewed;
+  s3cam_presets suite). Next: Aescher's Alpha 3 run (PHASE2.md).
