@@ -23,6 +23,8 @@ void s3cam_probe_arm(const SourceTrial& trial, const SourceCameraSnapshot& nativ
 // Mode 2: one engine-thread tick, after the game's camera update. `ready` is the debug tick's
 // can-control and verified-camera-phase. Throws SourceGuard when the camera cannot be read.
 void s3cam_overlay_tick(const SourceTrial& trial, std::uintptr_t client, bool ready);
+// Mode 2's write, from the native camera update's listener (camera_observer.h).
+void s3cam_camera_updated(std::uintptr_t camera) noexcept;
 // The probe's pose for this tick, built on `previous` (row fourth lanes are kept). Throws
 // SourceGuard when the skater cannot be read; the caller then holds the last pose.
 std::array<float, 16> s3cam_probe_pose(const SourceTrial& trial, std::uintptr_t client, const std::array<float, 16>& previous);

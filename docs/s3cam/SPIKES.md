@@ -1,8 +1,9 @@
 # S3Cam Phase 0: spike findings
 
-Status: **two in-game runs done (2026-10-15).** Run 1 (19:55): S1 and S3 answered. Run 2 (20:08,
-after the 10 Hz fix): smooth, but it exposed the replay/right-stick problem behind spike **S1b**
-(below), and gravity needs one more run. Next: run 3 = `s3cam_probe 2`. Code reading is done (below). Every
+Status: **three in-game runs done (2026-10-15).** S2, S3 and **S4 (g ≈ 10.1 m/s²)** answered.
+Ownership: mode 1 shows the pose but freezes the replay editor; mode 2 (run 3) keeps everything
+native, but its write came too late to show. Next: run 4 = **S1c**, mode 2 writing from inside the
+game's camera update. `ctest`: **46/46 passed** (MSVC, Release). Code reading is done (below). Every
 cell marked _pending_ needs a log line from Aescher's PC. Gate 0 is decided from this file.
 
 How the work is split: a Linux cloud session writes code and checks it (pure-math tests with g++ and
@@ -32,7 +33,7 @@ ctest --test-dir build/vs2022-x64 -C Release --output-on-failure
 | Check | Result |
 |---|---|
 | Release build, no warnings | yes (after fixing the Spotify configure step, `cmake/Runtime.cmake`) |
-| `ctest` all green (count) | _pending: Aescher to paste the summary line_ |
+| `ctest` all green (count) | **46/46 passed** (run 3 build) |
 | Game launches with the new DLL, `ReSkate.log` clean | yes |
 
 ## S1. Ownership: B1 (full override) or B2 (post-process)
@@ -112,11 +113,32 @@ render-pose handoff, as first person does.
 
 | Run 3 question | Answer |
 |---|---|
+| Does the view follow the probe pose, smoothly? | **no: the view stayed the game's own camera** |
+| Off board: is the game's camera back, right stick working? | **yes** |
+| Replay editor while mode 2 is on: normal? | **yes**: free camera and clip playback as in vanilla |
+| Freecam / first person on and off while mode 2 is on: clean? | **yes** |
+| `writes` vs `found unchanged next tick` | 7095 writes, 0 failed, **0 unchanged**: the game recomputes its camera every frame, and the view had already taken it before the debug tick wrote |
+
+### S1c. Write inside the game's camera update
+
+The camera observer already hooks the native camera callback (0x178b690, `camera_observer.cpp`).
+Its evaluator holds the game camera at +0x138, the same object as the view's mode-0 camera. A
+listener (`set_camera_updated_listener`) now runs right after that callback returns, from the
+verified native caller only. Mode 2's tick computes the pose and the listener writes it, inside
+the game's own update and before anything later in the frame copies the camera. The pose is one
+tick old (constant lag, as run 1's 60 Hz chase). Unit test: `camera_observer_recovery` →
+`updated_listener`.
+
+Log: `s3cam_probe overlay: W writes in the camera update (S seen, T other thread, X stale), H
+still ours at the tick, …`. S≈W means every update was overwritten. H≈W means nothing later in
+the native update overwrote it again. If the view still doesn't follow, the copy happens inside
+the callback (in its `output`), and the next spike looks at that buffer.
+
+| Run 4 question | Answer |
+|---|---|
 | Does the view follow the probe pose, smoothly? | _pending_ |
-| Off board: is the game's camera back, right stick working? | _pending_ |
-| Replay editor while mode 2 is on: normal? | _pending_ |
-| Freecam / first person on and off while mode 2 is on: clean? | _pending_ |
-| `writes` vs `found unchanged next tick` | _pending_ |
+| Off board, replay editor, Freecam, first person still vanilla? | _pending_ |
+| W / S / H counters | _pending_ |
 
 **Verdict (proposed for Gate 0, revised after run 2): own the pose, not the selection.** If S1b
 works, S3Cam writes the game's camera (B1's full control of the pose, without B1's mode switch),
@@ -192,7 +214,7 @@ each end) and logs `air: … g=… rms=…`. The summary prints the median over 
 
 | Measurement | Value |
 |---|---|
-| g (median of N arcs) | _pending_. Run 1 sampled at 10 Hz: nothing fittable. Run 2: 31 fits, **1.8 to 28 m/s² (median 17.2), rms 1–7 cm**, which is not ballistic. Ollie-sized arcs (0.33–0.45 s) fit 15–28. The long drops (0.77–1.03 s, 1.9–3.4 m down) fit **10.3, 11.7, 12.9**. Cause: the arc started at state 200, while the pop is still pushing the board, and the board root is flipped and caught during tricks. Run 3 records only state 201 and fits the skater root too (`air root:` lines). The data-defined `GravityAcceleration` 9.81 (trainer_classes.inc) sits with the on-foot values and may not be the board's air gravity |
+| g (median of N arcs) | **≈ 10.1 m/s²** from the skater root on the five long arcs of run 3 (0.87–1.15 s of free air, state 201 only): **10.19, 10.38, 10.07, 10.13, 9.80**, rms 0.4–1.7 cm. Short ollies (0.27–0.42 s) scatter from 7.4 to 15.6 (too short, and the body still moves through the trick); the board root scatters more (3–25). Use 10.1, tunable. Earlier runs: run 1 sampled at 10 Hz: nothing fittable. Run 2: 31 fits, **1.8 to 28 m/s² (median 17.2), rms 1–7 cm**, which is not ballistic. Ollie-sized arcs (0.33–0.45 s) fit 15–28. The long drops (0.77–1.03 s, 1.9–3.4 m down) fit **10.3, 11.7, 12.9**. Cause: the arc started at state 200, while the pop is still pushing the board, and the board root is flipped and caught during tricks. Run 3 records only state 201 and fits the skater root too (`air root:` lines). The data-defined `GravityAcceleration` 9.81 (trainer_classes.inc) sits with the on-foot values and may not be the board's air gravity |
 | rms of a typical arc | _pending_ |
 | physics dt (`dt_phys` in the log) | **0.0167 s (60 Hz)** |
 | board root vs skater root height (`board_h` − `root.y`) | **≈ −0.9 m** riding |
@@ -201,10 +223,10 @@ each end) and logs `air: … g=… rms=…`. The summary prints the median over 
 
 ## Gate 0 report (filled in after the run)
 
-- B1/B2 verdict: **own the pose, not the selection** (S1b, `s3cam_probe 2`), pending run 3
+- B1/B2 verdict: **own the pose, not the selection**: mode 2's hand-back behaviour is proven (run 3); whether its pose shows from inside the camera update is S1c (run 4)
 - Frozen `SubjectSnapshot` fields: _pending manual + gravity rerun_
 - Ray-cast cost: **~0.02 ms per 10 casts** (budget 0.3)
-- Measured gravity: _pending run 3 (201-only, root fit)_
+- Measured gravity: **≈ 10.1 m/s²** (skater root, long arcs; tunable `air.gravity`)
 - Camera matrix convention: rows {right, up, backward, position}, right × up = **+backward**
 - Card changes: T3 should also read `skate-game/src/camera/trajectory.rs` and
   `skate-core/src/camera/trajectory_query.rs` (gravity is a query input there). T8 should read

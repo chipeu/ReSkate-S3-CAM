@@ -8,6 +8,7 @@
 #include "Engine/Game/Camera/s3_probe_pose.h"
 #include "Extension/Objects/ParkEditor/park_editor_surface.h"
 #include "Extension/Objects/local_placements_runtime.h"
+#include "Extension/Skater/camera_observer.h"
 #include "Extension/Skater/free_flight.h"
 #include <algorithm>
 #include <cmath>
@@ -29,9 +30,15 @@ struct Probe {
     bool armed{};
     // Mode 2 (S1b): instead of selecting the FreeCamera (mode 1), overwrite the game's own camera
     // after its update. Counters say whether the write stuck and when it was skipped.
+    // Run 3: written after the debug tick, the pose never showed (the view had already taken the
+    // camera). Now the tick only computes it, and the native camera update's listener writes it
+    // right after the game's own update (S1c), one frame behind the skater.
     bool overlay{}, overlay_written{};
     std::array<float, 16> overlay_last{};
+    double overlay_at{};
+    DWORD overlay_thread{};
     std::uint64_t overlay_writes{}, overlay_held{}, overlay_offboard{}, overlay_other_camera{}, overlay_failed{};
+    std::uint64_t updates_seen{}, updates_other_thread{}, updates_stale{};
     double overlay_report_at{};
     std::uintptr_t native_camera{};
     int hand{};
@@ -142,6 +149,7 @@ void s3cam_probe_arm(const SourceTrial& trial, const SourceCameraSnapshot& nativ
     p.native_last = view;
     p.native_seen = true;
     p.overlay = overlay;
+    if (overlay) set_camera_updated_listener(&s3cam_camera_updated);
     p.overlay_report_at = p.armed_at + 5;
     p.armed = true;
     logging::log(Level::info, Channel::skater,
@@ -269,36 +277,51 @@ void s3cam_overlay_tick(const SourceTrial& trial, std::uintptr_t client, bool re
     // recompute on some frames, or keep our pose as its state).
     if (p.overlay_written && view == p.overlay_last) ++p.overlay_held;
     const auto matrix = s3cam_probe_pose(trial, client, view);
+    const auto now = source_flight_now();
+    p.overlay_thread = GetCurrentThreadId();
     if (p.state == addr::no_bail::offboard_physics_state) {
         // On foot or bailing: the game's camera, right stick included, is left alone.
         ++p.overlay_offboard;
         p.overlay_written = false;
-    } else if (write_native_view(p.native_camera, matrix)) {
-        p.overlay_last = matrix;
-        p.overlay_written = true;
-        ++p.overlay_writes;
     } else {
-        ++p.overlay_failed;
-        p.overlay_written = false;
+        // Published for the next native camera update (s3cam_camera_updated).
+        p.overlay_last = matrix;
+        p.overlay_at = now;
+        p.overlay_written = true;
     }
-    const auto now = source_flight_now();
     if (now >= p.overlay_report_at) {
         p.overlay_report_at = now + 5;
         logging::log(Level::info, Channel::skater,
-            "s3cam_probe overlay: {} writes, {} found unchanged next tick, {} skipped off board, {} other camera, {} failed",
-            p.overlay_writes, p.overlay_held, p.overlay_offboard, p.overlay_other_camera, p.overlay_failed);
+            "s3cam_probe overlay: {} writes in the camera update ({} seen, {} other thread, {} stale), "
+            "{} still ours at the tick, {} skipped off board, {} other camera, {} failed",
+            p.overlay_writes, p.updates_seen, p.updates_other_thread, p.updates_stale, p.overlay_held,
+            p.overlay_offboard, p.overlay_other_camera, p.overlay_failed);
     }
+}
+
+void s3cam_camera_updated(std::uintptr_t camera) noexcept {
+    auto& p = probe();
+    if (!p.armed || !p.overlay || camera != p.native_camera) return;
+    ++p.updates_seen;
+    // The probe's state belongs to the debug tick's thread; anything else only counts.
+    if (GetCurrentThreadId() != p.overlay_thread) { ++p.updates_other_thread; return; }
+    if (!p.overlay_written || source_flight_now() - p.overlay_at > 0.1) { ++p.updates_stale; return; }
+    if (write_native_view(camera, p.overlay_last)) ++p.overlay_writes;
+    else ++p.overlay_failed;
 }
 
 void s3cam_probe_disarm(const char* reason) noexcept {
     auto& p = probe();
     if (!p.armed) return;
     p.armed = false;
+    set_camera_updated_listener(nullptr);
     try {
         if (p.overlay)
             logging::log(Level::info, Channel::skater,
-                "s3cam_probe overlay total: {} writes, {} found unchanged next tick, {} skipped off board, {} other camera, {} failed",
-                p.overlay_writes, p.overlay_held, p.overlay_offboard, p.overlay_other_camera, p.overlay_failed);
+                "s3cam_probe overlay total: {} writes in the camera update ({} seen, {} other thread, {} stale), "
+                "{} still ours at the tick, {} skipped off board, {} other camera, {} failed",
+                p.overlay_writes, p.updates_seen, p.updates_other_thread, p.updates_stale, p.overlay_held,
+                p.overlay_offboard, p.overlay_other_camera, p.overlay_failed);
         logging::log(Level::info, Channel::skater,
             "s3cam_probe summary ({}): {:.1f} s, native camera moved on {}/{} ticks, unreadable {}; "
             "entity row2.travel mean {:+.2f} over {} samples; gravity median board {:.3f} over {} arcs, root {:.3f} over {} arcs",

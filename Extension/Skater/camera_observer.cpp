@@ -59,6 +59,7 @@ struct CameraObserver {
     std::atomic<std::uint64_t> observation_generation{};
 };
 CameraObserver& camera_state() { static auto* state = new CameraObserver; return *state; }
+std::atomic<CameraUpdatedListener> camera_updated_listener{};
 CameraPhase camera_current_phase() noexcept {
     if (camera_thread.overflow) return CameraPhase::overflow;
     return camera_thread.depth ? camera_thread.frames[camera_thread.depth - 1].phase : CameraPhase::outside;
@@ -206,6 +207,17 @@ struct CameraCall {
     }
     ~CameraCall() { finish(false); }
 };
+// After a native update returns: hands the camera it evaluated to the listener, only for the
+// verified native caller, reading it the way camera_identity does.
+void camera_notify_updated(const CameraObserver& state, std::uintptr_t caller, std::uintptr_t time_input) noexcept {
+    const auto listener = camera_updated_listener.load(std::memory_order_acquire);
+    if (!listener || caller != state.base + camera_addresses::native_caller_return) return;
+    std::uintptr_t evaluator{}, camera{}, vtable{};
+    if (camera_range(time_input, 0x10) && memory::peek(time_input + 8, evaluator) && camera_object(evaluator) &&
+        camera_range(evaluator, 0x140) && memory::peek(evaluator + 0x138, camera) && camera_object(camera) &&
+        camera_range(camera, 0x188) && memory::peek(camera, vtable) && vtable == state.base + addr::engine::camera_vtable)
+        listener(camera);
+}
 void camera_hook(std::uintptr_t callback, std::uintptr_t time_input, std::uintptr_t output) {
     const auto incoming = GetLastError();
     const auto caller = reinterpret_cast<std::uintptr_t>(_ReturnAddress());
@@ -216,8 +228,12 @@ void camera_hook(std::uintptr_t callback, std::uintptr_t time_input, std::uintpt
     original(callback, time_input, output);
     const auto returned = GetLastError();
     call.finish(true);
+    camera_notify_updated(state, caller, time_input);
     SetLastError(returned);
 }
+}
+void set_camera_updated_listener(CameraUpdatedListener listener) noexcept {
+    camera_updated_listener.store(listener, std::memory_order_release);
 }
 bool start_camera_observer(std::uintptr_t base) noexcept {
     CameraError error;

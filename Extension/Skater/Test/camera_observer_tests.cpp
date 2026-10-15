@@ -138,6 +138,28 @@ void replacement_cameras() {
         check(!camera_probe_phase_observed(other.context.address()), "A different world cannot use the previous observation");
     }
 }
+std::uintptr_t updated_camera{};
+int updated_calls{};
+void record_update(std::uintptr_t camera) noexcept { updated_camera = camera; ++updated_calls; }
+// S3Cam spike S1c: the listener gets the evaluated camera after a verified native update only.
+void updated_listener() {
+    Camera camera;
+    const auto native = camera_state().base + camera_addresses::native_caller_return;
+    camera_notify_updated(camera_state(), native, camera.input.address());
+    check(updated_calls == 0, "No listener, no call");
+    set_camera_updated_listener(&record_update);
+    camera_notify_updated(camera_state(), native, camera.input.address());
+    check(updated_calls == 1 && updated_camera == camera.camera.address(), "The listener receives the evaluated camera");
+    camera_notify_updated(camera_state(), native + 1, camera.input.address());
+    check(updated_calls == 1, "Other callers are ignored");
+    camera.camera.put(0, std::uintptr_t{0});
+    camera_notify_updated(camera_state(), native, camera.input.address());
+    check(updated_calls == 1, "A camera of another type is ignored");
+    set_camera_updated_listener(nullptr);
+    camera.camera.put(0, camera_state().base + addr::engine::camera_vtable);
+    camera_notify_updated(camera_state(), native, camera.input.address());
+    check(updated_calls == 1, "A removed listener is not called");
+}
 int main() {
     try {
         const auto image = reinterpret_cast<std::uintptr_t>(VirtualAlloc(nullptr, 0x7900000, MEM_RESERVE, PAGE_READWRITE));
@@ -145,7 +167,7 @@ int main() {
         check(VirtualAlloc(reinterpret_cast<void*>(image + (addr::engine::tls_index & ~std::uintptr_t{0xfff})), 4096, MEM_COMMIT, PAGE_READWRITE) != nullptr,
             "Commit fixture TLS index page");
         camera_state().base = image; camera_state().active = true;
-        native_entry_variants(); recovery(); replacement_cameras();
+        native_entry_variants(); recovery(); replacement_cameras(); updated_listener();
         VirtualFree(reinterpret_cast<void*>(image), 0, MEM_RELEASE);
         std::cout << "Camera observation recovery checks passed.\n";
         return 0;
