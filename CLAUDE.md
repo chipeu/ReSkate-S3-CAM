@@ -196,3 +196,6 @@ with file:line and a concrete failure scenario. Do not edit code.
   `s3cam_ray` (S3) console commands, `s3_gravity_fit.h` and `s3_probe_pose.h` with tests, and
   `docs/s3cam/SPIKES.md` with the code-reading findings. Not yet built with MSVC or run in game.
   Next: Aescher runs S0, then the SPIKES.md session.
+- 2026-10-15: Phase 0 done after six in-game runs (SPIKES.md). Gate 0 proposed: B1 via mode 1 with
+  early hand-back; mode 2 (overwrite the game camera) ruled out; g ≈ 10.1; rays 0.02 ms/10. Waiting
+  for Aescher's Gate 0 approval before Phase 1.

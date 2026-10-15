@@ -168,8 +168,18 @@ that is rebuilt every frame is derived from the other (or from data further back
 
 | Run 6 question | Answer |
 |---|---|
-| Does the view switch to the chase pose? | _pending_ |
-| `+0x10` / `+0x50` survival counts | _pending_ |
+| Does the view switch to the chase pose? | **no** |
+| `+0x10` / `+0x50` survival counts | **0 / 0** of 11 620 writes. Both copies are rebuilt every frame from state the camera keeps elsewhere. Off board, the replay editor, Freecam and first person stayed vanilla |
+
+**S1b–S1e conclusion:** the game's camera can't be steered by overwriting its output. Runs 3 to 6
+wrote after the tick, inside the update, into the update's output, and into both view copies.
+None of it showed: the camera rebuilds its view every frame from internal state (director rig,
+trackers) that isn't mapped. Steering it would mean reverse-engineering that state or the
+render-view copy (0x3f8b2b0, which risks culling mismatch). Neither is a spike-sized job.
+
+Run 6 also showed a probe bug, not a game one: `firstperson 0` ran `debug_restore_camera`, which
+disarmed mode 2's probe while `s3cam_overlay` stayed set. A later `s3cam_probe 2` was then ignored
+until `s3cam_probe 0`. It's throwaway code, so this is noted, not fixed.
 
 **Fallback if S1e fails:** mode 1 is proven to show the pose (runs 1, 2, 5). What it lacks is
 hand-back before the replay editor and menus take the verified phase away. Phase 0 would then end
@@ -258,13 +268,45 @@ each end) and logs `air: … g=… rms=…`. The summary prints the median over 
 
 ---
 
-## Gate 0 report (filled in after the run)
+## Gate 0 report (2026-10-15, after six runs)
 
-- B1/B2 verdict: **own the pose, not the selection**: mode 2's hand-back behaviour is proven (run 3); whether its pose shows from inside the camera update is S1c (run 4)
-- Frozen `SubjectSnapshot` fields: _pending manual + gravity rerun_
-- Ray-cast cost: **~0.02 ms per 10 casts** (budget 0.3)
-- Measured gravity: **≈ 10.1 m/s²** (skater root, long arcs; tunable `air.gravity`)
-- Camera matrix convention: rows {right, up, backward, position}, right × up = **+backward**
-- Card changes: T3 should also read `skate-game/src/camera/trajectory.rs` and
-  `skate-core/src/camera/trajectory_query.rs` (gravity is a query input there). T8 should read
-  `skate-game/src/camera/collision.rs` and `world_query.rs`. None of these are named in the plan.
+**Ownership: B1 through mode 1, with early hand-back** (proposed; Aescher decides).
+
+- Mode 1 (FreeCamera, the path first person, Freecam, spectate and the Park Editor use) **shows
+  the pose, smoothly** (runs 1, 2, 5). HUD, trick names and scoring are intact.
+- Its one gap: the **replay editor froze** and **the right stick off board** did nothing (run 2).
+  T9 hands the camera back to the game (mode 0):
+  - **off board** (state 504): proven safe; the camera phase is verified while walking;
+  - **before the replay editor / menus**: the game flow leaves gameplay (`client_tick.cpp` checks
+    `state == 13 || state == 21`) and the debug tick goes unready. T9 has to hand back on that
+    transition, while the phase is still verified. **That's the one remaining unknown**, so T9
+    starts with a small spike: log the flow state and the phase on the frames around opening the
+    replay editor and the pause menu.
+  - Fallback if the phase is already gone by then: keep writing the last pose, so the view
+    doesn't freeze mid-motion, and hand back on the first verified frame after.
+- Mode 2 (steer the game's own camera without taking it) is ruled out for now (S1b–S1e above).
+- The game's camera keeps running under mode 1 (1516/1517, 9887/9999 ticks), R3 height included,
+  so its pose stays readable as a reference or blend target during hand-overs.
+
+**SubjectSnapshot (frozen for Phase 1):**
+
+| Field | Source |
+|---|---|
+| position, transform | entity transform (`debug_skater`); row 2 = forward, Y up |
+| velocity, spin | board body 0 +0x70 / +0x90 |
+| board position | board body 0 +0x50 (≈0.9 m below the root while riding) |
+| physics state | context +0x1414: 100 ride, 101 (brief, after air), 103 crouch, 200 pop, 201 air, 400–406 grind, 504 offboard/bail, 601, 701 post-grind |
+| stance (switch) | context +0x13c4 bit 5 (flips in state 100 as expected) |
+| ground normal | 3 down-rays from the root (0.02 ms per 10 rays) |
+| manual | **not a separate state**: not seen in three runs that included manuals. T7 must detect it some other way (board pitch from the board body's rotation, or a native flag). It's open, and until then manual falls back to the chase shot |
+| launch velocity / predicted air | board velocity at 200→201, with g below |
+
+- Ray-cast cost: **~0.02 ms per 10 casts** (budget 0.3).
+- Gravity: **≈ 10.1 m/s²** (skater root, long arcs; runs 3 and 6 medians 10.4–10.6 including
+  short ollies; tunable `air.gravity`).
+- Camera matrix: rows {right, up, backward, position}, right × up = **+backward**.
+- Card changes: T3 also reads `skate-game/src/camera/trajectory.rs` and
+  `skate-core/src/camera/trajectory_query.rs`. T8 also reads `skate-game/src/camera/collision.rs`
+  and `world_query.rs`. T7 adds the manual signal hunt. T9 opens with the hand-back spike above
+  and writes at the render-pose handoff, as first person does.
+- Phase 1 (T1–T6) is pure math and doesn't depend on any of the open items.
