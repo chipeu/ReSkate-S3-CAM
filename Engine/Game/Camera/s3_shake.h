@@ -117,8 +117,11 @@ struct ShakeSettings {
     ShakeCurve amplitude_curve{};  // speed fraction -> 0..1, scales [amplitude_min, amplitude_max]
     ShakeCurve frequency_curve{};  // speed fraction -> 0..1, scales [frequency_min, frequency_max]
     float one_shot_magnitude = 3.0f;      // TUNE: impulse at full landing speed (amplitude units)
-    float one_shot_min_velocity = 4.0f;   // TUNE: m/s, below this a landing gives no impulse
-    float one_shot_max_velocity = 12.0f;  // TUNE: m/s, at/above this the impulse is full
+    // TUNE: speed INTO the ground (-velocity . normal), m/s. Alpha 3 from the in-game log: ollies land at
+    // 3-4.5 m/s down, so 2.2 / 5.7 gives a flat ollie (3.5) ~12% of full, a 1 m drop (4.5) ~42%, a 3 m
+    // drop (7.8) full; a curb hop (under 2.2) none. The old 4 / 12 was for the Rust's angle-weighted speed.
+    float one_shot_min_velocity = 2.2f;   // TUNE: m/s, at or below this a landing gives no impulse
+    float one_shot_max_velocity = 5.7f;   // TUNE: m/s, at/above this the impulse is full
     float one_shot_frequency = 2.0f;      // TUNE: playback rate multiplier while an impulse is active
     float one_shot_decay = 0.03f;         // TUNE: impulse *= (1 - decay) per fixed update (not dt-scaled)
     float amplitude_min = 0.0f;           // TUNE: speed rumble at standstill
@@ -163,13 +166,20 @@ public:
     // Landing response (ShakeEffect::landing_impulse). `normal` is the ground normal, `velocity` the
     // pre-landing velocity. `magnitude_scale` is 1 normally, broken_bone_scale for a broken-bone
     // landing. Returns true when it raised the impulse; it never lowers it.
+    //
+    // Deviation from the Rust (Alpha 3, in-game log): the Rust weights the speed by how head-on the hit
+    // is, speed * (1 - angle / 90 degrees), where the angle is between the velocity and the surface
+    // normal. A skater lands with a large forward speed and a small downward one (an ollie at 6.6 m/s
+    // forward and 3.5 m/s down is 62 degrees off the normal), so that weighting keeps only about a third
+    // of the speed and every normal landing fell under one_shot_min_velocity: the impulse was always
+    // 0.000. It also made the same drop shake LESS the faster the skater rode. The weighted speed here is
+    // the speed INTO the surface, -velocity . normal (the same as the Rust for a head-on hit, 0 when
+    // sliding along the surface or moving away from it), so it depends on how hard the board hits, not on
+    // how fast it was travelling sideways. CameraMan::kick_dip mirrors this.
     bool landing_impulse(const Vec3& normal, const Vec3& velocity, const ShakeSettings& s, float magnitude_scale = 1.0f) {
         const float speed = length(velocity);
         if (!std::isfinite(speed) || speed < 1e-5f) return false;
-        const Vec3 direction = scale(velocity, 1 / speed);
-        const float cosine = std::max(-1.0f, std::min(1.0f, dot(scale(normal, -1.0f), direction)));
-        const float angle = std::acos(cosine) * (2 / pi); // 0 head-on .. 1 at 90 degrees
-        const float weighted = speed * (1.0f - clamp01(angle));
+        const float weighted = -dot(normalized(normal, {0.0f, 1.0f, 0.0f}), velocity);
         if (!(weighted > 0.0f)) return false;
         const float fraction =
             clamp01((weighted - s.one_shot_min_velocity) / (s.one_shot_max_velocity - s.one_shot_min_velocity));

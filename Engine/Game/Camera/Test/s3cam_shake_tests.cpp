@@ -73,35 +73,78 @@ void impulse_scaling() {
     expect(near(bone.impulse(), 20 * s.one_shot_magnitude), "broken-bone landing is x20");
 }
 
+// Alpha 3: the impulse is weighted by the speed INTO the surface (-velocity . normal), not by the Rust's
+// angle weighting speed * (1 - angle / 90 degrees), which discarded every normal landing (see
+// Shake::landing_impulse). The three cases below are the in-game log's: 6.6 m/s forward, g = 10.1.
 void grazing() {
     const ShakeSettings s;
-    const float v = 12.0f; // full impulse head on
+    const float v = s.one_shot_max_velocity * 1.1f; // just past full when head on, so 45 degrees is partial
     const float head = landing(v, s);
-    Shake a;
-    a.landing_impulse(up, {v * std::sin(45 * degrees), -v * std::cos(45 * degrees), 0}, s);
-    // 45 degrees keeps half the speed: v' = 6, fraction = (6-4)/8 = 0.25
-    expect(near(a.impulse(), 0.0625f * s.one_shot_magnitude, 1e-4f), "45 degrees off the normal halves the speed");
-    expect(a.impulse() < head, "grazing gives less than head on");
-    Shake b;
-    b.landing_impulse(up, {v * std::sin(80 * degrees), -v * std::cos(80 * degrees), 0}, s);
-    expect(b.impulse() < a.impulse(), "more grazing gives less");
+    expect(near(head, s.one_shot_magnitude), "head on just past the full speed is the full impulse");
+    // Slanted hits: only the part of the velocity along the normal counts (v cos(angle)).
+    const auto slanted = [&](float angle_degrees) {
+        Shake shake;
+        shake.landing_impulse(up, {v * std::sin(angle_degrees * degrees), -v * std::cos(angle_degrees * degrees), 0}, s);
+        return shake.impulse();
+    };
+    const float a45 = slanted(45), a80 = slanted(80), a10 = slanted(10);
+    const float f45 = clamp01((v * std::cos(45 * degrees) - s.one_shot_min_velocity) / (s.one_shot_max_velocity - s.one_shot_min_velocity));
+    expect(near(a45, f45 * f45 * s.one_shot_magnitude, 1e-4f), "45 degrees off the normal keeps v cos 45 of the speed");
+    expect(a45 < head, "grazing gives less than head on");
+    expect(a80 < a45, "more grazing gives less");
+    expect(a10 <= head && a10 >= a45, "10 degrees is no more than head on and no less than 45 degrees");
     Shake c;
     const bool raised = c.landing_impulse(up, {v, 0, 0}, s);
     expect(!raised && c.impulse() == 0.0f, "sliding along the surface (90 degrees) gives zero");
-    Shake d;
-    d.landing_impulse(up, {v * std::sin(10 * degrees), -v * std::cos(10 * degrees), 0}, s);
-    expect(d.impulse() < head && d.impulse() > a.impulse(), "10 degrees is slightly less than head on");
+    Shake away;
+    expect(!away.landing_impulse(up, {0, v, 0}, s) && away.impulse() == 0.0f, "moving away from the surface gives zero");
+    // A tilted ground normal: the same world velocity is more or less "into" it.
+    const Vec3 slope{std::sin(20 * degrees), std::cos(20 * degrees), 0.0f};
+    Shake tilted;
+    tilted.landing_impulse(slope, {0, -v, 0}, s);
+    Shake level;
+    level.landing_impulse(up, {0, -v * std::cos(20 * degrees), 0}, s);
+    expect(near(tilted.impulse(), level.impulse(), 1e-4f), "the weight is the speed along the (unit) ground normal");
+    Shake unscaled;
+    unscaled.landing_impulse({0.0f, 5.0f, 0.0f}, head_on(v), s);
+    expect(near(unscaled.impulse(), head, 1e-4f), "a non-unit normal is normalised");
+}
+
+// The three landings from the in-game log: a plain flat ollie (3.5 m/s down), a 1 m drop and a 3 m drop,
+// all at 6.6 m/s forward. The log showed impulse 0.000 for every one with the old weighting and defaults.
+void log_landings() {
+    const ShakeSettings s;
+    const float forward = 6.6f, gravity = 10.1f;
+    const auto land = [&](float down_speed) {
+        Shake shake;
+        shake.landing_impulse(up, {0.0f, -down_speed, forward}, s);
+        return shake.impulse() / s.one_shot_magnitude; // share of the full impulse
+    };
+    const float ollie = land(3.5f);
+    const float one_m = land(std::sqrt(2.0f * gravity * 1.0f));
+    const float three_m = land(std::sqrt(2.0f * gravity * 3.0f));
+    std::printf("  landing impulse, share of full: ollie %.3f, 1 m drop %.3f, 3 m drop %.3f\n", static_cast<double>(ollie),
+                static_cast<double>(one_m), static_cast<double>(three_m));
+    expect(ollie > 0.05f && ollie < 0.2f, "a flat ollie gives a light impulse (5-20% of full)");
+    expect(one_m >= 0.3f && one_m <= 0.5f, "a 1 m drop gives a clear but moderate impulse (30-50% of full)");
+    expect(three_m >= 0.95f, "a 3 m drop is near full");
+    expect(ollie < one_m && one_m < three_m, "and they rise with the drop");
+    expect(land(1.5f) == 0.0f, "a curb hop (1.5 m/s down) gives none");
 }
 
 void only_raises() {
     const ShakeSettings s;
+    const float range = s.one_shot_max_velocity - s.one_shot_min_velocity;
+    // Speeds as fractions of the range (the Rust defaults were 10 / 7 / 12 against 4..12; same fractions order).
+    const float strong = s.one_shot_min_velocity + 0.75f * range, weak = s.one_shot_min_velocity + 0.4f * range,
+                strongest = s.one_shot_max_velocity;
     Shake shake;
-    expect(shake.landing_impulse(up, head_on(10), s), "first landing raises");
+    expect(shake.landing_impulse(up, head_on(strong), s), "first landing raises");
     const float first = shake.impulse();
-    expect(!shake.landing_impulse(up, head_on(7), s), "a weaker landing reports no change");
+    expect(!shake.landing_impulse(up, head_on(weak), s), "a weaker landing reports no change");
     expect(shake.impulse() == first, "a weaker landing does not lower the impulse");
-    expect(!shake.landing_impulse(up, head_on(10), s), "an equal landing is not a raise");
-    expect(shake.landing_impulse(up, head_on(12), s), "a stronger landing raises");
+    expect(!shake.landing_impulse(up, head_on(strong), s), "an equal landing is not a raise");
+    expect(shake.landing_impulse(up, head_on(strongest), s), "a stronger landing raises");
     expect(shake.impulse() > first, "and the value goes up");
 }
 
@@ -260,6 +303,7 @@ int main() {
     settings_validity();
     impulse_scaling();
     grazing();
+    log_landings();
     only_raises();
     decay();
     frequency_and_curves();
