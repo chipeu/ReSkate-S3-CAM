@@ -211,3 +211,8 @@ with file:line and a concrete failure scenario. Do not edit code.
   scripted session gives the same shot sequence at 30/60/144 fps, max step 0.34 m. Next: Gate 1 review.
 - 2026-10-15: Gate 1 passed with fixes (independent review); fixes 1–7 in, 11 suites green. Standing
   heights Low 0.589 / High 1.870 m. Next: Phase 2 (T7 subject, T8 collision, T9 ownership, T10, T11).
+- 2026-10-15: Phase 2 opened with the S3Cam alpha (T7 skater reader + T9 ownership, written by
+  Opus): `s3cam 1` drives the view with CameraMan through mode 1, hands back on foot and the first
+  tick without control, logs the flow states (hand-back spike), landings and per-second costs.
+  Alloc-free rays with the start-hit skip. Syntax-checked only. Next: Aescher's alpha run
+  (docs/s3cam/PHASE2.md), then T8 collision, T10/T11 settings and page.

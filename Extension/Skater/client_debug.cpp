@@ -9,12 +9,14 @@
 #include "free_flight.h"
 #include "Engine/Game/Skater/first_person_cycle.h"
 #include "Engine/Game/Skater/velocity_boost.h"
+#include "Extension/Camera/s3cam.h"
 #include "Extension/Camera/s3cam_probe.h"
 #include "Extension/Multiplayer/Remote/native_skater.h"
 #include "Extension/Objects/ParkEditor/park_editor_runtime.h"
 #include "Extension/Profile/local_profile_runtime.h"
 #include <atomic>
 #include <cmath>
+#include <format>
 #include <optional>
 #include <utility>
 
@@ -116,6 +118,7 @@ void debug_restore_camera(SourceTrial& trial, std::uintptr_t client, bool phase,
     if (!debug.camera_owned) {
         debug.first_person = false; debug.first_person_saved_fov = 0;
         s3cam_probe_disarm("camera no longer owned"); debug.s3cam_probe = false;
+        s3cam_end("camera no longer owned"); debug.s3cam_view = false;
         return;
     }
     source_require(phase, "Waiting for the native camera update phase.");
@@ -128,6 +131,7 @@ void debug_restore_camera(SourceTrial& trial, std::uintptr_t client, bool phase,
             first_person_disarm();
             if (debug.first_person) first_person_restore_fov(debug);
             s3cam_probe_disarm("camera restored");
+            s3cam_end("camera handed back");
             free_camera_restore_fov(debug);
             debug.camera_ambiguous = true; // Cleared only after a native return; no retry on an exception.
             SetLastError(error);
@@ -144,7 +148,46 @@ void debug_restore_camera(SourceTrial& trial, std::uintptr_t client, bool phase,
         debug.first_person = false;
         s3cam_probe_disarm("camera restored");
         debug.s3cam_probe = false;
+        s3cam_end("camera handed back");
+        debug.s3cam_view = false;
     }
+}
+// Selects the FreeCamera (mode 1) at the current view. Freecam, first person and S3Cam all own
+// the view through it.
+void debug_take_camera(SourceTrial& trial, std::uintptr_t client, DWORD error) {
+    auto& debug = trial.debug;
+    auto camera = source_camera_snapshot(trial, client);
+    source_require(camera.mode == 0 && camera.view_enabled && !camera.input_active,
+        "An active local view with no other camera override is required.");
+    const auto pose = debug_view_matrix(trial, camera);
+    debug.camera_identity = camera.identity;
+    debug.camera_owned = true; debug.camera_ambiguous = true;
+    SetLastError(error);
+    trial.camera_mode(camera.identity.controller, 1);
+    debug.camera_ambiguous = false;
+    camera = source_camera_snapshot(trial, client);
+    source_require(camera.identity == debug.camera_identity && camera.mode == 1 &&
+        camera.active == camera.identity.camera && camera.input_active,
+        "Freecam activation could not be verified; disable Freecam to restore the view.");
+    SetLastError(error);
+    trial.camera_transform(camera.identity.camera, &pose);
+    debug.flight_matrix = pose;
+    debug.flight_time = source_flight_now();
+    debug.flight_ready = true;
+}
+// S3Cam takes the view: against the game's own camera first (Native+ keeps reading it), then
+// through the FreeCamera like first person.
+void s3cam_take(SourceTrial& trial, std::uintptr_t client, DWORD error) {
+    auto& debug = trial.debug;
+    const auto camera = source_camera_snapshot(trial, client);
+    source_require(camera.mode == 0 && camera.view_enabled && !camera.input_active, "S3Cam is waiting for the game's own camera.");
+    s3cam_begin(trial, camera.active, debug_view_matrix(trial, camera));
+    try { debug_take_camera(trial, client, error); }
+    catch (...) { s3cam_end("could not take the camera"); throw; }
+    debug.s3cam_view = true;
+    float fov{};
+    if (first_person_read(debug.camera_identity.camera + camera_fov_offset, &fov, 4))
+        s3cam_note(std::format("took the view; FreeCamera FOV {:.1f}", fov).c_str());
 }
 // `taken` receives the camera snapshot this step read, for the tick's model to reuse:
 // nothing after it here changes the camera's identity or mode (only its pose and FOV).
@@ -177,6 +220,7 @@ void debug_flight_tick(SourceTrial& trial, std::uintptr_t client, bool ready, bo
     source_require(camera.identity == debug.camera_identity && camera.mode == 1 && camera.active == camera.identity.camera,
         debug.first_person ? "First person lost the camera; view paused." : "Freecam ownership changed; movement paused.");
     auto next = debug.flight_matrix;
+    float s3cam_fov = 0;
     if (debug.first_person) {
         // Respawns, loads and bails can briefly leave no readable head. Hold the
         // last pose instead of dropping the view, and say why once.
@@ -227,6 +271,10 @@ void debug_flight_tick(SourceTrial& trial, std::uintptr_t client, bool ready, bo
                 ? "First person on. True first person keeps the view level and steady."
                 : "First person on. The camera follows the skater's head.";
         }
+    } else if (debug.s3cam_view) {
+        // A frame without a readable skater (respawn, load) holds the last pose.
+        try { next = s3cam_pose(trial, debug.flight_matrix, s3cam_fov); }
+        catch (const SourceGuard& guard) { debug.status = guard.message; }
     } else if (debug.s3cam_probe) {
         // Respawns, loads and bails can briefly leave the skater unreadable: hold the last pose.
         try { next = s3cam_probe_pose(trial, client, debug.flight_matrix); }
@@ -244,7 +292,18 @@ void debug_flight_tick(SourceTrial& trial, std::uintptr_t client, bool ready, bo
     // Written every tick: the camera may refresh its FOV from its own settings.
     if (debug.first_person && debug.first_person_fov > 0)
         (void)first_person_write_fov(camera.identity.camera, debug.first_person_fov);
-    else if (!debug.first_person && debug.free_camera_fov > 0) {
+    else if (debug.s3cam_view) {
+        // The shot's FOV when asked for (s3cam_shotfov, s3cam_fov); otherwise the camera's own,
+        // put back if an earlier choice changed it.
+        if (s3cam_fov > 0) {
+            if (!debug.free_camera_saved_fov) {
+                float current{};
+                debug.free_camera_saved_fov = first_person_read(camera.identity.camera + camera_fov_offset, &current, 4) &&
+                    std::isfinite(current) && current > 1.0f && current < 175.0f ? current : 0.0f;
+            }
+            (void)first_person_write_fov(camera.identity.camera, s3cam_fov);
+        } else if (debug.free_camera_saved_fov > 0) free_camera_restore_fov(debug);
+    } else if (!debug.first_person && debug.free_camera_fov > 0) {
         if (!debug.free_camera_saved_fov) {
             float current{};
             debug.free_camera_saved_fov = first_person_read(camera.identity.camera + camera_fov_offset, &current, 4) &&
@@ -674,7 +733,31 @@ void debug_action(SourceTrial& trial, std::uintptr_t client, bool can_control, b
         debug.status = s3cam_ray_report(trial, client);
         return;
     }
+    if (request.action == overlay::DebugAction::set_s3cam) {
+        if (!request.enabled) {
+            if (!debug.s3cam) return;
+            debug.s3cam = false;
+            if (debug.s3cam_view) debug_restore_camera(trial, client, phase, error); // Also ends S3Cam's run.
+            s3cam_note("off");
+            debug.status = "S3Cam off. The game's camera is back.";
+            return;
+        }
+        if (debug.s3cam) return;
+        source_require(!debug.s3cam_probe && !debug.s3cam_overlay, "Turn off the S3Cam probe (s3cam_probe 0) first.");
+        source_require(!debug.noclip && !debug.park_editor, "Turn off noclip and the Park Editor before S3Cam.");
+        // S3Cam replaces Freecam and first person: hand their camera back; the S3Cam tick takes it
+        // again once the skater is on the board.
+        debug.first_person_paused = false;
+        if (debug.camera_owned) debug_restore_camera(trial, client, phase, error);
+        debug.s3cam = true;
+        debug.s3cam_retry_after = 0;
+        s3cam_note("on");
+        debug.status = "S3Cam on: the Skate 3 camera while you ride. Off the board, in menus and in the replay editor "
+            "the game's camera comes back.";
+        return;
+    }
     if (request.action == overlay::DebugAction::set_s3cam_probe) {
+        source_require(!debug.s3cam || !request.enabled, "Turn off S3Cam (s3cam 0) before the probe.");
         if (!request.enabled && debug.s3cam_overlay) {
             s3cam_probe_disarm("turned off");
             debug.s3cam_overlay = false;
@@ -724,6 +807,13 @@ void debug_action(SourceTrial& trial, std::uintptr_t client, bool can_control, b
         }
         if (debug.first_person) return;
         source_require(!debug.s3cam_probe, "Turn off the S3Cam probe (s3cam_probe 0) first.");
+        if (debug.s3cam) {
+            // First person takes over S3Cam's owned camera as it is; S3Cam stays off until asked again.
+            s3cam_end("switched to first person");
+            debug.s3cam_view = false;
+            debug.s3cam = false;
+            s3cam_note("off: first person chosen");
+        }
         // Resolve the head against the live camera matrix before taking the
         // camera, so an unavailable skeleton never leaves an orphaned mode 1.
         auto pose = debug_view_matrix(trial, camera);
@@ -791,25 +881,20 @@ void debug_action(SourceTrial& trial, std::uintptr_t client, bool can_control, b
                 debug.s3cam_probe = false;
                 debug.status = "Freecam enabled from the S3Cam probe view.";
             }
+            if (debug.s3cam_view) {
+                // Keep the owned camera and fly on from S3Cam's pose; S3Cam stays off until asked again.
+                s3cam_end("switched to Freecam");
+                debug.s3cam_view = false;
+                debug.s3cam = false;
+                debug.status = "Freecam enabled from the S3Cam view. S3Cam is off.";
+            }
             return;
         }
-        source_require(camera.mode == 0 && camera.view_enabled && !camera.input_active,
-            "An active local view with no other camera override is required.");
-        const auto pose = debug_view_matrix(trial, camera);
-        debug.camera_identity = camera.identity;
-        debug.camera_owned = true; debug.camera_ambiguous = true;
-        SetLastError(error);
-        trial.camera_mode(camera.identity.controller, 1);
-        debug.camera_ambiguous = false;
-        camera = source_camera_snapshot(trial, client);
-        source_require(camera.identity == debug.camera_identity && camera.mode == 1 &&
-            camera.active == camera.identity.camera && camera.input_active,
-            "Freecam activation could not be verified; disable Freecam to restore the view.");
-        SetLastError(error);
-        trial.camera_transform(camera.identity.camera, &pose);
-        debug.flight_matrix = pose;
-        debug.flight_time = source_flight_now();
-        debug.flight_ready = true;
+        if (debug.s3cam) {
+            debug.s3cam = false;
+            s3cam_note("off: Freecam chosen");
+        }
+        debug_take_camera(trial, client, error);
         debug.status = "Freecam enabled. WASD / Q E move; hold RMB to look; Shift boosts.";
         return;
     }
@@ -849,6 +934,54 @@ void first_person_board_tick(SourceTrial& trial, std::uintptr_t client, bool can
         debug.first_person_retry_after = now + 500;
     } catch (...) {
         debug.first_person_retry_after = now + 500;
+    }
+}
+// S3Cam (Extension/Camera/s3cam.h) owns the view while the skater rides or bails (the Wipeout
+// shot) and hands the game its camera back on foot, in menus, in the replay editor and while
+// loading. Taking mode 1 freezes the replay editor and hides the right stick on foot (SPIKES.md,
+// runs 1-2), so the hand-back comes first: the moment the tick loses control, as long as the
+// camera phase still allows the switch. The flow log records what each screen looks like here.
+void s3cam_tick(SourceTrial& trial, std::uintptr_t client, bool can_control, bool phase, DWORD error) {
+    auto& debug = trial.debug;
+    if (!debug.s3cam) return;
+    if (debug.s3cam_view && !debug.camera_owned) {
+        debug.s3cam_view = false;
+        s3cam_end("camera no longer owned");
+    }
+    {
+        std::optional<SourceCameraSnapshot> camera;
+        try { camera = source_camera_snapshot(trial, client); } catch (...) {}
+        s3cam_note_flow(client, can_control, phase, camera ? &*camera : nullptr, debug.s3cam_view);
+    }
+    const auto now = GetTickCount64();
+    // This tick's reading of the skater: the flight tick's pose uses it too.
+    const auto seen = can_control ? s3cam_observe(trial, client) : S3CamObservation{};
+    if (now < debug.s3cam_retry_after) return;
+    try {
+        if (debug.s3cam_view) {
+            if (!can_control) {
+                if (!phase) return; // Held at the last pose; tried again every tick.
+                debug_restore_camera(trial, client, phase, error);
+                s3cam_note("handed back: no local control (menu, replay editor or loading)");
+                return;
+            }
+            if (seen.valid && !seen.wants_view && seen.wants_for >= 0.25 && phase) {
+                debug_restore_camera(trial, client, phase, error);
+                s3cam_note("handed back: on foot");
+            }
+            return;
+        }
+        if (!can_control || !phase || debug.camera_owned || debug.camera_ambiguous || debug.noclip || debug.park_editor ||
+            debug.editor_transition)
+            return;
+        if (!seen.valid || !seen.wants_view || seen.wants_for < 0.15) return;
+        s3cam_take(trial, client, error);
+    } catch (const SourceGuard& guard) {
+        debug.status = guard.message;
+        s3cam_note(guard.message);
+        debug.s3cam_retry_after = now + 500;
+    } catch (...) {
+        debug.s3cam_retry_after = now + 500;
     }
 }
 // "First person in the camera cycle" (Engine/Game/Skater/first_person_cycle.h). The game writes
@@ -960,10 +1093,12 @@ overlay::DebugModel on_client_debug_tick(std::uintptr_t base, std::uintptr_t cli
     }
     first_person_board_tick(trial, client, can_control, camera_phase_observed, error.value);
     first_person_cycle_tick(trial, client, can_control, camera_phase_observed, error.value);
+    s3cam_tick(trial, client, can_control, camera_phase_observed, error.value);
     // Camera ownership survives a busy tick or a failed presentation snapshot.
     // Input capture must follow the lease, not those transient model failures.
-    state.free_camera_active.store(debug.camera_owned && !debug.first_person && !debug.s3cam_probe, std::memory_order_release);
-    model.free_camera = debug.camera_owned && !debug.first_person && !debug.s3cam_probe;
+    const bool other_view = debug.first_person || debug.s3cam_probe || debug.s3cam_view;
+    state.free_camera_active.store(debug.camera_owned && !other_view, std::memory_order_release);
+    model.free_camera = debug.camera_owned && !other_view;
     std::optional<SourceCameraSnapshot> flight_camera;
     try { debug_flight_tick(trial, client, can_control, camera_phase_observed, flight_input, error.value, flight_camera); }
     catch (const SourceGuard& guard) { debug_stop_noclip(debug); debug.status = guard.message; }
@@ -976,6 +1111,8 @@ overlay::DebugModel on_client_debug_tick(std::uintptr_t base, std::uintptr_t cli
         catch (...) { debug.status = "S3Cam probe mode 2 skipped a frame after a native error."; }
     }
     model.s3cam_probe = debug.s3cam_overlay;
+    model.s3cam = debug.s3cam;
+    model.s3cam_view = debug.s3cam_view;
     model.available = can_control || debug_has_lease(debug);
     model.park_editor = debug.park_editor;
     model.settings_owned = debug_has_lease(debug);
@@ -989,7 +1126,7 @@ overlay::DebugModel on_client_debug_tick(std::uintptr_t base, std::uintptr_t cli
     try {
         const auto camera = flight_camera ? *flight_camera : source_camera_snapshot(trial, client);
         const bool owned_view = camera.mode == 1 && camera.active == camera.identity.camera;
-        model.free_camera = owned_view && !debug.first_person && !debug.s3cam_probe;
+        model.free_camera = owned_view && !other_view;
         model.s3cam_probe = (owned_view && debug.s3cam_probe) || debug.s3cam_overlay;
         // Handed back on foot still reads as on, so the toggle can switch it off.
         model.first_person = (owned_view && debug.first_person) || debug.first_person_paused;

@@ -1,4 +1,5 @@
 #include "Extension/Console/commands.h"
+#include "Extension/Camera/s3cam.h"
 #include "Extension/Profile/local_profile_runtime.h"
 #include "ai_skaters.h"
 #include <format>
@@ -117,6 +118,97 @@ void register_movement_commands(Commands &registry) {
         out("Casting; the result is in the debug status and the log (s3cam_ray).");
     };
     registry.add(std::move(ray));
+    // S3Cam (Extension/Camera/s3cam.h): the Skate 3 camera while riding.
+    namespace cam = client_source::detail;
+    auto s3cam_entry = variable("s3cam", "Skate 3 camera while riding (the game's camera comes back on foot and in menus)",
+        Group::movement, argument("0|1", Type::boolean));
+    s3cam_entry.inspect = [](const Model &m) {
+        auto result = boolean_state(m.debug.camera_available || m.debug.s3cam, m.debug.s3cam, m.debug.camera_unavailable);
+        if (m.debug.s3cam) result.detail = m.debug.s3cam_view ? "Driving the view" : "Handed back (on foot, menu or loading)";
+        return result;
+    };
+    s3cam_entry.run = [](const Model &, const Values &args, const Output &) { request_debug(Debug::set_s3cam, std::get<bool>(args[0])); };
+    s3cam_entry.reset = [](const Model &, const Output &) { request_debug(Debug::set_s3cam, false); };
+    registry.add(std::move(s3cam_entry));
+    // Settings apply on the camera's next frame; S3Cam does not need to be on to change them.
+    const auto setting = [&registry](const char *name, const char *description, Argument arg,
+                                     std::function<std::string()> current,
+                                     std::function<bool(const Values &, std::string &)> apply) {
+        auto entry = variable(name, description, Group::movement, std::move(arg));
+        entry.inspect = [current](const Model &) { return State{true, current(), {}, {}, false}; };
+        entry.run = [apply](const Model &, const Values &args, const Output &out) {
+            std::string message;
+            if (!apply(args, message)) out("error: " + message);
+            else if (!message.empty()) out(message);
+        };
+        registry.add(std::move(entry));
+    };
+    const auto update_settings = [](auto change, std::string &message) {
+        auto camera = cam::s3cam_settings();
+        change(camera);
+        if (cam::s3cam_set_settings(camera)) return true;
+        message = "out of range; nothing changed.";
+        return false;
+    };
+    auto preset_argument = argument("full|native");
+    preset_argument.choices = {"full", "native"};
+    setting("s3cam_preset", "S3Cam style: full Skate 3 camera, or the game's camera plus S3 air hold, landing dip and shake",
+        preset_argument,
+        [] { return std::string(cam::s3cam_settings().preset == s3cam::CameraPreset::NativePlus ? "native" : "full"); },
+        [update_settings](const Values &args, std::string &message) {
+            const bool native = std::get<std::string>(args[0]) == "native";
+            return update_settings([&](s3cam::CameraSettings &s) {
+                s.preset = native ? s3cam::CameraPreset::NativePlus : s3cam::CameraPreset::FullS3;
+            }, message);
+        });
+    auto angle_argument = argument("low|high");
+    angle_argument.choices = {"low", "high"};
+    setting("s3cam_angle", "S3Cam shot set: Skate 3's Low or High camera", angle_argument,
+        [] { return std::string(cam::s3cam_settings().angle == s3cam::CameraAngle::High ? "high" : "low"); },
+        [update_settings](const Values &args, std::string &message) {
+            const bool high = std::get<std::string>(args[0]) == "high";
+            return update_settings([&](s3cam::CameraSettings &s) { s.angle = high ? s3cam::CameraAngle::High : s3cam::CameraAngle::Low; },
+                message);
+        });
+    setting("s3cam_shake", "S3Cam landing and speed shake", argument("0|1", Type::boolean),
+        [] { return std::string(cam::s3cam_settings().shake_enabled ? "1" : "0"); },
+        [update_settings](const Values &args, std::string &message) {
+            const bool on = std::get<bool>(args[0]);
+            return update_settings([&](s3cam::CameraSettings &s) { s.shake_enabled = on; }, message);
+        });
+    auto s3cam_fov_argument = argument("degrees", Type::number);
+    s3cam_fov_argument.minimum = 0;
+    s3cam_fov_argument.maximum = 120;
+    setting("s3cam_fov", "S3Cam field of view in vertical degrees (30-120; 0 = the camera's own or the shot's)",
+        s3cam_fov_argument, [] { return value_text(static_cast<double>(cam::s3cam_settings().fov_override_deg)); },
+        [update_settings](const Values &args, std::string &message) {
+            const auto degrees = static_cast<float>(std::get<double>(args[0]));
+            if (degrees != 0 && degrees < 30) {
+                message = "Use 0 or 30-120.";
+                return false;
+            }
+            return update_settings([&](s3cam::CameraSettings &s) { s.fov_override_deg = degrees; }, message);
+        });
+    setting("s3cam_shotfov", "S3Cam writes each shot's field of view (0 keeps the camera's own)", argument("0|1", Type::boolean),
+        [] { return std::string(cam::s3cam_options().shot_fov ? "1" : "0"); },
+        [](const Values &args, std::string &) {
+            auto options = cam::s3cam_options();
+            options.shot_fov = std::get<bool>(args[0]);
+            cam::s3cam_set_options(options);
+            return true;
+        });
+    setting("s3cam_log", "S3Cam logs state and shot changes and every landing (ReSkate.log)", argument("0|1", Type::boolean),
+        [] { return std::string(cam::s3cam_options().verbose ? "1" : "0"); },
+        [](const Values &args, std::string &) {
+            auto options = cam::s3cam_options();
+            options.verbose = std::get<bool>(args[0]);
+            cam::s3cam_set_options(options);
+            return true;
+        });
+    auto dump = action("s3cam_dump", "Show S3Cam's settings and what the camera is doing now", Group::movement);
+    dump.inspect = [](const Model &) { return State{true, {}, {}, {}, false}; };
+    dump.run = [](const Model &, const Values &, const Output &out) { out(cam::s3cam_dump()); };
+    registry.add(std::move(dump));
     auto boost_speed_argument = argument("speed", Type::number);
     boost_speed_argument.minimum = 1;
     boost_speed_argument.maximum = 300;

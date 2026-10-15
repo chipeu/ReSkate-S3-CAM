@@ -111,6 +111,10 @@ struct InteractiveDebug {
     bool s3cam_probe{};
     // Probe mode 2 (S1b): writes the game's own camera instead; owns nothing.
     bool s3cam_overlay{};
+    // S3Cam (Extension/Camera/s3cam.h): `s3cam` is the player's choice; `s3cam_view` while it
+    // drives Freecam's owned mode-1 camera. Handed back on foot and in menus, taken again on board.
+    bool s3cam{}, s3cam_view{};
+    ULONGLONG s3cam_retry_after{};
     ULONGLONG first_person_foot_since{}, first_person_retry_after{};
     // "First person in the camera cycle": after first person could not start, the camera height
     // button switches height as the game does until this time.
