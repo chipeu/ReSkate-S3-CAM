@@ -12,7 +12,15 @@ set -e
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 WORK=${TMPDIR:-/tmp}/reskate-syntax-check
 rm -rf "$WORK" && mkdir -p "$WORK/mirror" "$WORK/shim"
-printf '#pragma once\n#include <windows.h>\n' > "$WORK/shim/Windows.h"
+# Windows headers are case-insensitive; MinGW's are lowercase. Shim every mixed-case <Name.h>
+# the sources include that MinGW has in lowercase.
+MINGW_INC=$(echo | x86_64-w64-mingw32-g++ -xc++ -E -v - 2>&1 | sed -n 's/^ \(\/.*mingw32\/include\)$/\1/p' | head -1)
+grep -rhoE '#include <[A-Za-z0-9_]*[A-Z][A-Za-z0-9_]*\.h>' "$(dirname "$0")/../../Engine" "$(dirname "$0")/../../Extension" \
+    "$(dirname "$0")/../../Runtime" 2>/dev/null | sed -E 's/#include <(.*)>/\1/' | sort -u | while read -r h; do
+    lower=$(echo "$h" | tr 'A-Z' 'a-z')
+    [ -f "$MINGW_INC/$lower" ] && printf '#pragma once\n#include <%s>\n' "$lower" > "$WORK/shim/$h"
+    true
+done
 cd "$ROOT"
 git ls-files -co --exclude-standard Engine Extension Runtime External | tar -cf - -T - | tar -xf - -C "$WORK/mirror"
 grep -rlE '__try|__except' "$WORK/mirror/Engine" "$WORK/mirror/Extension" "$WORK/mirror/Runtime" |
