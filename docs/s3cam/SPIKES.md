@@ -1,7 +1,8 @@
 # S3Cam Phase 0: spike findings
 
-Status: **first in-game run done (2026-10-15, log `ReSkate.log` 19:55–20:01).** S1 and S3 answered;
-S4 needs a rerun (see the 10 Hz bug under S1). Code reading is done (below). Every
+Status: **two in-game runs done (2026-10-15).** Run 1 (19:55): S1 and S3 answered. Run 2 (20:08,
+after the 10 Hz fix): smooth, but it exposed the replay/right-stick problem behind spike **S1b**
+(below), and gravity needs one more run. Next: run 3 = `s3cam_probe 2`. Code reading is done (below). Every
 cell marked _pending_ needs a log line from Aescher's PC. Gate 0 is decided from this file.
 
 How the work is split: a Linux cloud session writes code and checks it (pure-math tests with g++ and
@@ -83,7 +84,47 @@ about 10 ticks a second against 60 Hz physics (`dt_phys=0.0167`). Fixed by addin
 `debug_model.s3cam_probe` to that condition. This is not an ownership problem: the replay, which
 doesn't use the probe, looked smooth.
 
-**Verdict (proposed for Gate 0): B1, with B2 available.** Taking mode 1 broke nothing
+**Run 2 (every-frame tick):** Aescher: "Character is now smooth, camera probe also smooth." The native
+camera updated on 9887/9999 ticks. Two problems, both caused by **taking mode 1**:
+
+- **The right stick does nothing off board.** Mode 1 shows the FreeCamera, so the game camera's stick
+  orbit is not what the player sees.
+- **The replay editor froze (no movement, no tracking).** In the log, from 20:11:09 to 20:11:27,
+  "Freecam and Noclip unavailable: Waiting for a verified local camera update". The tick is not
+  ready, so the probe stops writing, but mode 1 stays selected and holds the last pose. Handing
+  back needs that same verified phase, so it cannot happen there either. First person takes mode 1
+  the same way and most likely has the same problem upstream.
+
+### S1b. Own the pose, not the selection (`s3cam_probe 2`)
+
+Run 1 showed the game's camera keeps updating under mode 1. So instead of switching to the
+FreeCamera, mode 2 leaves mode 0 selected and **overwrites the game camera's view rows (+0x50)
+after its update**, in the same place in the tick where Freecam writes. It writes nothing when the
+tick is not ready (menus, replay editor, loading), when another camera is showing (Freecam, first
+person, spectate, Park Editor) or when the skater is off board (504). In each of those cases the
+game's camera, right stick included, is simply what you see.
+
+The log line `s3cam_probe overlay: N writes, H found unchanged next tick, …` every 5 s says how
+it goes. If the view follows the probe's chase pose, the write sticks. H ≈ N would mean the game
+does not recompute its camera every frame (it keeps our pose as state). If the view stays the
+game's own, the renderer copies the camera before our tick, and the write must move to the
+render-pose handoff, as first person does.
+
+| Run 3 question | Answer |
+|---|---|
+| Does the view follow the probe pose, smoothly? | _pending_ |
+| Off board: is the game's camera back, right stick working? | _pending_ |
+| Replay editor while mode 2 is on: normal? | _pending_ |
+| Freecam / first person on and off while mode 2 is on: clean? | _pending_ |
+| `writes` vs `found unchanged next tick` | _pending_ |
+
+**Verdict (proposed for Gate 0, revised after run 2): own the pose, not the selection.** If S1b
+works, S3Cam writes the game's camera (B1's full control of the pose, without B1's mode switch),
+and the replay editor, menus, Freecam, first person and off-board play stay native with nothing to
+hand back. If it does not, B1 through mode 1 needs a replay/menu signal to hand back *before* the
+phase is lost. That signal is not known yet.
+
+~~Verdict after run 1: B1, with B2 available.~~ Taking mode 1 broke nothing
 (HUD, scoring and replay were intact, and hand-back was clean). The game's own camera keeps running
 underneath, including R3 height changes, so its matrix is a live fallback: S3Cam can own every
 onboard state (B1) and can still read or blend the native pose for states it does not handle yet,
@@ -151,7 +192,7 @@ each end) and logs `air: … g=… rms=…`. The summary prints the median over 
 
 | Measurement | Value |
 |---|---|
-| g (median of N arcs) | _pending: run 1 sampled at 10 Hz (the bug above), so every arc had 2–13 samples and none could be fitted. Rerun_ |
+| g (median of N arcs) | _pending_. Run 1 sampled at 10 Hz: nothing fittable. Run 2: 31 fits, **1.8 to 28 m/s² (median 17.2), rms 1–7 cm**, which is not ballistic. Ollie-sized arcs (0.33–0.45 s) fit 15–28. The long drops (0.77–1.03 s, 1.9–3.4 m down) fit **10.3, 11.7, 12.9**. Cause: the arc started at state 200, while the pop is still pushing the board, and the board root is flipped and caught during tricks. Run 3 records only state 201 and fits the skater root too (`air root:` lines). The data-defined `GravityAcceleration` 9.81 (trainer_classes.inc) sits with the on-foot values and may not be the board's air gravity |
 | rms of a typical arc | _pending_ |
 | physics dt (`dt_phys` in the log) | **0.0167 s (60 Hz)** |
 | board root vs skater root height (`board_h` − `root.y`) | **≈ −0.9 m** riding |
@@ -160,10 +201,10 @@ each end) and logs `air: … g=… rms=…`. The summary prints the median over 
 
 ## Gate 0 report (filled in after the run)
 
-- B1/B2 verdict: **B1 with a live native fallback** (proposed; recheck smoothness after the fix)
+- B1/B2 verdict: **own the pose, not the selection** (S1b, `s3cam_probe 2`), pending run 3
 - Frozen `SubjectSnapshot` fields: _pending manual + gravity rerun_
 - Ray-cast cost: **~0.02 ms per 10 casts** (budget 0.3)
-- Measured gravity: _pending rerun_
+- Measured gravity: _pending run 3 (201-only, root fit)_
 - Camera matrix convention: rows {right, up, backward, position}, right × up = **+backward**
 - Card changes: T3 should also read `skate-game/src/camera/trajectory.rs` and
   `skate-core/src/camera/trajectory_query.rs` (gravity is a query input there). T8 should read
