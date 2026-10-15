@@ -93,6 +93,109 @@ struct PipelineSettings {
     }
 };
 
+// ---- Player layers (Aescher's alpha feedback, docs/s3cam/PHASE2.md "Alpha 2"). FullS3 only unless
+// a field says otherwise. Not Skate 3 tunables: S3Cam's own, every default is TUNE.
+
+// Pitch prediction: where the camera looks, on top of the shot's framing.
+struct LookSettings {
+    bool landing_look = true;          // in the air, look down toward a landing below the takeoff (stairs, gaps to a lower level)
+    float landing_look_strength = 0.6f; // 0..1: share of the way the look target moves toward the predicted landing point
+    float landing_look_full_drop = 2.5f; // m the landing is below the takeoff for the full strength (scales linearly from 0)
+    bool slope_look = true;            // on the ground, pitch with the slope: down when riding downhill, up uphill
+    float slope_look_strength = 0.5f;  // 0..1: share of the incline angle added to the pitch
+    float vertical_follow = 1.0f;      // 0..1: how much the pitch follows the skater's height (0: the pitch stays level with the anchor)
+    float response_time = 0.25f;       // s: the look offsets ease in and out with this time constant
+
+    bool valid() const noexcept {
+        const auto ok = [](float v, float lo, float hi) { return std::isfinite(v) && v >= lo && v <= hi; };
+        return ok(landing_look_strength, 0.0f, 1.0f) && ok(landing_look_full_drop, 0.1f, 50.0f) &&
+               ok(slope_look_strength, 0.0f, 1.0f) && ok(vertical_follow, 0.0f, 1.0f) && ok(response_time, 0.0f, 5.0f);
+    }
+};
+
+enum class ShoulderSide { Off, Manual, Auto }; // Off: centred. Manual: `side`, swapped by the player (L3). Auto: the stance's toe side
+// Over-the-shoulder offset: the camera slides sideways along its own right axis, so the skater sits
+// left or right of the screen centre. Applies in both presets.
+struct ShoulderSettings {
+    ShoulderSide mode = ShoulderSide::Off;
+    float offset = 0.45f;   // m sideways when on a side
+    int side = 1;           // Manual: +1 the camera sits to the skater's right (skater left of centre), -1 left
+    bool goofy = false;     // Auto: the player's stance; regular rides with the toes to the right. Riding switch flips it
+    float switch_time = 0.45f; // s for the camera to slide across to the other side (sine ease)
+
+    bool valid() const noexcept {
+        return std::isfinite(offset) && offset >= 0.0f && offset <= 3.0f && (side == 1 || side == -1) &&
+               std::isfinite(switch_time) && switch_time >= 0.0f && switch_time <= 5.0f;
+    }
+};
+
+// How tightly the camera follows: the anchor lag and the heading / elevation / pan / tilt smoothing.
+struct FollowSettings {
+    float strength = 1.0f;       // 1 = Skate 3. Above 1 follows tighter (less lag), below 1 looser
+    bool dynamic = true;         // follow tighter as speed rises
+    float dynamic_speed = 12.0f; // m/s where the dynamic boost is full
+    float dynamic_boost = 0.5f;  // added to strength at that speed
+
+    bool valid() const noexcept {
+        const auto ok = [](float v, float lo, float hi) { return std::isfinite(v) && v >= lo && v <= hi; };
+        return ok(strength, 0.2f, 4.0f) && ok(dynamic_speed, 0.5f, 60.0f) && ok(dynamic_boost, 0.0f, 3.0f);
+    }
+};
+
+// Field of view on top of the base FOV (the game camera's own, or fov_override_deg). Every term eases
+// with smoothing_time, so nothing snaps.
+struct FovSettings {
+    bool shot_fov = true;          // the shot's lens relative to the chase shot's (stock shots all share one lens: 0 today)
+    bool speed_fov = true;         // widen with speed
+    float speed_fov_degrees = 6.0f; // extra degrees at speed_fov_max
+    float speed_fov_min = 5.0f;    // m/s where widening starts
+    float speed_fov_max = 15.0f;   // m/s where it is full
+    bool air_fov = true;           // widen in big airs (Skate 3's high-air feel)
+    float air_fov_degrees = 8.0f;  // extra degrees at air_fov_full_height
+    float air_fov_full_height = 2.5f; // m: predicted apex above takeoff for the full air FOV
+    float smoothing_time = 0.35f;  // s, time constant of the FOV ease
+
+    bool valid() const noexcept {
+        const auto ok = [](float v, float lo, float hi) { return std::isfinite(v) && v >= lo && v <= hi; };
+        return ok(speed_fov_degrees, 0.0f, 40.0f) && ok(speed_fov_min, 0.0f, 60.0f) && speed_fov_max > speed_fov_min &&
+               ok(speed_fov_max, 0.1f, 80.0f) && ok(air_fov_degrees, 0.0f, 40.0f) && ok(air_fov_full_height, 0.1f, 50.0f) &&
+               ok(smoothing_time, 0.0f, 5.0f);
+    }
+};
+
+// The speed rumble ("shaky downhill / speed cam"), on top of the landing shake. Scales ShakeSettings'
+// speed terms; the landing impulse is separate (shake_enabled switches both off).
+struct SpeedShakeSettings {
+    bool enabled = true;
+    float strength = 1.0f;     // multiplies amplitude_max
+    float top_speed = 15.0f;   // m/s for the full rumble (replaces amplitude_top_speed / frequency_top_speed)
+    bool downhill_boost = true; // more rumble riding downhill
+    float downhill_scale = 1.5f; // multiplier at downhill_full_degrees
+    float downhill_full_degrees = 20.0f;
+
+    bool valid() const noexcept {
+        const auto ok = [](float v, float lo, float hi) { return std::isfinite(v) && v >= lo && v <= hi; };
+        return ok(strength, 0.0f, 10.0f) && ok(top_speed, 0.5f, 80.0f) && ok(downhill_scale, 1.0f, 10.0f) &&
+               ok(downhill_full_degrees, 1.0f, 80.0f);
+    }
+};
+
+// Camera collision (T8 positioner): walls, poles and the ground between the skater and the camera.
+struct CollisionSettings {
+    bool enabled = true;
+    float radius = 0.25f;        // m kept between the camera and a hit surface (pulled in along the ray)
+    float min_distance = 0.5f;   // m: never closer to the look target than this
+    float pull_in_time = 0.05f;  // s: how fast the camera moves in front of an obstacle (near instant)
+    float release_time = 0.4f;   // s: how fast it eases back out once clear
+    float ground_clearance = 0.3f; // m above the ground under the camera itself
+
+    bool valid() const noexcept {
+        const auto ok = [](float v, float lo, float hi) { return std::isfinite(v) && v >= lo && v <= hi; };
+        return ok(radius, 0.0f, 2.0f) && ok(min_distance, 0.0f, 5.0f) && ok(pull_in_time, 0.0f, 2.0f) &&
+               ok(release_time, 0.0f, 5.0f) && ok(ground_clearance, 0.0f, 3.0f);
+    }
+};
+
 struct CameraSettings {
     CameraPreset preset = CameraPreset::FullS3;
     CameraAngle angle = CameraAngle::Low; // S3 Low / S3 High (the shot set)
@@ -108,11 +211,18 @@ struct CameraSettings {
     SubjectPointSettings points;
     NativePlusSettings native_plus;
     PipelineSettings pipeline;
+    LookSettings look;
+    ShoulderSettings shoulder;
+    FollowSettings follow;
+    FovSettings fov;
+    SpeedShakeSettings speed_shake;
+    CollisionSettings collision;
 
     bool valid() const noexcept {
         return std::isfinite(fov_override_deg) && fov_override_deg >= 0.0f && fov_override_deg < 180.0f && rig.valid() && orientation.valid() && air.valid() &&
                shake.valid() && trajectory.valid() && graph.valid() && points.valid() && native_plus.valid() &&
-               pipeline.valid();
+               pipeline.valid() && look.valid() && shoulder.valid() && follow.valid() && fov.valid() &&
+               speed_shake.valid() && collision.valid();
     }
 };
 

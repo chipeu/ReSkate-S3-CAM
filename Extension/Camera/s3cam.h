@@ -42,10 +42,16 @@ void s3cam_note(const char* what) noexcept;
 // Settings (console thread or engine thread). Applied to the camera on its next pose.
 s3cam::CameraSettings s3cam_settings() noexcept;
 bool s3cam_set_settings(const s3cam::CameraSettings& settings) noexcept;
+// Glue options (not camera-core tunables). Applied on the camera's next frame.
 struct S3CamOptions {
-    bool shot_fov = false; // write the shot's field of view (otherwise the FreeCamera keeps its own)
-    bool verbose = true;   // log state and shot changes and a line per landing
+    bool shot_fov = true;            // S3Cam drives the FOV (base + the FovSettings terms); off: the camera keeps its own
+    bool verbose = true;             // log state and shot changes and a line per landing
+    bool follow_game_height = true;  // the game's camera height button (R3) picks S3 Low / High
+    float take_blend_time = 0.5f;    // s: crossfade from the game camera when S3Cam takes the view
+    float release_blend_time = 0.4f; // s: crossfade back to the game camera before handing it back (on foot)
 };
+// Bumped by every settings / options change: a saver can watch it.
+std::uint64_t s3cam_settings_revision() noexcept;
 S3CamOptions s3cam_options() noexcept;
 void s3cam_set_options(const S3CamOptions& options) noexcept;
 // One human-readable block: settings that matter in play and the last frame's debug values.
