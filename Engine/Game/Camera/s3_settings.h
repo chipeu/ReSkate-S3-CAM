@@ -105,11 +105,16 @@ struct LookSettings {
     float slope_look_strength = 0.5f;  // 0..1: share of the incline angle added to the pitch
     float vertical_follow = 1.0f;      // 0..1: how much the pitch follows the skater's height (0: the pitch stays level with the anchor)
     float response_time = 0.25f;       // s: the look offsets ease in and out with this time constant
+    // Where the camera aims in manuals and grinds: 0 = the board, 1 = the shot's usual point (hips /
+    // upper body). Alpha 3 feedback: manuals should frame the lower body and the board.
+    float manual_focus = 0.25f;
+    float grind_focus = 0.5f;
 
     bool valid() const noexcept {
         const auto ok = [](float v, float lo, float hi) { return std::isfinite(v) && v >= lo && v <= hi; };
         return ok(landing_look_strength, 0.0f, 1.0f) && ok(landing_look_full_drop, 0.1f, 50.0f) &&
-               ok(slope_look_strength, 0.0f, 1.0f) && ok(vertical_follow, 0.0f, 1.0f) && ok(response_time, 0.0f, 5.0f);
+               ok(slope_look_strength, 0.0f, 1.0f) && ok(vertical_follow, 0.0f, 1.0f) && ok(response_time, 0.0f, 5.0f) &&
+               ok(manual_focus, 0.0f, 1.0f) && ok(grind_focus, 0.0f, 1.0f);
     }
 };
 
@@ -213,6 +218,22 @@ struct FramingSettings {
     }
 };
 
+// Big airs (Alpha 3 feedback: the skater left the screen in big airs, and the camera should end up
+// above, looking down at the landing as the game's own camera does). Both presets.
+struct AirCameraSettings {
+    float follow_height = 0.6f;    // 0: the camera stays at the takeoff height, 1: rises with the skater
+    float rise_degrees = 15.0f;    // the camera swings up over the skater by this much in a big air
+    float rise_full_height = 2.0f; // m: apex above the takeoff, or drop below it, for the full rise
+    float ease_time = 0.35f;       // s: how fast the rise and the height follow ease in and out
+    bool keep_in_frame = true;     // aim the view so the skater never leaves the screen in the air
+
+    bool valid() const noexcept {
+        const auto ok = [](float v, float lo, float hi) { return std::isfinite(v) && v >= lo && v <= hi; };
+        return ok(follow_height, 0.0f, 1.0f) && ok(rise_degrees, 0.0f, 60.0f) && ok(rise_full_height, 0.1f, 20.0f) &&
+               ok(ease_time, 0.0f, 3.0f);
+    }
+};
+
 // Trick yaw: while the skater tricks, the camera swings round to the side to show the trick, holds that
 // angle while tricks keep coming, and recentres behind after landing. Nothing snaps.
 struct TrickYawSettings {
@@ -255,14 +276,17 @@ struct CameraSettings {
     FovSettings fov;
     SpeedShakeSettings speed_shake;
     CollisionSettings collision;
-    FramingSettings framing;
+    FramingSettings framing;      // the Low camera's position (also the default for the High one)
+    FramingSettings framing_high; // the High camera's position
     TrickYawSettings trick_yaw;
+    AirCameraSettings air_camera;
 
     bool valid() const noexcept {
         return std::isfinite(fov_override_deg) && fov_override_deg >= 0.0f && fov_override_deg < 180.0f && rig.valid() && orientation.valid() && air.valid() &&
                shake.valid() && trajectory.valid() && graph.valid() && points.valid() && native_plus.valid() &&
                pipeline.valid() && look.valid() && shoulder.valid() && follow.valid() && fov.valid() &&
-               speed_shake.valid() && collision.valid() && framing.valid() && trick_yaw.valid();
+               speed_shake.valid() && collision.valid() && framing.valid() && trick_yaw.valid() &&
+               framing_high.valid() && air_camera.valid();
     }
 };
 
