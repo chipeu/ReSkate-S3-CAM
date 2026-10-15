@@ -282,7 +282,7 @@ enum Page { map, world, build, skater, s3_camera, training, multiplayer, progres
 constexpr std::array<const char*, page_count> page_names{
     "MAP", "WORLD", "BUILD", "SKATER", "S3 CAMERA", "TRAINER", "MULTIPLAYER", "PROGRESS", "MODS", "MUSIC", "SETTINGS", "SPECIAL", "DEVELOPER"};
 constexpr std::array<const char*, page_count> page_subtitles{
-    "Pick your spot.", "Set the vibe.", "Make the park yours.", "Ride it your way.", "Skate 3's camera, your way.", "Tune it. Drill it. Measure it.",
+    "Pick your spot.", "Set the vibe.", "Make the park yours.", "Ride it your way.", "Tune the ride camera.", "Tune it. Drill it. Measure it.",
     "Bring your crew.", "Pick up where you want.", "Bring your own.", "Your sound, in the game.", "Your controls, your screen.", "Not everyone gets this page.",
     "Under the hood."};
 }

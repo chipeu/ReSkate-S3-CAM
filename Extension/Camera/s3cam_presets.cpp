@@ -126,14 +126,17 @@ bool write_text(const fs::path& file, const std::string& text) {
     return true;
 }
 
-std::string refused_note(const pf::LoadReport& report) {
-    if (!report.refused) return {};
-    return " (" + std::to_string(report.refused) + " value(s) were out of range or the wrong type and kept their defaults)";
+// What to tell the player besides "Loaded": values that were refused, and a preset from a newer ReSkate.
+template <class Parsed> std::string refused_note(const Parsed& parsed) {
+    std::string extra;
+    if (parsed.report.refused)
+        extra += " (" + std::to_string(parsed.report.refused) + " value(s) were out of range or the wrong type and kept their defaults)";
+    if (parsed.from_newer_version) extra += " (made by a newer ReSkate: the settings this version knows were loaded)";
+    return extra;
 }
 
 std::string error_message(pf::PresetError error, const std::string& what) {
     switch (error) {
-    case pf::PresetError::newer_version: return what + " was made by a newer ReSkate and cannot be read here.";
     case pf::PresetError::too_large: return what + " is too large to be an S3Cam preset.";
     default: return what + " is not an S3Cam preset.";
     }
@@ -186,6 +189,7 @@ S3CamPresetResult s3cam_preset_load(const std::string& name) noexcept {
     return guarded("load the preset", [&] {
         if (const auto index = pf::find_builtin(name); index < pf::builtin_count) {
             if (!s3cam_set_settings(pf::builtin_settings(index))) return failure("That preset is not valid.");
+            s3cam_set_options(S3CamOptions{}); // a built-in also puts the extra options back to their defaults
             note("loaded", pf::builtin_name(index));
             return success(std::string("Loaded '") + pf::builtin_name(index) + "'", pf::builtin_name(index));
         }
@@ -199,7 +203,7 @@ S3CamPresetResult s3cam_preset_load(const std::string& name) noexcept {
         if (!s3cam_set_settings(parsed.camera)) return failure("'" + name + "' does not hold valid settings.");
         s3cam_set_options(parsed.options);
         note("loaded", name);
-        return success("Loaded '" + name + "'" + refused_note(parsed.report), name);
+        return success("Loaded '" + name + "'" + refused_note(parsed), name);
     });
 }
 
@@ -306,8 +310,8 @@ S3CamPresetResult s3cam_preset_import(const std::string& text) noexcept {
         if (first == std::string::npos) return failure("The clipboard is empty.");
         pf::ParsedPreset<S3CamOptions> parsed;
         if (const auto error = pf::parse_preset(std::string_view(text).substr(first), parsed); error != pf::PresetError::none)
-            return failure(error == pf::PresetError::newer_version || error == pf::PresetError::too_large
-                ? error_message(error, "That clipboard text") : "That clipboard text is not an S3Cam preset.");
+            return failure(error == pf::PresetError::too_large ? error_message(error, "That clipboard text")
+                                                               : "That clipboard text is not an S3Cam preset.");
         const auto stem = free_name(parsed.name);
         if (stem.empty()) return failure("Could not find a free name for the preset.");
         const auto file = file_of(stem);
@@ -315,7 +319,7 @@ S3CamPresetResult s3cam_preset_import(const std::string& text) noexcept {
             return failure("Could not write the preset file for '" + stem + "'.");
         note("imported", stem);
         s3cam_presets_refresh();
-        return success("Imported '" + stem + "'" + refused_note(parsed.report), stem);
+        return success("Imported '" + stem + "'" + refused_note(parsed), stem);
     });
 }
 

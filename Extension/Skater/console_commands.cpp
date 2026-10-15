@@ -120,11 +120,11 @@ void register_movement_commands(Commands &registry) {
     registry.add(std::move(ray));
     // S3Cam (Extension/Camera/s3cam.h): the S3Cam camera while riding.
     namespace cam = client_source::detail;
-    auto s3cam_entry = variable("s3cam", "S3Cam camera while riding (the game's camera is used off the board and in menus)",
+    auto s3cam_entry = variable("s3cam", "Use the S3Cam camera while riding (the game's camera is used off the board and in menus)",
         Group::movement, argument("0|1", Type::boolean));
     s3cam_entry.inspect = [](const Model &m) {
         auto result = boolean_state(m.debug.camera_available || m.debug.s3cam, m.debug.s3cam, m.debug.camera_unavailable);
-        if (m.debug.s3cam) result.detail = m.debug.s3cam_view ? "Driving the view" : "Handed back (on foot, menu or loading)";
+        if (m.debug.s3cam) result.detail = m.debug.s3cam_view ? "Enabled" : "Disabled off board";
         return result;
     };
     s3cam_entry.run = [](const Model &, const Values &args, const Output &) { request_debug(Debug::set_s3cam, std::get<bool>(args[0])); };
@@ -163,7 +163,7 @@ void register_movement_commands(Commands &registry) {
         });
     auto angle_argument = argument("low|high");
     angle_argument.choices = {"low", "high"};
-    setting("s3cam_angle", "S3Cam camera height: low or high", angle_argument,
+    setting("s3cam_angle", "S3Cam camera: low or high", angle_argument,
         [] { return std::string(cam::s3cam_settings().angle == s3cam::CameraAngle::High ? "high" : "low"); },
         [update_settings](const Values &args, std::string &message) {
             const bool high = std::get<std::string>(args[0]) == "high";

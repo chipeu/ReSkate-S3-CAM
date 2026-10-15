@@ -34,8 +34,8 @@ struct S3CamPresetResult {
 void s3cam_presets_refresh() noexcept;
 // The cached list from the last refresh. The reference stays valid until the next refresh.
 const std::vector<S3CamPresetEntry>& s3cam_presets_list() noexcept;
-// Applies the preset's settings (and, for a saved preset, its options) through s3cam_set_settings /
-// s3cam_set_options; the saver then persists them. S3Cam stays on or off as it was.
+// Applies the preset's settings and options through s3cam_set_settings / s3cam_set_options (a built-in
+// sets the options to their defaults); the saver then persists them. S3Cam stays on or off as it was.
 S3CamPresetResult s3cam_preset_load(const std::string& name) noexcept;
 // Saves the live settings and options under `name` (made safe for a file name).
 S3CamPresetResult s3cam_preset_save(const std::string& name, bool overwrite) noexcept;

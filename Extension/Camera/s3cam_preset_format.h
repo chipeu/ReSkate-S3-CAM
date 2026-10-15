@@ -12,6 +12,16 @@
 //   { "name": "Park cam", "version": 1, "values": { "S3Cam.Framing.DistanceScale": 0.85, ... } }
 // Unknown keys are ignored, a missing key keeps the default, and a value of the wrong type or out of
 // range is refused on its own while the rest still load.
+//
+// Compatibility rules (older presets must keep working with newer builds, and the other way round):
+//  * Version 1 stays readable forever. A key that did not exist when a preset was made is simply
+//    missing, so the field keeps its default.
+//  * A preset with a higher version than preset_version still loads every key this build knows (the
+//    result says so in ParsedPreset::from_newer_version); only a version below 1 is refused.
+//  * Renaming a saved key later: keep the old spelling in key_aliases (old key -> new key). The loader,
+//    shared by the profile and the preset import, reads the new key first and falls back to its aliases.
+//    Never reuse an old key for a different field. Bump preset_version only when the meaning of
+//    existing keys changes in a way an alias cannot express.
 #include "Engine/Core/Json/json.h"
 #include "Engine/Game/Camera/s3_settings.h"
 
@@ -23,6 +33,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <span>
 #include <string_view>
 #include <system_error>
 #include <type_traits>
@@ -63,6 +74,20 @@ template <class Options, class Visit> void visit_fields(cfg::CameraSettings& cam
     visit("S3Cam.Framing.ManualDistanceScale", camera.framing, &cfg::FramingSettings::manual_distance_scale);
     visit("S3Cam.Framing.ManualHeightDegrees", camera.framing, &cfg::FramingSettings::manual_height_degrees);
 
+    // The High camera's position (the Low one keeps the S3Cam.Framing.* keys, so old presets still mean Low).
+    visit("S3Cam.FramingHigh.DistanceScale", camera.framing_high, &cfg::FramingSettings::distance_scale);
+    visit("S3Cam.FramingHigh.HeightDegrees", camera.framing_high, &cfg::FramingSettings::height_degrees);
+    visit("S3Cam.FramingHigh.PitchDegrees", camera.framing_high, &cfg::FramingSettings::pitch_degrees);
+    visit("S3Cam.FramingHigh.ManualCamera", camera.framing_high, &cfg::FramingSettings::manual_camera);
+    visit("S3Cam.FramingHigh.ManualDistanceScale", camera.framing_high, &cfg::FramingSettings::manual_distance_scale);
+    visit("S3Cam.FramingHigh.ManualHeightDegrees", camera.framing_high, &cfg::FramingSettings::manual_height_degrees);
+
+    visit("S3Cam.AirCamera.FollowHeight", camera.air_camera, &cfg::AirCameraSettings::follow_height);
+    visit("S3Cam.AirCamera.RiseDegrees", camera.air_camera, &cfg::AirCameraSettings::rise_degrees);
+    visit("S3Cam.AirCamera.RiseFullHeight", camera.air_camera, &cfg::AirCameraSettings::rise_full_height);
+    visit("S3Cam.AirCamera.EaseTime", camera.air_camera, &cfg::AirCameraSettings::ease_time);
+    visit("S3Cam.AirCamera.KeepInFrame", camera.air_camera, &cfg::AirCameraSettings::keep_in_frame);
+
     visit("S3Cam.TrickYaw.Enabled", camera.trick_yaw, &cfg::TrickYawSettings::enabled);
     visit("S3Cam.TrickYaw.AngleDegrees", camera.trick_yaw, &cfg::TrickYawSettings::angle_degrees);
     visit("S3Cam.TrickYaw.InAir", camera.trick_yaw, &cfg::TrickYawSettings::in_air);
@@ -80,6 +105,8 @@ template <class Options, class Visit> void visit_fields(cfg::CameraSettings& cam
     visit("S3Cam.Look.SlopeLookStrength", camera.look, &cfg::LookSettings::slope_look_strength);
     visit("S3Cam.Look.VerticalFollow", camera.look, &cfg::LookSettings::vertical_follow);
     visit("S3Cam.Look.ResponseTime", camera.look, &cfg::LookSettings::response_time);
+    visit("S3Cam.Look.ManualFocus", camera.look, &cfg::LookSettings::manual_focus);
+    visit("S3Cam.Look.GrindFocus", camera.look, &cfg::LookSettings::grind_focus);
 
     visit("S3Cam.Shoulder.Offset", camera.shoulder, &cfg::ShoulderSettings::offset);
     visit("S3Cam.Shoulder.SwitchTime", camera.shoulder, &cfg::ShoulderSettings::switch_time);
@@ -139,6 +166,16 @@ inline constexpr std::array<const char*, 3> trick_side_names{"auto", "left", "ri
 inline int trick_side_index(int side) noexcept { return side < 0 ? 1 : side > 0 ? 2 : 0; }
 inline int trick_side_value(int index) noexcept { return index == 1 ? -1 : index == 2 ? 1 : 0; }
 
+// ---- Key aliases ----
+
+// A saved key that was renamed: `legacy` is what old files and old profiles still say, `current` is
+// the key in visit_fields / the choices. Add a row when a key is renamed; never remove one.
+struct KeyAlias {
+    const char* legacy;
+    const char* current;
+};
+inline constexpr std::array<KeyAlias, 0> key_aliases{}; // no key has been renamed yet
+
 // ---- Loading ----
 
 struct LoadReport {
@@ -157,23 +194,30 @@ template <std::size_t N> int index_of(const std::optional<std::string>& text, co
 // Applies one saved value over a field when it has the right type and the group stays valid. `Source`
 // is called as source(key) and returns the saved Json or nullopt.
 template <class Source> struct Loader {
-    explicit Loader(Source& from) : source(from) {}
+    explicit Loader(Source& from, std::span<const KeyAlias> renamed = key_aliases) : source(from), aliases(renamed) {}
     Source& source;
+    std::span<const KeyAlias> aliases;
     int refused{};
     std::string first_refused;
 
     void refuse(const char* key) {
         if (!refused++) first_refused = key;
     }
-    // The saved value of `key`; a throwing source reads as "never saved".
+    // The saved value of `key`, or else of a legacy key that was renamed to it; a throwing source
+    // reads as "never saved".
     std::optional<Json> fetch(const char* key) const noexcept {
-        try { return source(key); } catch (...) { return std::nullopt; }
+        try {
+            auto value = source(key);
+            if (value) return value;
+            for (const auto& alias : aliases)
+                if (std::string_view(alias.current) == key)
+                    if (auto old = source(alias.legacy)) return old;
+        } catch (...) {}
+        return std::nullopt;
     }
     std::optional<std::string> text(const char* key) const noexcept {
-        try {
-            const auto value = source(key);
-            if (value && value->is_string()) return value->string();
-        } catch (...) {}
+        const auto value = fetch(key);
+        if (value && value->is_string()) return value->string();
         return std::nullopt;
     }
     static std::optional<bool> parse(const Json& json, const bool*) {
@@ -252,19 +296,22 @@ inline void drop_invalid_groups(cfg::CameraSettings& camera) noexcept {
     fix(camera.native_plus);
     fix(camera.shake);
     fix(camera.framing);
+    fix(camera.framing_high);
     fix(camera.trick_yaw);
+    fix(camera.air_camera);
 }
 
 // Applies every value `source` has over `camera` and `options`. A field is accepted on its own; a
 // field refused only because it needs a partner that comes later in the table (the speed FOV's
 // minimum above the default maximum) gets a second pass, so a saved pair loads whole whichever
 // order they come in.
-template <class Source, class Options> LoadReport load_values(Source& source, cfg::CameraSettings& camera, Options& options) {
-    Loader<Source> first{source};
+template <class Source, class Options>
+LoadReport load_values(Source& source, cfg::CameraSettings& camera, Options& options, std::span<const KeyAlias> aliases = key_aliases) {
+    Loader<Source> first{source, aliases};
     visit_fields(camera, options, first);
     load_choices(first, camera);
     if (!first.refused) return {};
-    Loader<Source> second{source};
+    Loader<Source> second{source, aliases};
     visit_fields(camera, options, second);
     load_choices(second, camera);
     return {second.refused, second.first_refused};
@@ -418,34 +465,25 @@ inline std::string unique_name(std::string_view name, const std::function<bool(s
 
 // ---- Built-in presets (code, not files; they cannot be deleted) ----
 
-inline constexpr std::size_t builtin_count = 4;
+inline constexpr std::size_t builtin_count = 2;
 inline const char* builtin_name(std::size_t index) noexcept {
     switch (index) {
-    case 0: return "Skate 3 (default)";
-    case 1: return "Native+ light";
-    case 2: return "Close & low";
-    case 3: return "High & wide";
+    case 0: return "Skate 3";
+    case 1: return "Close & low";
     default: return "";
     }
 }
-// The settings a built-in sets (everything else at the code defaults). Options (logging, blend times,
-// the R3 bind) are the player's own and are not part of a built-in.
+// The settings a built-in sets (everything else at the code defaults). Loading a built-in also puts
+// the glue options (FOV override switch, R3 option, blend times, logging) back to their defaults, so
+// "Skate 3" always means the plain defaults whatever was changed before; the glue does that.
 inline cfg::CameraSettings builtin_settings(std::size_t index) {
     cfg::CameraSettings settings; // the code defaults
     switch (index) {
-    case 0: break; // Skate 3 (default): the code defaults as they are
-    case 1: // Native+ light: the game's own camera plus the S3 layers, everything else default
-        settings.preset = cfg::CameraPreset::NativePlus;
-        break;
-    case 2: // Close & low. TUNE
+    case 0: break; // Skate 3: the code defaults as they are
+    case 1: // Close & low. TUNE
+        settings.angle = cfg::CameraAngle::Low;
         settings.framing.distance_scale = 0.85f;
         settings.framing.height_degrees = -3.0f;
-        settings.angle = cfg::CameraAngle::Low;
-        break;
-    case 3: // High & wide. TUNE
-        settings.angle = cfg::CameraAngle::High;
-        settings.framing.distance_scale = 1.2f;
-        settings.fov.speed_fov_degrees = 8.0f;
         break;
     default: break;
     }
@@ -465,8 +503,9 @@ template <class Options> struct ParsedPreset {
     cfg::CameraSettings camera;
     Options options;
     LoadReport report;
+    bool from_newer_version{}; // the file's version is above preset_version: its known keys were loaded, the rest ignored
 };
-enum class PresetError { none, not_json, not_preset, newer_version, too_large };
+enum class PresetError { none, not_json, not_preset, too_large };
 
 // The preset as a JSON object (name, version, values).
 template <class Options> Json preset_json(std::string_view name, const cfg::CameraSettings& camera, const Options& options) {
@@ -482,9 +521,11 @@ template <class Options> std::string preset_text(std::string_view name, const cf
     return preset_json(name, camera, options).dump(2);
 }
 
-// Reads a preset over the code defaults. `name` comes back sanitised ("Imported preset" when the text
+// Reads a preset over the code defaults (any version from 1 up; see the compatibility rules above).
+// `aliases` is key_aliases; the parameter exists for tests. `name` comes back sanitised ("Imported preset" when the text
 // carries none). On an error `out` is untouched.
-template <class Options> PresetError parse_preset(std::string_view text, ParsedPreset<Options>& out) noexcept {
+template <class Options>
+PresetError parse_preset(std::string_view text, ParsedPreset<Options>& out, std::span<const KeyAlias> aliases = key_aliases) noexcept {
     try {
         if (text.size() > max_preset_bytes) return PresetError::too_large;
         Json root;
@@ -495,10 +536,10 @@ template <class Options> PresetError parse_preset(std::string_view text, ParsedP
             !root.at("version").is_number_integer())
             return PresetError::not_preset;
         const auto version = root.at("version").get<std::int64_t>();
-        if (version > preset_version) return PresetError::newer_version;
         if (version < 1) return PresetError::not_preset;
 
         ParsedPreset<Options> parsed;
+        parsed.from_newer_version = version > preset_version; // not refused: every key we know still loads
         if (root.contains("name") && root.at("name").is_string()) parsed.name = sanitize_name(root.at("name").string());
         if (parsed.name.empty()) parsed.name = "Imported preset";
         const Json& values = root.at("values");
@@ -506,7 +547,7 @@ template <class Options> PresetError parse_preset(std::string_view text, ParsedP
             if (!values.contains(key)) return std::nullopt;
             return values.at(key);
         };
-        parsed.report = load_values(reader, parsed.camera, parsed.options);
+        parsed.report = load_values(reader, parsed.camera, parsed.options, aliases);
         drop_invalid_groups(parsed.camera);
         if (!parsed.camera.valid()) parsed.camera = {};
         if (!group_ok(parsed.options)) parsed.options = {};

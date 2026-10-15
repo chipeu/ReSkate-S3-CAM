@@ -1,6 +1,8 @@
 #include "Extension/Camera/s3cam_preset_format.h"
 
+#include <array>
 #include <cstdio>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -64,6 +66,10 @@ cs::CameraSettings tuned_camera() {
     camera.collision.radius = 0.4f;
     camera.native_plus.dip_depth = 0.2f;
     camera.shake.one_shot_magnitude = 1.5f;
+    camera.framing_high = {1.3f, 6.0f, -2.5f, false, 0.9f, -4.0f};
+    camera.air_camera = {0.8f, 22.0f, 3.5f, 0.6f, false};
+    camera.look.manual_focus = 0.1f;
+    camera.look.grind_focus = 0.9f;
     return camera;
 }
 TestOptions tuned_options() {
@@ -91,6 +97,13 @@ void json_round_trip() {
     expect(saved_of(parsed.camera, parsed.options) == saved_of(camera, options), "every saved field round-trips");
     expect(parsed.camera.valid(), "the loaded settings are valid");
     expect(parsed.camera.trick_yaw.side == -1 && parsed.camera.framing.manual_camera == false, "new fields round-trip");
+    expect(parsed.camera.framing_high.distance_scale == 1.3f && parsed.camera.framing_high.height_degrees == 6.0f &&
+           parsed.camera.framing_high.manual_camera == false && parsed.camera.framing.distance_scale == 0.85f,
+           "the High camera position round-trips apart from the Low one");
+    expect(parsed.camera.air_camera.follow_height == 0.8f && parsed.camera.air_camera.rise_degrees == 22.0f &&
+           parsed.camera.air_camera.rise_full_height == 3.5f && parsed.camera.air_camera.ease_time == 0.6f &&
+           !parsed.camera.air_camera.keep_in_frame, "the big-air camera round-trips");
+    expect(parsed.camera.look.manual_focus == 0.1f && parsed.camera.look.grind_focus == 0.9f, "manual and grind focus round-trip");
     expect(parsed.camera.fov.speed_fov_min == 20.0f && parsed.camera.fov.speed_fov_max == 30.0f, "a speed FOV pair above the default maximum loads whole");
 
     const auto root = parse_text(text);
@@ -176,8 +189,13 @@ void not_presets() {
     expect(sf::parse_preset(R"({"values":{}})", parsed) == sf::PresetError::not_preset, "a version is required");
     expect(sf::parse_preset(R"({"version":"1","values":{}})", parsed) == sf::PresetError::not_preset, "the version is a number");
     expect(sf::parse_preset(R"({"version":0,"values":{}})", parsed) == sf::PresetError::not_preset, "version 0 does not exist");
-    expect(sf::parse_preset(R"({"version":2,"values":{}})", parsed) == sf::PresetError::newer_version, "a newer version is named as such");
-    expect(parsed.name == "untouched", "a failed parse leaves the output alone");
+    expect(sf::parse_preset(R"({"version":2,"values":{}})", parsed) == sf::PresetError::none && parsed.from_newer_version,
+           "a newer version is loaded and flagged, not refused");
+    expect(sf::parse_preset(R"({"version":1,"values":{}})", parsed) == sf::PresetError::none && !parsed.from_newer_version,
+           "version 1 is not flagged");
+    parsed.name = "untouched";
+    expect(sf::parse_preset("[1,2,3]", parsed) == sf::PresetError::not_preset && parsed.name == "untouched",
+           "a failed parse leaves the output alone");
     expect(sf::parse_preset(std::string(sf::max_preset_bytes + 1, ' '), parsed) == sf::PresetError::too_large, "a huge text is refused");
     expect(sf::parse_preset(R"({"version":1,"values":{}})", parsed) == sf::PresetError::none && parsed.name == "Imported preset",
            "a preset without a name is called Imported preset");
@@ -228,8 +246,8 @@ void names() {
 }
 
 void builtins() {
-    expect(sf::builtin_count == 4, "four built-in presets");
-    const std::vector<std::string> expected{"Skate 3 (default)", "Native+ light", "Close & low", "High & wide"};
+    expect(sf::builtin_count == 2, "two built-in presets");
+    const std::vector<std::string> expected{"Skate 3", "Close & low"};
     for (std::size_t i = 0; i < sf::builtin_count; ++i) {
         expect(sf::builtin_name(i) == expected[i], "built-in name");
         const auto settings = sf::builtin_settings(i);
@@ -240,15 +258,81 @@ void builtins() {
         expect(sf::parse_preset(sf::preset_text(sf::builtin_name(i), settings, TestOptions{}), again) == sf::PresetError::none &&
                saved_of(again.camera, again.options) == saved_of(settings, TestOptions{}), "a built-in exports and imports unchanged");
     }
-    expect(sf::find_builtin("skate 3 (DEFAULT)") == 0 && sf::find_builtin("Nothing") == sf::builtin_count, "built-in lookup ignores case");
-    expect(saved_of(sf::builtin_settings(0), TestOptions{}) == saved_of(cs::CameraSettings{}, TestOptions{}), "Skate 3 (default) is the code defaults");
-    expect(sf::builtin_settings(1).preset == cs::CameraPreset::NativePlus && sf::builtin_settings(0).preset == cs::CameraPreset::FullS3,
-           "Native+ light is the Native+ style");
-    const auto close = sf::builtin_settings(2);
-    expect(close.framing.distance_scale == 0.85f && close.framing.height_degrees == -3.0f && close.angle == cs::CameraAngle::Low,
-           "Close & low");
-    const auto wide = sf::builtin_settings(3);
-    expect(wide.angle == cs::CameraAngle::High && wide.framing.distance_scale == 1.2f && wide.fov.speed_fov_degrees == 8.0f, "High & wide");
+    expect(sf::find_builtin("SKATE 3") == 0 && sf::find_builtin("Nothing") == sf::builtin_count &&
+           sf::find_builtin("Native+ light") == sf::builtin_count && sf::find_builtin("Skate 3 (default)") == sf::builtin_count,
+           "built-in lookup ignores case and the old names are gone");
+    expect(saved_of(sf::builtin_settings(0), TestOptions{}) == saved_of(cs::CameraSettings{}, TestOptions{}), "Skate 3 is the code defaults");
+    const auto close = sf::builtin_settings(1);
+    expect(close.framing.distance_scale == 0.85f && close.framing.height_degrees == -3.0f && close.angle == cs::CameraAngle::Low &&
+           close.preset == cs::CameraPreset::FullS3, "Close & low");
+}
+
+// An old version 1 preset, written before the High camera, the big-air camera and the focus keys.
+void old_preset_keeps_new_defaults() {
+    Parsed parsed;
+    const std::string text = R"({"name":"Old","version":1,"values":{
+        "S3Cam.Framing.DistanceScale":0.9,"S3Cam.Framing.HeightDegrees":2.0,"S3Cam.Angle":"high",
+        "S3Cam.Look.LandingLook":false,"S3Cam.Options.Logging":false}})";
+    expect(sf::parse_preset(text, parsed) == sf::PresetError::none && !parsed.from_newer_version, "an old v1 preset reads");
+    expect(parsed.report.refused == 0, "nothing refused");
+    expect(parsed.camera.framing.distance_scale == 0.9f && parsed.camera.angle == cs::CameraAngle::High && !parsed.camera.look.landing_look &&
+           !parsed.options.verbose, "its keys load");
+    const cs::CameraSettings defaults;
+    expect(parsed.camera.framing_high.distance_scale == defaults.framing_high.distance_scale &&
+           parsed.camera.framing_high.height_degrees == defaults.framing_high.height_degrees,
+           "the High camera position stays at its defaults, not copied from the old Low one");
+    expect(parsed.camera.air_camera.follow_height == defaults.air_camera.follow_height &&
+           parsed.camera.air_camera.rise_degrees == defaults.air_camera.rise_degrees &&
+           parsed.camera.air_camera.keep_in_frame == defaults.air_camera.keep_in_frame, "the big-air camera stays at its defaults");
+    expect(parsed.camera.look.manual_focus == defaults.look.manual_focus && parsed.camera.look.grind_focus == defaults.look.grind_focus,
+           "manual and grind focus stay at their defaults");
+}
+
+// A preset from a later version: unknown keys, an unknown top-level field and a changed unknown value type.
+void newer_preset_loads_known_keys() {
+    Parsed parsed;
+    const std::string text = R"({"name":"Future","version":2,"future_field":{"a":1},"values":{
+        "S3Cam.Framing.DistanceScale":1.25,"S3Cam.Next.Thing":[1,2,3],"S3Cam.AirCamera.RiseDegrees":30,
+        "S3Cam.Framing.PitchDegrees":99.0,"S3Cam.Look.GrindFocus":0.2}})";
+    expect(sf::parse_preset(text, parsed) == sf::PresetError::none, "a version 2 preset reads");
+    expect(parsed.from_newer_version, "and is flagged as newer");
+    expect(parsed.name == "Future", "its name survives");
+    expect(parsed.camera.framing.distance_scale == 1.25f && parsed.camera.air_camera.rise_degrees == 30.0f &&
+           parsed.camera.look.grind_focus == 0.2f, "the known keys load");
+    expect(parsed.camera.framing.pitch_degrees == 0.0f && parsed.report.refused == 1, "a known key out of range is still refused alone");
+    expect(parsed.camera.valid(), "the result is valid");
+}
+
+// The profile loader and the preset import share Loader, so one alias table serves both.
+void aliases() {
+    constexpr std::array<sf::KeyAlias, 2> table{{{"S3Cam.Framing.Distance", "S3Cam.Framing.DistanceScale"},
+                                                  {"S3Cam.Old.Angle", "S3Cam.Angle"}}};
+    Parsed parsed;
+    const std::string text = R"({"version":1,"values":{"S3Cam.Framing.Distance":1.4,"S3Cam.Old.Angle":"high"}})";
+    expect(sf::parse_preset(text, parsed, table) == sf::PresetError::none, "a preset with renamed keys reads");
+    expect(parsed.camera.framing.distance_scale == 1.4f, "a number under its old key maps to the new field");
+    expect(parsed.camera.angle == cs::CameraAngle::High, "a text choice under its old key maps too");
+    expect(parsed.report.refused == 0, "an alias is not a refusal");
+
+    Parsed both;
+    const std::string winner = R"({"version":1,"values":{"S3Cam.Framing.Distance":1.4,"S3Cam.Framing.DistanceScale":0.7}})";
+    expect(sf::parse_preset(winner, both, table) == sf::PresetError::none && both.camera.framing.distance_scale == 0.7f,
+           "the current key wins over its old spelling");
+
+    Parsed none;
+    expect(sf::parse_preset(text, none) == sf::PresetError::none && none.camera.framing.distance_scale == 1.0f &&
+           none.camera.angle == cs::CameraAngle::Low, "without the alias the old keys are just unknown");
+
+    // A profile-style source (a callable on the key) goes through the same loader.
+    cs::CameraSettings camera;
+    TestOptions options;
+    auto profile = [](const char* key) -> std::optional<Json> {
+        if (std::string_view(key) == "S3Cam.Framing.Distance") return Json(1.1);
+        return std::nullopt;
+    };
+    const auto report = sf::load_values(profile, camera, options, table);
+    expect(report.refused == 0 && camera.framing.distance_scale == 1.1f, "the profile loader maps old keys too");
+    expect(sf::key_aliases.size() == 0 || sf::key_aliases[0].legacy != nullptr, "the shipped table is well formed");
 }
 
 void field_table() {
@@ -266,7 +350,18 @@ void field_table() {
     }
     expect(framing == 6, "six framing keys");
     expect(yaw == 10, "ten trick yaw keys");
-    expect(values.size() == 69, "69 saved keys in all");
+    int high = 0, air = 0;
+    for (const auto& entry : values) {
+        high += entry.first.rfind("S3Cam.FramingHigh.", 0) == 0;
+        air += entry.first.rfind("S3Cam.AirCamera.", 0) == 0;
+    }
+    expect(high == 6 && air == 5, "six High framing keys and five big-air keys");
+    for (const auto& alias : sf::key_aliases) {
+        bool found = false;
+        for (const auto& entry : values) found = found || entry.first == alias.current;
+        expect(found, "every alias points at a saved key");
+    }
+    expect(values.size() == 82, "82 saved keys in all");
 }
 } // namespace
 
@@ -277,6 +372,9 @@ int main() {
     not_presets();
     names();
     builtins();
+    old_preset_keeps_new_defaults();
+    newer_preset_loads_known_keys();
+    aliases();
     field_table();
     if (failures) {
         std::printf("%d failure(s)\n", failures);
