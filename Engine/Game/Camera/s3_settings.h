@@ -196,6 +196,44 @@ struct CollisionSettings {
     }
 };
 
+// The player's framing on top of every shot: distance, camera height and view pitch, and the
+// manual close-up (Alpha 3 feedback).
+struct FramingSettings {
+    float distance_scale = 1.0f;        // multiplies every shot's camera distance
+    float height_degrees = 0.0f;        // added to every shot's elevation: the camera sits higher (+) or lower around the skater
+    float pitch_degrees = 0.0f;         // added to the view pitch: + looks up, - looks down
+    bool manual_camera = true;          // manuals / nose manuals use the manual close-up
+    float manual_distance_scale = 0.75f; // the manual shots' distance relative to the chase (a grind-like close-up, not too close)
+    float manual_height_degrees = 0.0f; // added to the manual shots' elevation
+
+    bool valid() const noexcept {
+        const auto ok = [](float v, float lo, float hi) { return std::isfinite(v) && v >= lo && v <= hi; };
+        return ok(distance_scale, 0.4f, 3.0f) && ok(height_degrees, -30.0f, 45.0f) && ok(pitch_degrees, -30.0f, 30.0f) &&
+               ok(manual_distance_scale, 0.3f, 1.5f) && ok(manual_height_degrees, -30.0f, 45.0f);
+    }
+};
+
+// Trick yaw: while the skater tricks, the camera swings round to the side to show the trick, holds that
+// angle while tricks keep coming, and recentres behind after landing. Nothing snaps.
+struct TrickYawSettings {
+    bool enabled = true;
+    float angle_degrees = 25.0f;  // how far round the camera swings
+    int side = 0;                 // 0: auto (the shoulder side when Manual, else the stance's toe side), +1 right, -1 left
+    bool in_air = true;           // airs and flip tricks
+    bool on_grinds = false;
+    bool on_manuals = false;
+    float min_air_time = 0.2f;    // s in the air before the swing starts (a plain ollie stays centred)
+    float in_time = 0.6f;         // s to swing out
+    float hold_time = 0.5f;       // s after the trick before recentring; a new trick in this time keeps the angle
+    float return_time = 1.5f;     // s to recentre behind
+
+    bool valid() const noexcept {
+        const auto ok = [](float v, float lo, float hi) { return std::isfinite(v) && v >= lo && v <= hi; };
+        return ok(angle_degrees, 0.0f, 90.0f) && side >= -1 && side <= 1 && ok(min_air_time, 0.0f, 3.0f) &&
+               ok(in_time, 0.0f, 5.0f) && ok(hold_time, 0.0f, 5.0f) && ok(return_time, 0.0f, 10.0f);
+    }
+};
+
 struct CameraSettings {
     CameraPreset preset = CameraPreset::FullS3;
     CameraAngle angle = CameraAngle::Low; // S3 Low / S3 High (the shot set)
@@ -217,12 +255,14 @@ struct CameraSettings {
     FovSettings fov;
     SpeedShakeSettings speed_shake;
     CollisionSettings collision;
+    FramingSettings framing;
+    TrickYawSettings trick_yaw;
 
     bool valid() const noexcept {
         return std::isfinite(fov_override_deg) && fov_override_deg >= 0.0f && fov_override_deg < 180.0f && rig.valid() && orientation.valid() && air.valid() &&
                shake.valid() && trajectory.valid() && graph.valid() && points.valid() && native_plus.valid() &&
                pipeline.valid() && look.valid() && shoulder.valid() && follow.valid() && fov.valid() &&
-               speed_shake.valid() && collision.valid();
+               speed_shake.valid() && collision.valid() && framing.valid() && trick_yaw.valid();
     }
 };
 
