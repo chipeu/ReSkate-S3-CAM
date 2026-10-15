@@ -138,26 +138,29 @@ void replacement_cameras() {
         check(!camera_probe_phase_observed(other.context.address()), "A different world cannot use the previous observation");
     }
 }
-std::uintptr_t updated_camera{};
+std::uintptr_t updated_camera{}, updated_output{};
 int updated_calls{};
-void record_update(std::uintptr_t camera) noexcept { updated_camera = camera; ++updated_calls; }
+void record_update(std::uintptr_t camera, std::uintptr_t output) noexcept {
+    updated_camera = camera; updated_output = output; ++updated_calls;
+}
 // S3Cam spike S1c: the listener gets the evaluated camera after a verified native update only.
 void updated_listener() {
     Camera camera;
     const auto native = camera_state().base + camera_addresses::native_caller_return;
-    camera_notify_updated(camera_state(), native, camera.input.address());
+    camera_notify_updated(camera_state(), native, camera.input.address(), 0x123450);
     check(updated_calls == 0, "No listener, no call");
     set_camera_updated_listener(&record_update);
-    camera_notify_updated(camera_state(), native, camera.input.address());
-    check(updated_calls == 1 && updated_camera == camera.camera.address(), "The listener receives the evaluated camera");
-    camera_notify_updated(camera_state(), native + 1, camera.input.address());
+    camera_notify_updated(camera_state(), native, camera.input.address(), 0x123450);
+    check(updated_calls == 1 && updated_camera == camera.camera.address() && updated_output == 0x123450,
+        "The listener receives the evaluated camera and the output buffer");
+    camera_notify_updated(camera_state(), native + 1, camera.input.address(), 0x123450);
     check(updated_calls == 1, "Other callers are ignored");
     camera.camera.put(0, std::uintptr_t{0});
-    camera_notify_updated(camera_state(), native, camera.input.address());
+    camera_notify_updated(camera_state(), native, camera.input.address(), 0x123450);
     check(updated_calls == 1, "A camera of another type is ignored");
     set_camera_updated_listener(nullptr);
     camera.camera.put(0, camera_state().base + addr::engine::camera_vtable);
-    camera_notify_updated(camera_state(), native, camera.input.address());
+    camera_notify_updated(camera_state(), native, camera.input.address(), 0x123450);
     check(updated_calls == 1, "A removed listener is not called");
 }
 int main() {

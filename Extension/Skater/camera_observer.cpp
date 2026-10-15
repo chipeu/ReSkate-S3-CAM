@@ -209,14 +209,15 @@ struct CameraCall {
 };
 // After a native update returns: hands the camera it evaluated to the listener, only for the
 // verified native caller, reading it the way camera_identity does.
-void camera_notify_updated(const CameraObserver& state, std::uintptr_t caller, std::uintptr_t time_input) noexcept {
+void camera_notify_updated(const CameraObserver& state, std::uintptr_t caller, std::uintptr_t time_input,
+    std::uintptr_t output) noexcept {
     const auto listener = camera_updated_listener.load(std::memory_order_acquire);
     if (!listener || caller != state.base + camera_addresses::native_caller_return) return;
     std::uintptr_t evaluator{}, camera{}, vtable{};
     if (camera_range(time_input, 0x10) && memory::peek(time_input + 8, evaluator) && camera_object(evaluator) &&
         camera_range(evaluator, 0x140) && memory::peek(evaluator + 0x138, camera) && camera_object(camera) &&
         camera_range(camera, 0x188) && memory::peek(camera, vtable) && vtable == state.base + addr::engine::camera_vtable)
-        listener(camera);
+        listener(camera, output);
 }
 void camera_hook(std::uintptr_t callback, std::uintptr_t time_input, std::uintptr_t output) {
     const auto incoming = GetLastError();
@@ -228,7 +229,7 @@ void camera_hook(std::uintptr_t callback, std::uintptr_t time_input, std::uintpt
     original(callback, time_input, output);
     const auto returned = GetLastError();
     call.finish(true);
-    camera_notify_updated(state, caller, time_input);
+    camera_notify_updated(state, caller, time_input, output);
     SetLastError(returned);
 }
 }

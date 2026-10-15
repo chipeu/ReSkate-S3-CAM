@@ -2,8 +2,8 @@
 
 Status: **three in-game runs done (2026-10-15).** S2, S3 and **S4 (g ≈ 10.1 m/s²)** answered.
 Ownership: mode 1 shows the pose but freezes the replay editor; mode 2 (run 3) keeps everything
-native, but its write came too late to show. Next: run 4 = **S1c**, mode 2 writing from inside the
-game's camera update. `ctest`: **46/46 passed** (MSVC, Release). Code reading is done (below). Every
+native, but its write came too late to show. Run 4: the write inside the update is replaced
+by the caller (it applies the update's output). Next: run 5 = **S1d**, write the output. `ctest`: **46/46 passed** (MSVC, Release). Code reading is done (below). Every
 cell marked _pending_ needs a log line from Aescher's PC. Gate 0 is decided from this file.
 
 How the work is split: a Linux cloud session writes code and checks it (pure-math tests with g++ and
@@ -136,9 +136,26 @@ the callback (in its `output`), and the next spike looks at that buffer.
 
 | Run 4 question | Answer |
 |---|---|
-| Does the view follow the probe pose, smoothly? | _pending_ |
-| Off board, replay editor, Freecam, first person still vanilla? | _pending_ |
-| W / S / H counters | _pending_ |
+| Does the view follow the probe pose, smoothly? | **no**: still the game's camera (smooth) |
+| Off board, replay editor, Freecam, first person still vanilla? | **yes** |
+| W / S / H counters | 3728 writes / 5974 seen / **0 still ours at the tick**, 0 failed. The listener ran on every update and the write was replaced every time, later in the same update |
+
+### S1d. Write the update's output, not the camera
+
+The native caller (return 0x1728bd5) applies the callback's `output` buffer to the camera after
+the callback returns, so a write to the camera inside the callback is always too early. The
+listener now receives `output` too. Mode 2 first **learns** where the view rows are: for 120
+updates it keeps a guarded copy of the first 0x400 bytes of `output` and, at the tick, matches
+them against the camera's final view. Nothing is written while learning. If one offset matches
+≥90% of updates, it logs `s3cam_probe now writes the pose at output+0x…` and writes the probe pose
+there (rows only, keeping the output's own fourth lanes). Either way it logs `output scan …`,
+with the best matrix and position offsets and any other copy of the view inside the camera object.
+
+| Run 5 question | Answer |
+|---|---|
+| `output scan` line: offset and hits | _pending_ |
+| After ~2 s riding: does the view switch to the chase pose? | _pending_ |
+| Everything else still vanilla? | _pending_ |
 
 **Verdict (proposed for Gate 0, revised after run 2): own the pose, not the selection.** If S1b
 works, S3Cam writes the game's camera (B1's full control of the pose, without B1's mode switch),
