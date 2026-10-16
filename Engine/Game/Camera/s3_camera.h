@@ -40,6 +40,11 @@
 // Alpha 3 layers: the framing (distance / height scale on every shot, the manual close-up) is applied where the
 // shot is resolved, so shot blends and settings changes ease it (FullS3; the pitch offset also in NativePlus); the
 // trick yaw swings the rig heading round to the side during airs / grinds / manuals (FullS3).
+// Alpha 5 layers: the landing shake / dip strength comes from the fall height (peak root height of the air minus
+// the landing height, plus a little speed), not from the board's velocity; the horizontal follow (FollowSettings::
+// horizontal) swings the orbit heading toward the filtered travel heading, before the trick yaw; leaving a manual /
+// grind shot uses a longer transition and eases the distance; manuals and grinds keep the camera above the board and
+// never look up at it; the framing height is an eased offset added after the rig's slow elevation tracker.
 // update() takes the real frame dt, runs as many fixed 1/60 s steps (s3_math.h fixed_step, the Rust
 // camera STEP) as the accumulator holds (CLAUDE.md hard rule 5; the subject is interpolated between
 // the previous and current snapshot across them) and returns the pose interpolated between the last two steps. Trackers, blends and shake never
@@ -110,6 +115,14 @@ struct FrameDebug {
     float keep_pitch_offset = 0.0f;    // rad, the keep-in-frame pitch added to the view (+ looks up)
     float focus_weight = 1.0f;         // 0..1, how far the look target sits from the board toward the usual point (manual / grind focus)
     Vec3 look_target{0, 0, 0};         // FullS3: the point the view aims at, after the focus and the look layers
+    // Alpha 5.
+    float landing_fall = 0.0f;         // m, the fall of the last landing (peak root height of the air minus the landing's)
+    float landing_fraction = 0.0f;     // 0..1, how hard that landing was (before the squared shaping); drives shake and dip
+    float follow_weight = 0.0f;        // 0..1, how far the orbit heading is pulled onto the travel heading (horizontal follow)
+    float travel_heading = 0.0f;       // rad, the filtered heading of the horizontal travel direction
+    float exit_blend = 1.0f;           // 0..1, progress of the distance ease after leaving a manual / grind shot (1: none running)
+    float floor_weight = 0.0f;         // 0..1, the eased weight of the manual / grind camera floor and pitch ceiling
+    float height_offset = 0.0f;        // rad, the eased framing height added after the rig's elevation tracker
 };
 
 struct Frame {
@@ -352,19 +365,55 @@ private:
     Shot framed(Shot shot, ShotId id, float chase_blend) const noexcept {
         if (settings_.preset == CameraPreset::NativePlus) return shot;
         const FramingSettings& fr = active_framing();
-        float elevation_degrees = fr.height_degrees;
         if (fr.manual_camera && (id == ShotId::ManualFar || id == ShotId::ManualClose)) {
             // The manual close-up is relative to the chase distance at this speed (FramingSettings:
             // "relative to the chase"), not to the manual shots' own table distances: the table's
             // close manual (1.1 m) is nearer than the grind shots, which the player found too close.
             shot.distance = blend_shots(lookup_shots(ShotId::Chase, settings_.angle), chase_blend).distance *
                             fr.manual_distance_scale;
-            elevation_degrees += fr.manual_height_degrees;
         }
+        // The grind close-up: the grind shots' own distance (~1.5-1.7 m) times grind_distance_scale.
+        if (fr.grind_camera && closeup_kind(id) == 2) shot.distance *= fr.grind_distance_scale;
         shot.distance *= fr.distance_scale;
-        const float limit = 85.0f * degrees; // short of straight up / down; the rig clamps tighter
-        shot.position_elevation = std::clamp(shot.position_elevation + elevation_degrees * degrees, -limit, limit);
+        // The framing height is NOT part of the shot's elevation any more (Alpha 5): the rig's elevation tracker
+        // moves only ~3.6 deg/s, so a slider change took many seconds. It is an eased offset added after the
+        // tracker (height_goal_of), the shot's own elevation still goes through the tracker.
         return shot;
+    }
+
+    // 0: neither, 1: a manual shot, 2: a grind shot. Leaving one kind for any other shot is an "exit".
+    static int closeup_kind(ShotId id) noexcept {
+        switch (id) {
+        case ShotId::ManualFar:
+        case ShotId::ManualClose: return 1;
+        case ShotId::GrindFlat:
+        case ShotId::GrindLedgeL:
+        case ShotId::GrindLedgeR: return 2;
+        default: return 0;
+        }
+    }
+
+    // The framing height for a shot, radians: height_degrees plus the manual_ / grind_ one on those shots
+    // (FullS3 only; NativePlus keeps the game's height).
+    float height_goal_of(ShotId id) const noexcept {
+        if (settings_.preset == CameraPreset::NativePlus) return 0.0f;
+        const FramingSettings& fr = active_framing();
+        float height_deg = fr.height_degrees;
+        if (fr.manual_camera && closeup_kind(id) == 1) height_deg += fr.manual_height_degrees;
+        if (fr.grind_camera && closeup_kind(id) == 2) height_deg += fr.grind_height_degrees;
+        return height_deg * degrees;
+    }
+
+    // How hard a landing was, 0..1: the impact speed sqrt(2 g fall) + speed_weight * horizontal speed, placed between the
+    // impact speeds of min_fall and full_fall (the same sqrt(2 g h)). Falls come from the root heights, which flip
+    // tricks and the board's physics spikes cannot fake.
+    float landing_fraction_of(float fall_height, float flat_speed) const noexcept {
+        const LandingShakeSettings& ls = settings_.landing_shake;
+        const float grav = std::max(settings_.trajectory.gravity, 1e-3f);
+        const auto impact_of = [grav](float h) { return std::sqrt(2.0f * grav * std::max(h, 0.0f)); };
+        const float impact = impact_of(fall_height) + ls.speed_weight * flat_speed;
+        const float low = impact_of(ls.min_fall), high = impact_of(ls.full_fall);
+        return clamp01((impact - low) / std::max(high - low, 1e-3f));
     }
 
     // The slope of the direction of travel along the ground, degrees, + uphill (manager_state.rs update_incline).
@@ -462,6 +511,39 @@ private:
         st.value = st.start + (st.target - st.start) * sine_blend(fraction);
     }
 
+    // Horizontal follow (FollowSettings::horizontal, 0-10, FullS3). Returns the orbit heading: the rig's own heading
+    // (its compass-driven tracker) pulled toward `travel + the shot's position heading` by w = horizontal / 10 times a
+    // speed weight. The travel heading is the heading of the horizontal velocity through a short two-stage filter, so
+    // velocity noise does not jitter the camera; it is only updated on the ground (flip tricks spike the board's
+    // velocity in the air) and while moving. Below ~1 m/s the speed weight fades to 0 (the camera keeps the rig's
+    // heading), eased so a stop does not snap. At w = 1 the orbit heading IS the filtered travel heading, so the camera
+    // stays straight behind the direction of travel; at 0 nothing here runs and the rig heading passes through.
+    float update_horizontal_follow(const SubjectSnapshot& s, bool snap, bool grounded, float flat_speed, float rig_heading, float dt) noexcept {
+        const float follow_goal = clamp01(settings_.follow.horizontal / 10.0f);
+        const float move_goal = clamp01((flat_speed - follow_min_speed) / std::max(follow_full_speed - follow_min_speed, 1e-3f));
+        const float raw_heading = heading_of({s.velocity[0], 0.0f, s.velocity[2]});
+        if (snap) {
+            travel_heading_ = travel_stage_ = flat_speed > follow_min_speed ? raw_heading : wrap_angle(rig_heading - current_.position_heading);
+            hf_w_ = hf_w_stage_ = follow_goal;
+            hf_move_goal_ = move_goal;
+            hf_move_w_ = hf_move_stage_ = move_goal;
+        } else {
+            if (grounded) {
+                hf_move_goal_ = move_goal;
+                if (flat_speed > follow_min_speed) {
+                    const float rate = camera_detail::ease_rate(0.5f * follow_filter_time, dt);
+                    travel_stage_ = blend_angle(travel_stage_, raw_heading, rate);
+                    travel_heading_ = blend_angle(travel_heading_, travel_stage_, rate);
+                }
+            }
+            hf_w_ = camera_detail::ease2_to(hf_w_stage_, hf_w_, follow_goal, follow_ease_time, dt);
+            hf_move_w_ = camera_detail::ease2_to(hf_move_stage_, hf_move_w_, hf_move_goal_, follow_speed_ease_time, dt);
+        }
+        const float total = hf_w_ * hf_move_w_;
+        if (!(total > 0.0f)) return rig_heading;
+        return blend_angle(rig_heading, wrap_angle(travel_heading_ + current_.position_heading), total);
+    }
+
     // Camera cut: every tracker lands on this frame's targets with zero velocity, shake and dip clear.
     template <class Query>
     void cut_to(const SubjectSnapshot& s, Query& ground) noexcept {
@@ -484,6 +566,13 @@ private:
         landing_point_stage_ = landing_point_;
         coll_pull_ = coll_lift_ = coll_pull_stage_ = coll_lift_stage_ = 0.0f;
         trick_yaw_ = TrickYawState{};
+        hf_w_ = hf_w_stage_ = hf_move_w_ = hf_move_stage_ = hf_move_goal_ = 0.0f;
+        travel_heading_ = travel_stage_ = 0.0f;
+        exit_active_ = false;
+        exit_blend_ = 1.0f;
+        floor_w_ = floor_w_stage_ = height_off_ = height_stage_ = 0.0f;
+        air_peak_y_ = 0.0f;
+        last_landing_fall_ = last_landing_fraction_ = 0.0f;
         layers_ = {};
         no_lag_timer_ = settings_.pipeline.no_lag_after_reset;
         step_once(s, ground, true);
@@ -560,11 +649,13 @@ private:
         if (entered_air) {
             air_time_ = 0.0f;
             flight_max_height_ = 0.0f;
+            air_peak_y_ = s.position[1];
             takeoff_surface_y_ = s.position[1] - last_clearance_;
             repredict_timer_ = 0.0f;
             predict(s, ground);
         } else if (air) {
             air_time_ += dt;
+            air_peak_y_ = std::max(air_peak_y_, s.position[1]); // one max per step: the highest root height of this air
             repredict_timer_ += dt;
             if (cs.pipeline.repredict_interval > 0.0f && repredict_timer_ >= cs.pipeline.repredict_interval) {
                 repredict_timer_ = 0.0f;
@@ -585,9 +676,15 @@ private:
         air_in.snap_height = snap;
         if (snap) air_.reset(anchor_pt[1], grounded);
         const AirOutput air_out = air_.update(dt, air_in, cs.air);
-        if (air_out.landing) {
-            shake_.landing_impulse(air_out.landing->normal, air_out.landing->velocity, cs.shake);
-            kick_dip(air_out.landing->normal, air_out.landing->velocity);
+        // Landing response (Alpha 5): the strength comes from how far the skater fell (the highest root height of
+        // this air minus the landing's) plus a little horizontal speed, not from the velocity at touchdown, which
+        // comes from the board's physics body and spikes in flip tricks. The first grounded step after an air
+        // counts, whatever the (possibly spiked) velocity says; a landing that fell less than min_fall gives 0.
+        if (!snap && was_air_ && grounded) {
+            last_landing_fall_ = std::max(0.0f, air_peak_y_ - s.position[1]);
+            last_landing_fraction_ = landing_fraction_of(last_landing_fall_, horizontal_speed);
+            shake_.landing_impulse_fraction(last_landing_fraction_, cs.shake);
+            kick_dip(last_landing_fraction_);
         }
         // ---- prepare 2: incline (after the landing response has read the previous normal)
         incline_degrees_ = incline_of(s, normal);
@@ -633,6 +730,9 @@ private:
 
         // ---- shot blend (shot_manager.rs: previous = interpolated at the change, eased by elapsed/duration)
         const bool changed = snap || pick.shot != id_ || cs.angle != angle_;
+        // Leaving a manual / grind close-up for any other kind of shot: a longer transition (and, below, an eased
+        // distance), so the camera does not snap out of the close-up (Alpha 5 feedback).
+        const bool leaving_closeup = changed && !snap && closeup_kind(id_) != 0 && closeup_kind(pick.shot) != closeup_kind(id_);
         if (changed) shots_ = lookup_shots(pick.shot, cs.angle); // cached until the selection changes
         // The player's framing is part of the resolved shot, every step: a shot change blends old -> new with it
         // baked into both, and a settings change moves only the target, which the rig's distance / elevation
@@ -643,6 +743,14 @@ private:
             from_ = snap ? leaf_ : current_;
             shot_elapsed_ = 0.0f;
             shot_duration_ = snap ? 0.0f : cs.graph.transition_time[static_cast<std::size_t>(pick.shot)];
+            if (leaving_closeup) {
+                shot_duration_ = std::max(shot_duration_, exit_transition_time);
+                exit_active_ = true;
+                exit_start_distance_ = distance_used_; // continuous with the camera's last distance, also when another exit still runs
+                exit_elapsed_ = 0.0f;
+                exit_duration_ = shot_duration_;
+            }
+            if (snap) exit_active_ = false;
             id_ = pick.shot;
             angle_ = cs.angle;
         }
@@ -751,19 +859,46 @@ private:
             // is -X when the camera looks along +Z, so swinging to the skater's right DEcreases the heading.
             // The pan tracker below keeps the view aimed at the skater.
             update_trick_yaw(s, snap, dt);
-            const float heading_used = rig_out.heading - trick_yaw_.value;
+            // Horizontal follow: the orbit heading is pulled onto the (filtered) travel heading, the trick yaw goes on top.
+            const float follow_heading = update_horizontal_follow(s, snap, grounded, horizontal_speed, rig_out.heading, dt);
+            const float heading_used = follow_heading - trick_yaw_.value;
             // The big-air rise rides on the rig's tracked elevation (not its target): the elevation tracker is slow
             // (it takes seconds to move a few degrees), so a rise fed through it would hardly show in an air.
-            const float elevation_used = std::clamp(rig_out.elevation + rise_rad, -85.0f * degrees, 85.0f * degrees);
+            // The framing height does the same (Alpha 5): an eased offset after the tracker, so a slider change
+            // shows within half a second instead of at the tracker's ~3.6 deg/s.
+            const float height_goal = height_goal_of(pick.shot);
+            if (snap) height_off_ = height_stage_ = height_goal;
+            else height_off_ = camera_detail::ease2_to(height_stage_, height_off_, height_goal, height_ease_time, dt);
+            const float elevation_used = std::clamp(rig_out.elevation + rise_rad + height_off_, -85.0f * degrees, 85.0f * degrees);
             last_elevation_used_ = elevation_used;
+            // Leaving a manual / grind close-up: the distance follows the shot blend (a sine ease over the longer
+            // exit transition) from where it was, whatever the rig's distance tracker (6 m/s, fast in the air) does.
+            float distance_now = rig_out.distance;
+            if (exit_active_ && !snap) {
+                exit_elapsed_ += dt;
+                const float exit_fraction = clamp01(exit_elapsed_ / std::max(exit_duration_, 1e-3f));
+                distance_now = camera_detail::lerp_f(exit_start_distance_, rig_out.distance, sine_blend(exit_fraction));
+                exit_blend_ = exit_fraction;
+                if (exit_fraction >= 1.0f) exit_active_ = false;
+            } else {
+                exit_blend_ = 1.0f;
+            }
+            distance_used_ = distance_now;
             const float cos_e = std::cos(elevation_used), sin_e = std::sin(elevation_used);
             const Vec3 offset_dir{-std::sin(heading_used), 0.0f, std::cos(heading_used)};
-            Vec3 camera = add(rig_out.anchor, add(scale(offset_dir, rig_out.distance * cos_e), {0, rig_out.distance * sin_e, 0}));
+            Vec3 camera = add(rig_out.anchor, add(scale(offset_dir, distance_now * cos_e), {0, distance_now * sin_e, 0}));
             // Only while the ground under the skater is measured: clearance_now is clamped to 3 m, so in a
             // higher air the floor would sit above the real ground and hold the camera up (hiding the rise).
             // The collision layer's own ground ray covers the camera there.
             if (cs.pipeline.floor_clearance > 0.0f && s.ground_clearance < 3.0f)
                 camera[1] = std::max(camera[1], s.position[1] - clearance_now + cs.pipeline.floor_clearance);
+            // Manuals and grinds: the camera stays at least manual_grind_min_height above the board (the Low
+            // shots sat below it, looking up at it). The floor's weight is eased in and out (two-stage), and the
+            // lift is that weight times the shortfall, so it grows continuously instead of clamping in.
+            const float floor_goal = closeup_kind(pick.shot) != 0 ? 1.0f : 0.0f;
+            if (snap) floor_w_ = floor_w_stage_ = floor_goal;
+            else floor_w_ = camera_detail::ease2_to(floor_w_stage_, floor_w_, floor_goal, floor_goal > floor_w_stage_ ? floor_in_time : floor_out_time, dt);
+            camera[1] += floor_w_ * std::max(0.0f, points[4][1] + manual_grind_min_height - camera[1]);
 
             // ---- look target. The shot's board_offset lifts the base above the weighted point (Rust: along
             // the subject's board-offset direction, here world up): the Low camera sits near the board and
@@ -847,6 +982,9 @@ private:
             framing_pitch_ = snap ? framing_pitch_goal : camera_detail::ease_to(framing_pitch_, framing_pitch_goal, lk.response_time, dt);
             pitch_target = std::clamp(pitch_target + current_.framing[2] + look_pitch_ + framing_pitch_,
                                       -89.0f * degrees, 89.0f * degrees);
+            // Manuals and grinds never look up (the camera is above the board there): the pitch above the player's
+            // own offset is taken off by the floor's eased weight.
+            pitch_target -= floor_w_ * std::max(0.0f, pitch_target - std::max(framing_pitch_, 0.0f));
             if (snap) {
                 pan_.reset(yaw_target);
                 tilt_.reset(pitch_target);
@@ -907,6 +1045,9 @@ private:
         layers_.air_rise = rise_rad;
         layers_.keep_pitch_offset = keep_off_;
         layers_.focus_weight = focus_value_;
+        layers_.follow_weight = native ? 0.0f : hf_w_ * hf_move_w_;
+        layers_.floor_weight = native ? 0.0f : floor_w_;
+        layers_.height_offset = native ? 0.0f : height_off_;
 
         // ---- shake. Speed shake (both presets): the rumble is rebuilt per step from a copy of the
         // settings, so the landing impulse (separate fields) is untouched. When the rumble is off its
@@ -989,17 +1130,13 @@ private:
         prediction_time_base_ = air_time_;
     }
 
-    // Landing dip: a velocity kick into the critically damped spring whose peak depth is dip_depth * intensity.
-    void kick_dip(const Vec3& normal, const Vec3& velocity) noexcept {
+    // Landing dip: a velocity kick into the critically damped spring whose peak depth is dip_depth * fraction^2, the
+    // fraction being landing_fraction_of (the same 0..1 as the shake impulse).
+    void kick_dip(float fraction) noexcept {
         const NativePlusSettings& np = settings_.native_plus;
         if (settings_.preset != CameraPreset::NativePlus || !np.landing_dip) return;
-        if (!(length(velocity) > 1e-5f)) return;
-        // The speed into the surface, as Shake::landing_impulse weights it (see the deviation noted there).
-        const float weighted = -dot(normalized(normal, {0.0f, 1.0f, 0.0f}), velocity);
-        if (!(weighted > 0.0f)) return;
-        const ShakeSettings& sk = settings_.shake;
-        const float fraction = clamp01((weighted - sk.one_shot_min_velocity) / std::max(sk.one_shot_max_velocity - sk.one_shot_min_velocity, 1e-6f));
-        const float peak = np.dip_depth * fraction * fraction;
+        if (!(fraction > 0.0f)) return;
+        const float peak = np.dip_depth * clamp01(fraction) * clamp01(fraction);
         const float omega = 1.0f / std::max(np.dip_peak_time, 1e-3f);
         constexpr float e = 2.71828182845905f;
         dip_v_ = std::max(dip_v_, peak * omega * e); // x(t) = v0 t exp(-omega t) peaks at v0 / (omega e)
@@ -1136,7 +1273,7 @@ private:
         dbg.anchor_lag = last_rig_.anchor_lag;
         dbg.heading = last_rig_.heading;
         dbg.elevation = settings_.preset == CameraPreset::FullS3 ? last_elevation_used_ : last_rig_.elevation; // with the rise, so camera = anchor + distance * sin(elevation)
-        dbg.distance = last_rig_.distance;
+        dbg.distance = settings_.preset == CameraPreset::FullS3 ? distance_used_ : last_rig_.distance; // with the exit ease
         dbg.impulse = shake_.impulse();
         dbg.landing_dip = dip_x_;
         dbg.speed = last_speed_;
@@ -1158,6 +1295,13 @@ private:
         dbg.keep_pitch_offset = layers_.keep_pitch_offset;
         dbg.focus_weight = layers_.focus_weight;
         dbg.look_target = layers_.look_target;
+        dbg.landing_fall = last_landing_fall_;
+        dbg.landing_fraction = last_landing_fraction_;
+        dbg.follow_weight = layers_.follow_weight;
+        dbg.travel_heading = travel_heading_;
+        dbg.exit_blend = exit_blend_;
+        dbg.floor_weight = layers_.floor_weight;
+        dbg.height_offset = layers_.height_offset;
         frame_.debug = dbg;
     }
 
@@ -1233,9 +1377,28 @@ private:
         float value = 0.0f, start = 0.0f, target = 0.0f, elapsed = 0.0f, duration = 0.0f;
         float hold_left = 0.0f; // s of hold remaining after the last trick step
     } trick_yaw_;
+    // Alpha 5. Landing: the highest root height of the current air, and the last landing's fall and strength.
+    float air_peak_y_ = 0.0f, last_landing_fall_ = 0.0f, last_landing_fraction_ = 0.0f;
+    // Horizontal follow: the filtered travel heading (and its first stage), the eased follow weight and speed weight.
+    float travel_heading_ = 0.0f, travel_stage_ = 0.0f, hf_w_ = 0.0f, hf_w_stage_ = 0.0f;
+    float hf_move_w_ = 0.0f, hf_move_stage_ = 0.0f, hf_move_goal_ = 0.0f;
+    static constexpr float follow_min_speed = 0.75f, follow_full_speed = 1.25f; // m/s: the speed weight ramps over this (about 1 m/s)
+    static constexpr float follow_filter_time = 0.1f;       // s, the travel heading filter (two stages): short, but it takes the velocity noise off
+    static constexpr float follow_ease_time = 0.4f;         // s, a change of the horizontal setting eases in over this
+    static constexpr float follow_speed_ease_time = 0.4f;   // s, the speed weight's fade when starting or stopping
+    // Leaving a manual / grind close-up: the distance ease (start distance, elapsed, duration), the last distance used.
+    bool exit_active_ = false;
+    float exit_start_distance_ = 0.0f, exit_elapsed_ = 0.0f, exit_duration_ = 0.0f, exit_blend_ = 1.0f, distance_used_ = 0.0f;
+    static constexpr float exit_transition_time = 0.9f;     // s, the shot transition when leaving a manual / grind (at least)
+    // Manual / grind camera floor: the eased weight, its first stage; the framing height offset (rad) and its stage.
+    float floor_w_ = 0.0f, floor_w_stage_ = 0.0f, height_off_ = 0.0f, height_stage_ = 0.0f;
+    static constexpr float manual_grind_min_height = 0.3f;  // m, the least the camera sits above the board in a manual / grind
+    static constexpr float floor_in_time = 0.3f, floor_out_time = 0.5f; // s, the floor weight's ease in and out
+    static constexpr float height_ease_time = 0.2f;         // s, the framing height offset's ease (settles within ~0.5 s)
     struct LayerDebug {
         float landing_look_weight = 0.0f, look_pitch_offset = 0.0f, follow_strength = 1.0f, collision_pull = 0.0f, trick_yaw = 0.0f;
         float air_follow_weight = 0.0f, air_reference_height = 0.0f, air_rise = 0.0f, keep_pitch_offset = 0.0f, focus_weight = 1.0f;
+        float follow_weight = 0.0f, floor_weight = 0.0f, height_offset = 0.0f;
         Vec3 look_target{0, 0, 0};
     } layers_;
 

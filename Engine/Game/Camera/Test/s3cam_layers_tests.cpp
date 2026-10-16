@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <new>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -1171,7 +1173,10 @@ void test_framing_change_is_smooth() {
         const std::string tag = fps_tag("framing change", fps);
         // The rig's distance tracker (6 m/s, 20 m/s^2) and the elevation tracker do the easing; nothing snaps.
         expect(worst_offset_step < 7.5f / fps, tag + "the camera moves at most 7.5 m/s relative to the skater");
-        expect(worst_pitch_step < 30.0f / fps, tag + "and the view pitch turns at most 30 deg/s");
+        // Alpha 5: the +20 degrees of height is now an offset eased over ~0.3 s after the rig's elevation tracker (it
+        // crawled through the tracker at ~3.6 deg/s before), so the view pitch turns faster while it settles: the bound was
+        // 30 deg/s, now ~36 deg/s with the +6 degree pitch change on top. Still a smooth turn, no snap.
+        expect(worst_pitch_step < 45.0f / fps, tag + "and the view pitch turns at most 45 deg/s");
         expect(close_to(frames.back().debug.distance, anchor_before * 1.8f, 0.03f), tag + "it settles at the new distance");
     }
 }
@@ -1553,8 +1558,11 @@ void test_landing_impulse_in_game() {
     const float three_m = landing_share(false, 3.0f);
     std::printf("  landing impulse through the camera, share of full: ollie %.3f, 1 m drop %.3f, 3 m drop %.3f\n", static_cast<double>(ollie),
                 static_cast<double>(one_m), static_cast<double>(three_m));
-    expect(ollie > 0.04f && ollie < 0.22f, "landing log: a plain flat ollie gives a light impulse (4-22% of full)");
-    expect(one_m >= 0.28f && one_m <= 0.55f, "landing log: a 1 m drop at 6.6 m/s gives a clear but moderate impulse (30-50%)");
+    // Alpha 5: the strength comes from the fall height now (LandingShakeSettings: 0.5 m / 2.5 m, speed weight 0.1), so a
+    // flat ollie (a fall of ~0.4 m) is lighter than the old velocity weighting gave (4-22% -> 0-12%) and a 1 m drop is
+    // ~0.25 (was 0.38); the 3 m drop is unchanged.
+    expect(ollie >= 0.0f && ollie < 0.12f, "landing log: a plain flat ollie gives at most a light impulse (under 12% of full)");
+    expect(one_m >= 0.15f && one_m <= 0.5f, "landing log: a 1 m drop at 6.6 m/s gives a clear but moderate impulse (15-50%)");
     expect(three_m >= 0.9f, "landing log: a 3 m drop is near full");
     expect(ollie < one_m && one_m < three_m, "landing log: and they rise with the drop");
 }
@@ -1906,6 +1914,618 @@ void test_framing_per_angle() {
     }
 }
 
+// ================================================================ Alpha 5
+
+// Allocation counter for the "nothing allocates" check: the global operator new counts its calls. The test reads
+// the counter around the camera updates only (the vectors that script the run are filled before).
+std::size_t alloc_count = 0;
+void* operator new(std::size_t bytes) {
+    ++alloc_count;
+    if (void* block = std::malloc(bytes != 0 ? bytes : 1)) return block;
+    throw std::bad_alloc();
+}
+void operator delete(void* block) noexcept { std::free(block); }
+void operator delete(void* block, std::size_t) noexcept { std::free(block); }
+
+
+
+// ---------------------------------------------------------------- task 1: landing strength from the fall
+
+// A rider on the flat at `speed` m/s along +Z that hops (air_begin .. air_begin + air_time, a parabola peaking
+// `hop_height` above the takeoff root) or steps down `drop` metres, with the board-velocity spikes the log showed
+// in the last frames of an air (and optionally zero velocity at the touchdown).
+struct HopRider {
+    float speed = 6.0f;
+    float air_begin = 1.0f;
+    float hop_height = 0.114f;   // 0.3 s of air: the log's light quick nollie
+    float drop = 0.0f;           // > 0: the landing is this much lower than the takeoff (fall = hop_height + drop)
+    bool spikes = false;         // the last 0.08 s of the air report a wild board velocity
+    bool lost_velocity = false;  // the touchdown step reports zero velocity
+    // Time in the air: rise to the peak, then fall hop_height + drop.
+    float rise_time() const { return std::sqrt(2.0f * hop_height / gravity_ms2); }
+    float fall_time() const { return std::sqrt(2.0f * (hop_height + drop) / gravity_ms2); }
+    float air_time() const { return rise_time() + fall_time(); }
+    SubjectSnapshot at(float time) const {
+        SubjectSnapshot s;
+        s.valid = true;
+        s.time = time;
+        s.velocity = {0.0f, 0.0f, speed};
+        s.position = {0.0f, root_height, speed * time};
+        s.ground_clearance = root_height;
+        const float since = time - air_begin;
+        if (since >= air_time()) {
+            s.position[1] = root_height - drop;
+            if (lost_velocity && since < air_time() + 0.1f) s.velocity = {0.0f, 0.0f, 0.0f};
+        } else if (since >= 0.0f) {
+            const float vy0 = std::sqrt(2.0f * gravity_ms2 * hop_height);
+            s.position[1] = root_height + vy0 * since - 0.5f * gravity_ms2 * since * since;
+            s.velocity[1] = vy0 - gravity_ms2 * since;
+            s.physics_state = physics_state::air;
+            s.ground_clearance = s.position[1] + drop;
+            if (spikes && since > air_time() - 0.08f) s.velocity = {7.0f, -14.0f, -9.0f};
+        }
+        return s;
+    }
+};
+
+struct LandingResult {
+    float impulse_share = 0.0f; // peak shake impulse / one_shot_magnitude
+    float fraction = 0.0f, fall = 0.0f;
+    float dip = 0.0f;           // NativePlus: deepest dip, m
+};
+LandingResult run_landing(const HopRider& rider, CameraPreset preset, float fps = 60.0f) {
+    CameraSettings cs;
+    cs.preset = preset;
+    World world;
+    world.upper_y = -1000.0f;
+    CameraMan cam = make_camera(cs);
+    LandingResult result;
+    const int count = static_cast<int>(std::lround(4.0f * fps));
+    for (int i = 0; i < count; ++i) {
+        const SubjectSnapshot s = rider.at(static_cast<float>(i) / fps);
+        const NativePose pose = air_native_pose(s);
+        FrameExtras extras;
+        extras.base_fov_deg = 60.0f;
+        extras.native = &pose;
+        const Frame& f = cam.update(1.0f / fps, s, world, extras);
+        result.impulse_share = std::max(result.impulse_share, f.debug.impulse / cs.shake.one_shot_magnitude);
+        result.dip = std::max(result.dip, f.debug.landing_dip);
+        result.fraction = f.debug.landing_fraction;
+        result.fall = f.debug.landing_fall;
+    }
+    return result;
+}
+
+void test_landing_from_fall() {
+    for (const CameraPreset preset : {CameraPreset::FullS3, CameraPreset::NativePlus}) {
+        const std::string name = preset == CameraPreset::FullS3 ? "FullS3: " : "NativePlus: ";
+        // The light quick nollie: 0.3 s in the air, +0.01 m at the landing, with and without board spikes.
+        for (const bool spiked : {false, true}) {
+            HopRider nollie;
+            nollie.spikes = spiked;
+            nollie.drop = -0.01f;
+            const LandingResult r = run_landing(nollie, preset);
+            const std::string tag = name + (spiked ? "nollie with velocity spikes: " : "nollie: ");
+            expect(close_to(r.fall, 0.114f + 0.01f, 0.03f), tag + "the fall is the ~0.1 m the root dropped");
+            expect(r.impulse_share == 0.0f && r.fraction == 0.0f, tag + "no landing shake");
+            expect(r.dip == 0.0f, tag + "no landing dip");
+        }
+        // Real drops, whatever the snapshot's velocity does at the touchdown.
+        float shares[3] = {0, 0, 0};
+        int slot = 0;
+        for (const float drop : {1.0f, 3.0f}) {
+            for (const int mode : {0, 1, 2}) {
+                HopRider hop;
+                hop.hop_height = 0.05f;
+                hop.drop = drop;
+                hop.spikes = mode == 1;
+                hop.lost_velocity = mode == 2;
+                const LandingResult r = run_landing(hop, preset);
+                if (mode == 0) shares[slot++] = r.impulse_share;
+                const std::string tag = name + std::to_string(static_cast<int>(drop)) + " m drop (" + (mode == 0 ? "clean" : mode == 1 ? "spiked" : "velocity lost") + "): ";
+                expect(close_to(r.fall, drop + 0.05f, 0.05f), tag + "the fall is the height lost");
+                if (drop == 1.0f) {
+                    expect(r.impulse_share > 0.12f && r.impulse_share < 0.45f, tag + "a moderate landing shake");
+                    if (preset == CameraPreset::NativePlus) expect(r.dip > 0.005f && r.dip < 0.5f * CameraSettings{}.native_plus.dip_depth, tag + "a moderate dip");
+                } else {
+                    expect(r.impulse_share > 0.9f, tag + "near the full landing shake");
+                    if (preset == CameraPreset::NativePlus) expect(r.dip > 0.7f * CameraSettings{}.native_plus.dip_depth, tag + "near the full dip");
+                }
+            }
+        }
+        std::printf("  landing from the fall (%s): 1 m drop %.3f, 3 m drop %.3f of full\n", preset == CameraPreset::FullS3 ? "FullS3" : "NativePlus",
+                    static_cast<double>(shares[0]), static_cast<double>(shares[1]));
+    }
+    // The mapping: the settings' min_fall and full_fall are the edges, the speed adds a little.
+    {
+        CameraSettings cs;
+        cs.landing_shake.min_fall = 1.0f;
+        cs.landing_shake.full_fall = 2.0f;
+        cs.landing_shake.speed_weight = 0.0f;
+        const auto share_for = [&cs](float drop) {
+            HopRider hop;
+            hop.hop_height = 0.02f;
+            hop.drop = drop - 0.02f;
+            hop.speed = 0.0f;
+            World world;
+            world.upper_y = -1000.0f;
+            CameraMan cam = make_camera(cs);
+            float best = 0.0f;
+            for (int i = 0; i < 240; ++i) best = std::max(best, cam.update(1.0f / 60.0f, hop.at(static_cast<float>(i) / 60.0f), world).debug.landing_fraction);
+            return best;
+        };
+        expect(share_for(0.95f) == 0.0f, "landing map: just under min_fall gives nothing");
+        expect(close_to(share_for(2.05f), 1.0f, 1e-4f), "landing map: past full_fall is full");
+        const float mid = (std::sqrt(2.0f * 10.1f * 1.5f) - std::sqrt(2.0f * 10.1f * 1.0f)) / (std::sqrt(2.0f * 10.1f * 2.0f) - std::sqrt(2.0f * 10.1f * 1.0f));
+        expect(close_to(share_for(1.5f), mid, 0.03f), "landing map: between them the fraction follows sqrt(2 g h)");
+        cs.landing_shake.speed_weight = 0.5f;
+        expect(share_for(1.0f) == 0.0f, "landing map: and without forward speed the speed weight adds nothing");
+    }
+    // A speed term: the same fall lands a little harder at speed.
+    {
+        HopRider slow, fast;
+        slow.hop_height = fast.hop_height = 0.05f;
+        slow.drop = fast.drop = 1.0f;
+        slow.speed = 1.0f;
+        fast.speed = 12.0f;
+        expect(run_landing(fast, CameraPreset::FullS3).fraction > run_landing(slow, CameraPreset::FullS3).fraction + 0.05f,
+               "landing: the same fall lands harder at speed (speed_weight)");
+    }
+    // The cut flag and a mid-air cut: no landing is measured from a reset.
+    {
+        CameraMan cam;
+        HopRider hop;
+        hop.drop = 1.0f;
+        World world;
+        world.upper_y = -1000.0f;
+        for (int i = 0; i < 20; ++i) cam.update(1.0f / 60.0f, hop.at(static_cast<float>(i) / 60.0f), world);
+        cam.request_reset();
+        float worst = 0.0f;
+        for (int i = 20; i < 40; ++i) worst = std::max(worst, cam.update(1.0f / 60.0f, hop.at(static_cast<float>(i) / 60.0f), world).debug.impulse);
+        expect(worst == 0.0f, "landing: a cut does not shake");
+    }
+    // Nothing allocates, the landing included.
+    {
+        HopRider hop;
+        hop.hop_height = 0.5f;
+        hop.drop = 2.0f;
+        CameraMan cam;
+        World world;
+        world.upper_y = -1000.0f;
+        std::vector<SubjectSnapshot> script;
+        for (int i = 0; i < 240; ++i) script.push_back(hop.at(static_cast<float>(i) / 60.0f));
+        const std::size_t before = alloc_count;
+        float peak_impulse = 0.0f;
+        for (const SubjectSnapshot& s : script) peak_impulse = std::max(peak_impulse, cam.update(1.0f / 60.0f, s, world).debug.impulse);
+        expect(alloc_count == before, "landing: the camera update allocates nothing, landings included");
+        expect(peak_impulse > 0.5f, "landing: (and the allocation run did land hard)");
+    }
+}
+
+// ---------------------------------------------------------------- task 2: horizontal follow
+
+// A rider that rides straight, turns at a constant rate between `turn_begin` and `turn_end`, then rides straight again.
+struct Turner {
+    float speed = 6.0f, turn_dps = 25.0f, turn_begin = 1.0f, turn_end = 6.0f;
+    float heading_at(float time) const { return turn_dps * degrees * std::clamp(time - turn_begin, 0.0f, turn_end - turn_begin); }
+    Vec3 dir_of(float theta) const { return {-std::sin(theta), 0.0f, std::cos(theta)}; }
+    SubjectSnapshot at(float time) const {
+        SubjectSnapshot s;
+        s.valid = true;
+        s.time = time;
+        const float omega = std::max(turn_dps * degrees, 1e-4f);
+        const float theta = heading_at(time);
+        float x = 0.0f, z = speed * std::min(time, turn_begin);
+        if (time > turn_begin) { // the arc
+            x += speed / omega * (std::cos(theta) - 1.0f);
+            z += speed / omega * std::sin(theta);
+        }
+        if (time > turn_end) { // straight again along the final heading
+            const Vec3 d = dir_of(theta);
+            x += d[0] * speed * (time - turn_end);
+            z += d[2] * speed * (time - turn_end);
+        }
+        s.position = {x, root_height, z};
+        s.forward = dir_of(theta);
+        s.velocity = scale(s.forward, speed);
+        s.ground_clearance = root_height;
+        return s;
+    }
+};
+// Degrees between the camera's horizontal offset from the rider and straight behind the direction of travel.
+float behind_error_deg(const Frame& f, const SubjectSnapshot& s) {
+    const Vec3 offset = normalized({f.pos[0] - s.position[0], 0.0f, f.pos[2] - s.position[2]}, {0, 0, -1});
+    const Vec3 behind = scale(normalized({s.velocity[0], 0.0f, s.velocity[2]}, {0, 0, 1}), -1.0f);
+    return std::acos(std::clamp(dot(offset, behind), -1.0f, 1.0f)) / degrees;
+}
+
+void test_horizontal_follow() {
+    World world;
+    world.upper_y = -1000.0f;
+    for (const float fps : {30.0f, 60.0f, 144.0f}) {
+        const std::string tag = fps_tag("horizontal follow", fps);
+        Turner turner;
+        CameraSettings tied;
+        tied.follow.horizontal = 10.0f;
+        CameraMan cam10 = make_camera(tied);
+        CameraMan cam0 = make_camera(CameraSettings{});
+        std::vector<Frame> f10, f0;
+        drive_between(cam10, turner, world, 0.0f, 9.0f, fps, f10);
+        drive_between(cam0, turner, world, 0.0f, 9.0f, fps, f0);
+        float worst10 = 0.0f, worst0 = 0.0f, worst_step = 0.0f, worst_yaw_step = 0.0f;
+        for (std::size_t i = 0; i < f10.size(); ++i) {
+            const float t = static_cast<float>(i) / fps;
+            if (t < 2.0f) continue;
+            const SubjectSnapshot s = turner.at(t);
+            worst10 = std::max(worst10, behind_error_deg(f10[i], s));
+            worst0 = std::max(worst0, behind_error_deg(f0[i], s));
+            const Vec3 o_now = sub(f10[i].pos, s.position), o_prev = sub(f10[i - 1].pos, turner.at(static_cast<float>(i - 1) / fps).position);
+            worst_step = std::max(worst_step, length(sub(o_now, o_prev)));
+            worst_yaw_step = std::max(worst_yaw_step, std::abs(wrap_angle((view_yaw_deg(f10[i]) - view_yaw_deg(f10[i - 1])) * degrees)) / degrees);
+        }
+        std::printf("  %sworst angle off straight-behind while turning: 10 -> %.2f deg, 0 -> %.2f deg; camera step %.3f m, yaw step %.2f deg\n", tag.c_str(),
+                    static_cast<double>(worst10), static_cast<double>(worst0), static_cast<double>(worst_step), static_cast<double>(worst_yaw_step));
+        expect(worst10 < 6.0f, tag + "at 10 a turning rider keeps the camera within 6 degrees of straight behind");
+        expect(worst0 > 2.0f * worst10 && worst0 > 12.0f, tag + "at 0 the camera swings lazily behind (well off straight behind in the same turn)");
+        expect(worst_step < 8.0f / fps, tag + "no snaps: the camera moves at most 8 m/s relative to the rider");
+        expect(worst_yaw_step < 80.0f / fps, tag + "and the view yaw turns at most 80 deg/s");
+        expect(f10.back().debug.follow_weight > 0.98f && f0.back().debug.follow_weight == 0.0f, tag + "the follow weight is 1 at 10 and exactly 0 at 0");
+    }
+    // At 0 the camera is what it was: a run with the setting never touched equals one with 0 set explicitly (and
+    // the rig heading passes through untouched; the weight is exactly 0).
+    {
+        Turner turner;
+        CameraSettings explicit_zero;
+        explicit_zero.follow.horizontal = 0.0f;
+        CameraMan a = make_camera(explicit_zero), b = make_camera(CameraSettings{});
+        std::vector<Frame> fa, fb;
+        drive_between(a, turner, world, 0.0f, 9.0f, 60.0f, fa);
+        drive_between(b, turner, world, 0.0f, 9.0f, 60.0f, fb);
+        bool same = true;
+        for (std::size_t i = 0; i < fa.size(); ++i) same = same && fa[i].pos == fb[i].pos && fa[i].back == fb[i].back;
+        expect(same, "horizontal follow: 0 is the default behaviour (identical frames)");
+    }
+    // Values in between pull partway, and the setting moves smoothly when it changes mid-ride.
+    {
+        Turner turner;
+        float previous_error = 1.0e9f;
+        for (const float level : {0.0f, 3.0f, 6.0f, 10.0f}) {
+            CameraSettings cs;
+            cs.follow.horizontal = level;
+            CameraMan cam = make_camera(cs);
+            std::vector<Frame> frames;
+            drive_between(cam, turner, world, 0.0f, 6.0f, 60.0f, frames);
+            float err = 0.0f;
+            for (std::size_t i = 150; i < frames.size(); ++i) err = std::max(err, behind_error_deg(frames[i], turner.at(static_cast<float>(i) / 60.0f)));
+            expect(err < previous_error, "horizontal follow: a higher setting keeps the camera closer to straight behind");
+            previous_error = err;
+        }
+        for (const float fps : {30.0f, 60.0f, 144.0f}) {
+            CameraSettings before;
+            CameraMan cam = make_camera(before);
+            std::vector<Frame> frames;
+            drive_between(cam, turner, world, 0.0f, 3.0f, fps, frames);
+            CameraSettings after = before;
+            after.follow.horizontal = 10.0f;
+            expect(cam.set_settings(after), "horizontal follow: settings accepted mid-ride");
+            drive_between(cam, turner, world, 3.0f, 8.0f, fps, frames);
+            float worst_step = 0.0f;
+            for (std::size_t i = 1; i < frames.size(); ++i)
+                worst_step = std::max(worst_step, length(sub(sub(frames[i].pos, turner.at(static_cast<float>(i) / fps).position),
+                                                           sub(frames[i - 1].pos, turner.at(static_cast<float>(i - 1) / fps).position))));
+            expect(worst_step < 8.0f / fps, fps_tag("horizontal follow", fps) + "switching 0 -> 10 mid-turn does not snap the camera");
+            expect(behind_error_deg(frames.back(), turner.at(7.99f)) < 6.0f, fps_tag("horizontal follow", fps) + "and it ends straight behind");
+        }
+    }
+    // Slower than ~1 m/s the rig heading is kept: the weight fades out instead of the camera chasing a noisy direction.
+    {
+        Turner crawl;
+        crawl.speed = 0.4f;
+        CameraSettings cs;
+        cs.follow.horizontal = 10.0f;
+        CameraMan cam = make_camera(cs);
+        std::vector<Frame> frames;
+        drive_between(cam, crawl, world, 0.0f, 6.0f, 60.0f, frames);
+        expect(frames.back().debug.follow_weight < 0.02f, "horizontal follow: at 0.4 m/s the follow weight is out (the rig heading is kept)");
+    }
+    // Trick yaw goes on top: in a long air on a straight line the camera sits the trick-yaw angle off straight behind.
+    {
+        Script script;
+        script.rider.speed = 6.0f;
+        script.airs.push_back({2.0f, 5.0f});
+        CameraSettings cs;
+        cs.follow.horizontal = 10.0f;
+        cs.trick_yaw.enabled = true;
+        cs.trick_yaw.angle_degrees = 25.0f;
+        cs.trick_yaw.side = 1;
+        CameraMan cam = make_camera(cs);
+        std::vector<Frame> frames;
+        drive_between(cam, script, world, 0.0f, 4.5f, 60.0f, frames);
+        const Frame& held = frame_at(frames, 4.4f, 60.0f);
+        const float error = behind_error_deg(held, script.at(4.4f));
+        expect(close_to(held.debug.trick_yaw / degrees, 25.0f, 1.0f), "horizontal follow + trick yaw: the swing reached its angle");
+        expect(close_to(error, 25.0f, 4.0f), "horizontal follow + trick yaw: the camera sits the trick-yaw angle off straight behind");
+        const Frame& rest = frame_at(frames, 1.9f, 60.0f);
+        expect(behind_error_deg(rest, script.at(1.9f)) < 4.0f, "horizontal follow + trick yaw: straight behind before the trick");
+    }
+}
+
+// ---------------------------------------------------------------- task 3: leaving a manual / grind close-up
+
+struct ExitRun {
+    std::vector<Frame> frames;
+    float fps = 60.0f, exit_time = 5.0f;
+};
+// A rider at 7 m/s in a manual (kind 0) or a grind (kind 1) from 2 s to 5 s that then ollies out.
+ExitRun run_exit(const CameraSettings& cs, int kind, float fps) {
+    Script script;
+    script.rider.speed = 7.0f;
+    script.rider.has_ollie = true;
+    script.rider.ollie_time = 5.0f;
+    (kind == 0 ? script.manuals : script.grinds).push_back({2.0f, 5.0f});
+    World world;
+    world.upper_y = -1000.0f;
+    CameraMan cam = make_camera(cs);
+    ExitRun run;
+    run.fps = fps;
+    drive_between(cam, script, world, 0.0f, 9.0f, fps, run.frames);
+    return run;
+}
+
+void test_exit_closeup_is_smooth() {
+    for (const int kind : {0, 1}) {
+        for (const float fps : {30.0f, 60.0f, 144.0f}) {
+            CameraSettings cs;
+            // A pronounced close-up so that the distance change leaving it is clearly bigger than 1 m.
+            cs.framing.manual_distance_scale = 0.5f;
+            cs.framing.grind_distance_scale = 0.6f;
+            const ExitRun run = run_exit(cs, kind, fps);
+            const std::string tag = fps_tag(kind == 0 ? "manual exit" : "grind exit", fps);
+            const float before = frame_at(run.frames, 4.9f, fps).debug.distance;
+            // The distance the exit settles at: where the camera is 3 s after the ollie (back in the chase / landing).
+            const float settled = frame_at(run.frames, 8.5f, fps).debug.distance;
+            expect(std::abs(settled - before) > 0.8f, tag + "the script changes the distance by more than 0.8 m");
+            // 10% to 90% of the way from `before` to `settled`, searched in the first 2 s after the exit.
+            float t10 = -1.0f, t90 = -1.0f, worst_step = 0.0f;
+            for (std::size_t i = static_cast<std::size_t>(std::lround(4.9f * fps)); i < static_cast<std::size_t>(std::lround(7.0f * fps)); ++i) {
+                const float d = run.frames[i].debug.distance;
+                const float t = static_cast<float>(i) / fps;
+                const float progress = (d - before) / (settled - before);
+                if (t10 < 0.0f && progress >= 0.1f) t10 = t;
+                if (t90 < 0.0f && progress >= 0.9f) t90 = t;
+                worst_step = std::max(worst_step, std::abs(d - run.frames[i - 1].debug.distance));
+            }
+            std::printf("  %s%s: distance %.2f -> %.2f m, 10%% at +%.2f s, 90%% at +%.2f s (%.2f s between), worst step %.3f m\n", tag.c_str(),
+                        kind == 0 ? "manual" : "grind", static_cast<double>(before), static_cast<double>(settled), static_cast<double>(t10 - 5.0f),
+                        static_cast<double>(t90 - 5.0f), static_cast<double>(t90 - t10), static_cast<double>(worst_step));
+            expect(t10 >= 0.0f && t90 >= 0.0f, tag + "the distance gets there");
+            expect(t10 - 5.0f >= 0.2f, tag + "and it starts gently: not 10% of the way in the first 0.2 s after the ollie");
+            expect(t90 - t10 >= 0.6f, tag + "the distance change takes at least 0.6 s from 10% to 90%");
+            expect(worst_step < 0.05f * std::max(1.0f, 60.0f / fps), tag + "no frame moves the distance by more than 5 cm (per 1/60 s)");
+            // The camera itself: no frame step of the camera relative to the rider above a small bound.
+            Script script;
+            script.rider.speed = 7.0f;
+            script.rider.has_ollie = true;
+            script.rider.ollie_time = 5.0f;
+            float worst_camera = 0.0f;
+            for (std::size_t i = static_cast<std::size_t>(std::lround(4.5f * fps)); i < static_cast<std::size_t>(std::lround(7.0f * fps)); ++i) {
+                const Vec3 o_now = sub(run.frames[i].pos, script.at(static_cast<float>(i) / fps).position);
+                const Vec3 o_prev = sub(run.frames[i - 1].pos, script.at(static_cast<float>(i - 1) / fps).position);
+                worst_camera = std::max(worst_camera, length(sub(o_now, o_prev)));
+            }
+            expect(worst_camera < 8.0f / fps, tag + "the camera moves at most 8 m/s relative to the rider through the exit");
+        }
+    }
+    // The transition itself is at least 0.9 s when leaving a close-up and unchanged for other shots.
+    {
+        CameraSettings cs;
+        const ExitRun run = run_exit(cs, 0, 60.0f);
+        bool long_transition = false;
+        float first_air = -1.0f, done = -1.0f;
+        for (std::size_t i = 290; i < run.frames.size(); ++i) {
+            const float t = static_cast<float>(i) / 60.0f;
+            if (first_air < 0.0f && std::string(run.frames[i].debug.shot_name).rfind("air", 0) == 0) first_air = t;
+            if (first_air >= 0.0f && done < 0.0f && run.frames[i].debug.exit_blend >= 1.0f) done = t;
+        }
+        long_transition = first_air > 0.0f && done - first_air >= 0.85f;
+        expect(long_transition, "exit: the distance ease after leaving the manual runs at least 0.9 s");
+    }
+}
+
+// ---------------------------------------------------------------- task 4: manual / grind floor, grind settings
+
+void test_manual_grind_floor() {
+    for (const int kind : {0, 1}) {
+        for (const float fps : {30.0f, 60.0f, 144.0f}) {
+            CameraSettings cs;
+            // A low camera that would sit below the board: a steep negative height on the close-up shots.
+            cs.framing.manual_height_degrees = -30.0f;
+            cs.framing.grind_height_degrees = -30.0f;
+            cs.framing.height_degrees = -20.0f;
+            cs.framing.manual_distance_scale = 1.0f;
+            cs.framing.grind_distance_scale = 1.4f;
+            Script script;
+            script.rider.speed = 7.0f;
+            (kind == 0 ? script.manuals : script.grinds).push_back({2.0f, 7.0f});
+            World world;
+            world.upper_y = -1000.0f;
+            CameraMan cam = make_camera(cs);
+            std::vector<Frame> frames;
+            drive_between(cam, script, world, 0.0f, 9.0f, fps, frames);
+            const std::string tag = fps_tag(kind == 0 ? "manual floor" : "grind floor", fps);
+            const float board_y = root_height - cs.points.board_drop;
+            float lowest = 1.0e9f, highest_pitch = -1.0e9f, worst_y_step = 0.0f, worst_pitch_step = 0.0f;
+            for (std::size_t i = 1; i < frames.size(); ++i) {
+                const float t = static_cast<float>(i) / fps;
+                worst_y_step = std::max(worst_y_step, std::abs(frames[i].pos[1] - frames[i - 1].pos[1]));
+                worst_pitch_step = std::max(worst_pitch_step, std::abs(view_pitch_deg(frames[i]) - view_pitch_deg(frames[i - 1])));
+                if (t < 3.5f || t > 7.0f) continue; // settled in the close-up
+                lowest = std::min(lowest, frames[i].pos[1] - board_y);
+                highest_pitch = std::max(highest_pitch, view_pitch_deg(frames[i]));
+            }
+            std::printf("  %slowest camera above the board %.3f m, highest view pitch %.2f deg, worst y step %.3f m, worst pitch step %.2f deg\n", tag.c_str(),
+                        static_cast<double>(lowest), static_cast<double>(highest_pitch), static_cast<double>(worst_y_step), static_cast<double>(worst_pitch_step));
+            expect(lowest >= 0.3f - 0.005f, tag + "the camera stays at least 0.3 m above the board");
+            expect(highest_pitch <= 0.5f, tag + "the view does not look up (pitch at most 0.5 deg)");
+            expect(frame_at(frames, 6.0f, fps).debug.floor_weight > 0.95f, tag + "the floor is fully on in the close-up");
+            expect(frame_at(frames, 8.9f, fps).debug.floor_weight < 0.05f, tag + "and off again afterwards");
+            expect(worst_y_step < 4.0f / fps, tag + "no frame lifts the camera by more than 4 m/s (the floor eases)");
+            expect(worst_pitch_step < 40.0f / fps, tag + "the view pitch turns at most 40 deg/s");
+            // Eased in: right after the shot starts the weight is far from 1.
+            expect(frame_at(frames, 2.05f, fps).debug.floor_weight < 0.3f, tag + "the floor weight eases in (not a jump)");
+        }
+    }
+    // Without the floor's reason (a chase) nothing changes: weight 0 on the flat.
+    {
+        Script script;
+        World world;
+        world.upper_y = -1000.0f;
+        CameraMan cam;
+        std::vector<Frame> frames;
+        drive_between(cam, script, world, 0.0f, 3.0f, 60.0f, frames);
+        expect(frames.back().debug.floor_weight == 0.0f, "floor: the chase has no floor weight");
+    }
+}
+
+FrameDebug grind_debug(const CameraSettings& cs) {
+    Script script;
+    script.rider.speed = 7.0f;
+    script.grinds.push_back({0.0f, 100.0f});
+    World world;
+    world.upper_y = -1000.0f;
+    CameraMan cam = make_camera(cs);
+    std::vector<Frame> frames;
+    drive_between(cam, script, world, 0.0f, 5.0f, 60.0f, frames);
+    return frames.back().debug;
+}
+
+void test_grind_framing_settings() {
+    const FrameDebug base = grind_debug(CameraSettings{});
+    expect(std::string(base.shot_name) == "grind_flat", "grind framing: the script is a flat grind");
+    CameraSettings wide;
+    wide.framing.grind_distance_scale = 2.0f;
+    expect(close_to(grind_debug(wide).distance, base.distance * 2.0f, 0.04f), "grind framing: grind_distance_scale multiplies the grind shot's own distance");
+    CameraSettings tight;
+    tight.framing.grind_distance_scale = 0.5f;
+    expect(close_to(grind_debug(tight).distance, base.distance * 0.5f, 0.04f), "grind framing: and 0.5 halves it");
+    CameraSettings tall;
+    tall.framing.grind_height_degrees = 15.0f;
+    expect(close_to(grind_debug(tall).elevation - base.elevation, 15.0f * degrees, 0.4f * degrees), "grind framing: grind_height_degrees adds to the grind elevation");
+    CameraSettings both;
+    both.framing.grind_height_degrees = 10.0f;
+    both.framing.height_degrees = 4.0f;
+    both.framing.distance_scale = 1.25f;
+    both.framing.grind_distance_scale = 0.8f;
+    const FrameDebug b = grind_debug(both);
+    expect(close_to(b.elevation - base.elevation, 14.0f * degrees, 0.4f * degrees), "grind framing: grind_height_degrees stacks with height_degrees");
+    expect(close_to(b.distance, base.distance * 1.25f * 0.8f, 0.04f), "grind framing: grind_distance_scale stacks with distance_scale");
+    // Off: the grind shots keep their own distance and elevation (apart from the general framing).
+    CameraSettings off;
+    off.framing.grind_camera = false;
+    off.framing.grind_distance_scale = 2.0f;
+    off.framing.grind_height_degrees = 20.0f;
+    const FrameDebug o = grind_debug(off);
+    expect(close_to(o.distance, base.distance, 0.02f) && close_to(o.elevation, base.elevation, 0.2f * degrees), "grind framing: grind_camera off applies no grind scale or height");
+    // The chase and the manual are not touched by the grind settings.
+    const FrameDebug chase_ref = settled_debug(CameraSettings{}, 7.0f, false);
+    const FrameDebug chase_wide = settled_debug(wide, 7.0f, false);
+    expect(close_to(chase_ref.distance, chase_wide.distance, 1e-3f), "grind framing: the chase ignores the grind settings");
+    // Per angle: Low uses framing, High uses framing_high.
+    CameraSettings angles;
+    angles.framing.grind_distance_scale = 1.5f;
+    angles.framing_high.grind_distance_scale = 0.5f;
+    angles.framing_high.grind_height_degrees = 12.0f;
+    angles.angle = CameraAngle::Low;
+    const FrameDebug low = grind_debug(angles);
+    CameraSettings plain_high;
+    plain_high.angle = CameraAngle::High;
+    const FrameDebug high_ref = grind_debug(plain_high);
+    angles.angle = CameraAngle::High;
+    const FrameDebug high = grind_debug(angles);
+    expect(close_to(low.distance, base.distance * 1.5f, 0.04f), "grind framing: Low uses framing.grind_distance_scale");
+    expect(close_to(high.distance, high_ref.distance * 0.5f, 0.04f), "grind framing: High uses framing_high.grind_distance_scale");
+    expect(close_to(high.elevation - high_ref.elevation, 12.0f * degrees, 0.4f * degrees), "grind framing: High uses framing_high.grind_height_degrees");
+    // Valid() range checks exist for the new fields.
+    CameraSettings bad;
+    bad.framing.grind_distance_scale = 5.0f;
+    CameraMan cam;
+    expect(!cam.set_settings(bad), "grind framing: an out-of-range grind_distance_scale is rejected");
+    bad = CameraSettings{};
+    bad.framing_high.grind_height_degrees = 90.0f;
+    expect(!cam.set_settings(bad), "grind framing: an out-of-range grind_height_degrees is rejected");
+}
+
+// ---------------------------------------------------------------- task 5: framing changes show at once
+
+void test_framing_changes_apply_quickly() {
+    World world;
+    world.upper_y = -1000.0f;
+    Script script;
+    script.rider.speed = 6.0f;
+    for (const float fps : {30.0f, 60.0f, 144.0f}) {
+        const std::string tag = fps_tag("height", fps);
+        CameraSettings before;
+        CameraMan cam = make_camera(before);
+        std::vector<Frame> frames;
+        drive_between(cam, script, world, 0.0f, 4.0f, fps, frames);
+        const float rel_before = frames.back().pos[1] - script.at(3.99f).position[1];
+        CameraSettings after = before;
+        after.framing.height_degrees = 15.0f;
+        expect(cam.set_settings(after), tag + "settings accepted mid-ride");
+        drive_between(cam, script, world, 4.0f, 9.0f, fps, frames);
+        const auto rel = [&](float time) { return frame_at(frames, time, fps).pos[1] - script.at(time).position[1]; };
+        const float rel_final = rel(8.9f);
+        const float change = rel_final - rel_before;
+        std::printf("  %sheight +15 deg: camera %.3f -> %.3f m above the rider; +0.3 s %.0f%%, +0.6 s %.0f%%\n", tag.c_str(), static_cast<double>(rel_before),
+                    static_cast<double>(rel_final), static_cast<double>(100.0f * (rel(4.3f) - rel_before) / change),
+                    static_cast<double>(100.0f * (rel(4.6f) - rel_before) / change));
+        expect(change > 0.4f, tag + "the new height is clearly higher");
+        expect(close_to(rel(4.6f), rel_final, 0.1f * change), tag + "within 0.6 s the camera is at the new height (90%)");
+        expect(rel(4.05f) - rel_before < 0.3f * change, tag + "and it did not jump at once");
+        float worst = 0.0f;
+        for (std::size_t i = static_cast<std::size_t>(std::lround(4.0f * fps)); i < frames.size(); ++i)
+            worst = std::max(worst, std::abs((frames[i].pos[1] - script.at(static_cast<float>(i) / fps).position[1]) -
+                                             (frames[i - 1].pos[1] - script.at(static_cast<float>(i - 1) / fps).position[1])));
+        expect(worst < 3.0f / fps, tag + "no frame step above 3 m/s while it moves");
+        // The shot's own elevation still goes through the slow tracker: the rig elevation is not what moves.
+        expect(close_to(frame_at(frames, 8.9f, fps).debug.height_offset, 15.0f * degrees, 0.1f * degrees), tag + "the offset settles at the setting");
+    }
+    // Distance and pitch changes also show quickly.
+    for (const float fps : {30.0f, 60.0f, 144.0f}) {
+        const std::string tag = fps_tag("distance / pitch", fps);
+        CameraSettings before;
+        CameraMan cam = make_camera(before);
+        std::vector<Frame> frames;
+        drive_between(cam, script, world, 0.0f, 4.0f, fps, frames);
+        const float distance_before = frames.back().debug.distance;
+        CameraSettings after = before;
+        after.framing.distance_scale = 1.5f;
+        expect(cam.set_settings(after), tag + "settings accepted mid-ride");
+        drive_between(cam, script, world, 4.0f, 9.0f, fps, frames);
+        const float distance_final = frame_at(frames, 8.9f, fps).debug.distance;
+        const float d_share = (frame_at(frames, 4.5f, fps).debug.distance - distance_before) / (distance_final - distance_before);
+        // The pitch alone, in a second run (the distance change moves the view pitch too).
+        CameraMan pitch_cam = make_camera(before);
+        std::vector<Frame> pitch_frames;
+        drive_between(pitch_cam, script, world, 0.0f, 4.0f, fps, pitch_frames);
+        const float pitch_before = view_pitch_deg(pitch_frames.back());
+        CameraSettings pitched = before;
+        pitched.framing.pitch_degrees = 8.0f;
+        expect(pitch_cam.set_settings(pitched), tag + "pitch settings accepted mid-ride");
+        drive_between(pitch_cam, script, world, 4.0f, 9.0f, fps, pitch_frames);
+        const float pitch_final = view_pitch_deg(frame_at(pitch_frames, 8.9f, fps));
+        const float p_share = (view_pitch_deg(frame_at(pitch_frames, 4.5f, fps)) - pitch_before) / (pitch_final - pitch_before);
+        const float p_share_1s = (view_pitch_deg(frame_at(pitch_frames, 5.0f, fps)) - pitch_before) / (pitch_final - pitch_before);
+        std::printf("  %sdistance %.2f -> %.2f m (%.0f%% at +0.5 s), pitch %.1f -> %.1f deg (%.0f%% at +0.5 s, %.0f%% at +1 s)\n", tag.c_str(),
+                    static_cast<double>(distance_before), static_cast<double>(distance_final), static_cast<double>(100.0f * d_share),
+                    static_cast<double>(pitch_before), static_cast<double>(pitch_final), static_cast<double>(100.0f * p_share),
+                    static_cast<double>(100.0f * p_share_1s));
+        expect(d_share > 0.9f, tag + "the distance change shows within 0.5 s (90%)");
+        expect(pitch_final - pitch_before > 6.0f, tag + "the pitch setting moves the view by about its amount");
+        expect(p_share > 0.6f && p_share_1s > 0.85f, tag + "and the pitch change is well under way within 0.5 s (60%) and nearly done in 1 s (85%)");
+    }
+}
+
 int main() {
     test_manual_grind_focus();
     test_framing_per_angle();
@@ -1936,6 +2556,12 @@ int main() {
     test_trick_yaw_triggers();
     test_trick_yaw_disable_and_cut();
     test_landing_impulse_in_game();
+    test_landing_from_fall();
+    test_horizontal_follow();
+    test_exit_closeup_is_smooth();
+    test_manual_grind_floor();
+    test_grind_framing_settings();
+    test_framing_changes_apply_quickly();
     if (failures == 0) std::printf("s3cam_layers_tests: all passed\n");
     return failures == 0 ? 0 : 1;
 }

@@ -145,7 +145,7 @@ struct Run {
     float predicted_air{}, predicted_drop{}, predicted_height{};
     bool predicted{};
     double landed_at{};
-    float landed_air{}, landed_drop{}, landing_impulse{}, landing_speed{};
+    float landed_air{}, landed_drop{}, landing_impulse{}, landing_speed{}, landing_fall{}, landing_fraction{};
     bool landing_pending{};
     std::uint32_t landings{};
     // Per flight: the largest frame-to-frame changes, to find what twitches in big airs.
@@ -245,10 +245,10 @@ void log_landing(const Run& r) {
     };
     logging::log(Level::info, Channel::skater,
         "s3cam landing #{}: air {:.2f} s (predicted {}), drop {:+.2f} m (predicted {}), apex {}, "
-        "speed {:.1f} m/s, shake impulse peak {:.3f} | in the air: fov {:.1f}-{:.1f} (largest step {:.2f}), "
+        "speed {:.1f} m/s, fell {:.2f} m (shake {:.0f}%), shake impulse peak {:.3f} | in the air: fov {:.1f}-{:.1f} (largest step {:.2f}), "
         "largest turn {:.2f} deg/frame, largest jerk {:.3f} m, landing look {:.2f}, collision pull {:.2f} m",
         r.landings, r.landed_air, predicted(r.predicted_air, "s", false), r.landed_drop, predicted(r.predicted_drop, "m", true),
-        predicted(r.predicted_height, "m", false), r.landing_speed, r.landing_impulse, r.flight_fov_min, r.flight_fov_max,
+        predicted(r.predicted_height, "m", false), r.landing_speed, r.landing_fall, r.landing_fraction * 100.0f, r.landing_impulse, r.flight_fov_min, r.flight_fov_max,
         r.flight_fov_jump, r.flight_turn, r.flight_jerk, r.flight_look, r.flight_pull);
 }
 
@@ -300,6 +300,8 @@ void watch_frame(Run& r, const Watch& w, const s3cam::Frame& frame, double now) 
         r.landed_drop = w.subject.position[1] - r.takeoff_y;
         r.landing_speed = s3cam::length(w.subject.velocity);
         r.landing_impulse = d.impulse;
+        r.landing_fall = d.landing_fall;
+        r.landing_fraction = d.landing_fraction;
         r.landing_pending = true;
     }
     r.airborne = d.airborne;

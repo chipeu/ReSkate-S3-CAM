@@ -189,6 +189,18 @@ public:
         return true;
     }
 
+    // Landing impulse from a 0..1 fraction of how hard the landing was (Alpha 5: CameraMan measures it from
+    // the fall height instead of the board's velocity, which flip tricks spike). Same squared shaping as
+    // landing_impulse; one_shot_magnitude is the full-strength amount. Never lowers the impulse.
+    bool landing_impulse_fraction(float fraction, const ShakeSettings& s, float magnitude_scale = 1.0f) {
+        if (!std::isfinite(fraction)) return false;
+        const float f = clamp01(fraction);
+        const float impulse = f * f * s.one_shot_magnitude * magnitude_scale;
+        if (!(impulse > impulse_)) return false;
+        impulse_ = impulse;
+        return true;
+    }
+
     // One fixed update (ShakeEffect::update). `speed` is skater speed in m/s, `distance` the camera
     // distance to the subject in metres, `enabled` fades the whole effect in/out.
     ShakeOutput update(float dt, float speed, float distance, bool enabled, const ShakeSettings& s,

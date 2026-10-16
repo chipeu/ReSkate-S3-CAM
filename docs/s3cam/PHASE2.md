@@ -161,3 +161,12 @@ landing had a shake impulse of 0 (angle weighting); the map / customisation hand
 3. Manual and grind: the camera aims lower (board / legs).
 4. Low and High with different positions; R3 switches between them smoothly.
 5. Send `logs\ReSkate.log` (look for `s3cam game paused`).
+
+## Alpha 5 (Alpha 4 run)
+
+Worked in game: replay editor, phone menu and quick drop on board; quarter-pipe airs.
+Changes: landing shake from how far the skater fell (peak to landing) plus a little speed, not the
+board's touchdown velocity (a flat nollie no longer shakes fully); horizontal follow 0-10; exits from
+manual / grind close-ups blend over ~0.9 s; camera kept 0.3 m above the board in manuals and grinds;
+camera height changes show within ~0.5 s; manual and grind close-ups per Low / High; plain tooltips.
+The landing log line now shows the fall and the shake percentage.

@@ -233,3 +233,6 @@ with file:line and a concrete failure scenario. Do not edit code.
   height, rise, keep on screen; Native+ too), manual/grind focus, Low/High positions, plain-named
   tabbed page, presets cleanup and forward compatibility (Sonnet x2 + Opus glue, reviewed). Next:
   Aescher's Alpha 4 run.
+- 2026-10-16: Alpha 4 fixes (menu flag hand-back, air collision smoothing) confirmed in game; Alpha 5:
+  fall-based landing shake, horizontal follow, smooth close-up exits, board floor in manuals/grinds,
+  immediate height, per-camera manual/grind close-ups, plain tooltips (Sonnet x2, reviewed).
