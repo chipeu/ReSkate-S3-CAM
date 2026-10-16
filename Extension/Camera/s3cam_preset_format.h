@@ -73,6 +73,9 @@ template <class Options, class Visit> void visit_fields(cfg::CameraSettings& cam
     visit("S3Cam.Framing.ManualCamera", camera.framing, &cfg::FramingSettings::manual_camera);
     visit("S3Cam.Framing.ManualDistanceScale", camera.framing, &cfg::FramingSettings::manual_distance_scale);
     visit("S3Cam.Framing.ManualHeightDegrees", camera.framing, &cfg::FramingSettings::manual_height_degrees);
+    visit("S3Cam.Framing.GrindCamera", camera.framing, &cfg::FramingSettings::grind_camera);
+    visit("S3Cam.Framing.GrindDistanceScale", camera.framing, &cfg::FramingSettings::grind_distance_scale);
+    visit("S3Cam.Framing.GrindHeightDegrees", camera.framing, &cfg::FramingSettings::grind_height_degrees);
 
     // The High camera's position (the Low one keeps the S3Cam.Framing.* keys, so old presets still mean Low).
     visit("S3Cam.FramingHigh.DistanceScale", camera.framing_high, &cfg::FramingSettings::distance_scale);
@@ -81,6 +84,9 @@ template <class Options, class Visit> void visit_fields(cfg::CameraSettings& cam
     visit("S3Cam.FramingHigh.ManualCamera", camera.framing_high, &cfg::FramingSettings::manual_camera);
     visit("S3Cam.FramingHigh.ManualDistanceScale", camera.framing_high, &cfg::FramingSettings::manual_distance_scale);
     visit("S3Cam.FramingHigh.ManualHeightDegrees", camera.framing_high, &cfg::FramingSettings::manual_height_degrees);
+    visit("S3Cam.FramingHigh.GrindCamera", camera.framing_high, &cfg::FramingSettings::grind_camera);
+    visit("S3Cam.FramingHigh.GrindDistanceScale", camera.framing_high, &cfg::FramingSettings::grind_distance_scale);
+    visit("S3Cam.FramingHigh.GrindHeightDegrees", camera.framing_high, &cfg::FramingSettings::grind_height_degrees);
 
     visit("S3Cam.AirCamera.FollowHeight", camera.air_camera, &cfg::AirCameraSettings::follow_height);
     visit("S3Cam.AirCamera.RiseDegrees", camera.air_camera, &cfg::AirCameraSettings::rise_degrees);
@@ -115,6 +121,7 @@ template <class Options, class Visit> void visit_fields(cfg::CameraSettings& cam
     visit("S3Cam.Follow.Dynamic", camera.follow, &cfg::FollowSettings::dynamic);
     visit("S3Cam.Follow.DynamicSpeed", camera.follow, &cfg::FollowSettings::dynamic_speed);
     visit("S3Cam.Follow.DynamicBoost", camera.follow, &cfg::FollowSettings::dynamic_boost);
+    visit("S3Cam.Follow.Horizontal", camera.follow, &cfg::FollowSettings::horizontal);
 
     visit("S3Cam.Fov.ShotLens", camera.fov, &cfg::FovSettings::shot_fov);
     visit("S3Cam.Fov.SpeedFov", camera.fov, &cfg::FovSettings::speed_fov);
@@ -127,6 +134,9 @@ template <class Options, class Visit> void visit_fields(cfg::CameraSettings& cam
     visit("S3Cam.Fov.SmoothingTime", camera.fov, &cfg::FovSettings::smoothing_time);
 
     visit("S3Cam.Shake.LandingStrength", camera.shake, &cfg::ShakeSettings::one_shot_magnitude);
+    visit("S3Cam.LandingShake.MinFall", camera.landing_shake, &cfg::LandingShakeSettings::min_fall);
+    visit("S3Cam.LandingShake.FullFall", camera.landing_shake, &cfg::LandingShakeSettings::full_fall);
+    visit("S3Cam.LandingShake.SpeedWeight", camera.landing_shake, &cfg::LandingShakeSettings::speed_weight);
     visit("S3Cam.SpeedShake.Enabled", camera.speed_shake, &cfg::SpeedShakeSettings::enabled);
     visit("S3Cam.SpeedShake.Strength", camera.speed_shake, &cfg::SpeedShakeSettings::strength);
     visit("S3Cam.SpeedShake.TopSpeed", camera.speed_shake, &cfg::SpeedShakeSettings::top_speed);
@@ -299,6 +309,7 @@ inline void drop_invalid_groups(cfg::CameraSettings& camera) noexcept {
     fix(camera.framing_high);
     fix(camera.trick_yaw);
     fix(camera.air_camera);
+    fix(camera.landing_shake);
 }
 
 // Applies every value `source` has over `camera` and `options`. A field is accepted on its own; a
@@ -337,7 +348,7 @@ using Values = std::vector<std::pair<std::string, Json>>;
 // Every saved key and value, in the table's order.
 template <class Options> Values collect_values(cfg::CameraSettings camera, Options options) {
     Values values;
-    values.reserve(80);
+    values.reserve(96);
     visit_fields(camera, options, [&values](const char* key, auto& group, auto member) {
         using Value = std::remove_cvref_t<decltype(group.*member)>;
         if constexpr (std::is_same_v<Value, float>) values.emplace_back(key, Json(tidy(group.*member)));

@@ -62,7 +62,7 @@ bool pick(Draft& draft, bool& dirty, const char* label, const char* id, int& sel
 // What the page remembers between frames (there is one overlay and one such page).
 struct PageState {
     int tab = 0;
-    int position_for = -1; // CAMERA POSITION edits 0 = the Low camera, 1 = the High one; -1 until first drawn
+    int position_for = -1; // CAMERA POSITION, MANUAL and GRIND edit 0 = the Low camera, 1 = the High one; -1 until first drawn
 };
 PageState& page_state() {
     static PageState state;
@@ -99,8 +99,8 @@ void camera_card(Draft& draft) {
     begin_card(draft.menu, "s3cam-camera", "CAMERA");
     int chosen_style = draft.next.preset == dingosdk::s3cam::CameraPreset::NativePlus ? 1 : 0;
     if (pick(draft, draft.next_changed, "Style", "s3cam-style", chosen_style, {"Full", "Native+"}, true,
-            {"This camera does everything.",
-             "Keeps the game's camera and adds the air, landing and shake effects."}))
+            {"This camera controls the whole view.",
+             "The game's own camera, plus this camera's air, landing and shake effects."}))
         draft.next.preset = chosen_style == 1 ? dingosdk::s3cam::CameraPreset::NativePlus : dingosdk::s3cam::CameraPreset::FullS3;
 
     int height = draft.next.angle == dingosdk::s3cam::CameraAngle::High ? 1 : 0;
@@ -113,18 +113,27 @@ void camera_card(Draft& draft) {
     end_card();
 }
 
+// The Low / High switch shared by the position, manual and grind cards (the one the player last chose).
+void camera_for_switch(Draft& draft, PageState& state, const char* label, const char* id, const char* low_tip, const char* high_tip) {
+    if (state.position_for < 0) state.position_for = draft.next.angle == dingosdk::s3cam::CameraAngle::High ? 1 : 0;
+    pick(draft, draft.next_changed, label, id, state.position_for, {"Low", "High"}, true, {low_tip, high_tip});
+}
+
+dingosdk::s3cam::FramingSettings& framing_for(Draft& draft, const PageState& state) {
+    return state.position_for == 1 ? draft.next.framing_high : draft.next.framing;
+}
+
 // Where the camera sits, kept separately for Low and High.
 void camera_position_card(Draft& draft, PageState& state) {
-    if (state.position_for < 0) state.position_for = draft.next.angle == dingosdk::s3cam::CameraAngle::High ? 1 : 0;
     begin_card(draft.menu, "s3cam-position", "CAMERA POSITION");
-    pick(draft, draft.next_changed, "Set position for", "s3cam-position-for", state.position_for, {"Low", "High"}, true,
-        {"Edit where the Low camera sits.", "Edit where the High camera sits."});
-    auto& framing = state.position_for == 1 ? draft.next.framing_high : draft.next.framing;
-    set_slider(draft, "Distance", "How far the camera sits behind you. 1 is normal; less comes closer, more pulls back.",
+    camera_for_switch(draft, state, "Set position for", "s3cam-position-for", "Edit where the Low camera sits.",
+        "Edit where the High camera sits.");
+    auto& framing = framing_for(draft, state);
+    set_slider(draft, "Distance", "Higher: the camera sits further behind you. Lower: closer to you. 1x is normal.",
         framing.distance_scale, 0.4f, 3.0f, "%.2fx");
-    set_slider(draft, "Height", "Raises or lowers the camera around you. Higher looks down on you more.",
+    set_slider(draft, "Height", "Higher: the camera sits further above you and looks down on you. Lower: closer to the ground.",
         framing.height_degrees, -30.0f, 45.0f, "%.1f degrees");
-    set_slider(draft, "Tilt", "Aims the camera up or down without moving it. Positive looks up, negative looks down.",
+    set_slider(draft, "Tilt", "Higher: the view tilts up and shows more sky. Lower: it tilts down and shows more ground. The camera itself does not move.",
         framing.pitch_degrees, -30.0f, 30.0f, "%.1f degrees");
     end_card();
 }
@@ -132,10 +141,10 @@ void camera_position_card(Draft& draft, PageState& state) {
 void fov_override_card(Draft& draft) {
     begin_card(draft.menu, "s3cam-fov", "FIELD OF VIEW");
     toggle(draft, draft.chosen_changed, "FOV override",
-        "On: this camera sets the field of view, including the widening with speed and in big airs. Off: the game's own field of view.",
+        "On: this camera sets how wide the view is, including widening with speed and in big airs. Off: the game's own width.",
         draft.chosen.shot_fov);
     ImGui::BeginDisabled(!draft.chosen.shot_fov);
-    field(draft.menu, "FOV", "Field of view in degrees. Pick 0 to keep the game's own.");
+    field(draft.menu, "FOV", "Higher: a wider view that shows more around you. Lower: a narrower, more zoomed-in view. 0 keeps the game's own.");
     int degrees = static_cast<int>(std::lround(draft.next.fov_override_deg));
     if (ImGui::SliderInt("##s3cam-fov-override", &degrees, 0, 120, degrees > 0 ? "%d degrees" : "Game's own",
             ImGuiSliderFlags_AlwaysClamp)) {
@@ -153,16 +162,16 @@ void fov_override_card(Draft& draft) {
 void big_air_card(Draft& draft) {
     auto& air = draft.next.air_camera;
     begin_card(draft.menu, "s3cam-big-air", "BIG AIR");
-    set_toggle(draft, "Keep skater on screen", "Aims the camera so you never leave the screen in the air.", air.keep_in_frame);
+    set_toggle(draft, "Keep skater on screen", "Turns the camera so you do not leave the screen while you are in the air.", air.keep_in_frame);
     set_slider(draft, "Big air: follow height",
-        "How much the camera rises with you in a big air. 0 stays at the takeoff height, 1 rises all the way.",
+        "Higher: the camera rises more with you in a big air. Lower: it stays near the height you took off from.",
         air.follow_height, 0.0f, 1.0f, "%.2f");
     set_slider(draft, "Big air: camera rise",
-        "How far the camera swings up over you in a big air, so it looks down at the landing.", air.rise_degrees, 0.0f, 60.0f,
+        "Higher: in a big air the camera swings further up over you and looks down at the landing. Lower: it stays behind you.", air.rise_degrees, 0.0f, 60.0f,
         "%.0f degrees");
-    set_slider(draft, "Big air: full at height", "How high (or how far down) the jump goes for the full rise.",
+    set_slider(draft, "Big air: full at height", "Higher: only very big jumps or drops get the full rise. Lower: even small ones do.",
         air.rise_full_height, 0.1f, 20.0f, "%.1f m");
-    set_slider(draft, "Big air: ease time", "How long the rise takes to build up and settle.", air.ease_time, 0.0f, 3.0f, "%.2f s");
+    set_slider(draft, "Big air: ease time", "Higher: the rise builds and settles back more slowly. Lower: it reacts faster.", air.ease_time, 0.0f, 3.0f, "%.2f s");
     end_card();
 }
 
@@ -171,11 +180,11 @@ void big_air_fov_card(Draft& draft) {
     begin_card(draft.menu, "s3cam-air-fov", "BIG-AIR FOV");
     if (!draft.chosen.shot_fov) note("Turn on FOV override in the CAMERA tab to use this.");
     ImGui::BeginDisabled(!draft.chosen.shot_fov);
-    set_toggle(draft, "Widen in big airs", "The view opens up a little in a big air.", fov.air_fov);
+    set_toggle(draft, "Widen in big airs", "The view opens up wider in a big air.", fov.air_fov);
     ImGui::BeginDisabled(!fov.air_fov);
-    set_slider(draft, "Extra angle", "How many degrees the view opens up at full height.", fov.air_fov_degrees, 0.0f, 40.0f,
+    set_slider(draft, "Extra angle", "Higher: the view opens up wider in a big air. Lower: it changes less.", fov.air_fov_degrees, 0.0f, 40.0f,
         "+%.1f degrees");
-    set_slider(draft, "Full at height", "How high the jump goes for the full widening.", fov.air_fov_full_height, 0.1f, 50.0f,
+    set_slider(draft, "Full at height", "Higher: only very big jumps open the view fully. Lower: smaller jumps do too.", fov.air_fov_full_height, 0.1f, 50.0f,
         "%.1f m");
     ImGui::EndDisabled();
     ImGui::EndDisabled();
@@ -186,15 +195,15 @@ void landing_view_card(Draft& draft) {
     auto& look = draft.next.look;
     begin_card(draft.menu, "s3cam-landing-view", "LANDING VIEW");
     set_toggle(draft, "Look down at landing",
-        "In the air, the camera tips down toward where you will land when it is lower than your takeoff (stairs, gaps).",
+        "When you jump down to something lower (stairs, gaps), the camera tips down to show where you will land.",
         look.landing_look);
     ImGui::BeginDisabled(!look.landing_look);
-    set_slider(draft, "Look down amount", "How far the camera tips toward the landing.", look.landing_look_strength, 0.0f, 1.0f,
+    set_slider(draft, "Look down amount", "Higher: the camera tips down more toward the landing. Lower: it tips less.", look.landing_look_strength, 0.0f, 1.0f,
         "%.2f");
-    set_slider(draft, "Full at drop", "How far below the takeoff the landing is for the full amount.",
+    set_slider(draft, "Full at drop", "Higher: the landing must be much lower than where you took off for the full tip. Lower: a small drop is enough.",
         look.landing_look_full_drop, 0.5f, 10.0f, "%.1f m"); // valid() allows 0.1-50: the slider keeps the useful part
     ImGui::EndDisabled();
-    set_slider(draft, "Aim follows height", "How much the camera's aim follows your height. 0 keeps it level.",
+    set_slider(draft, "Aim follows height", "Higher: the view follows you up and down as you jump. 0: it stays level.",
         look.vertical_follow, 0.0f, 1.0f, "%.2f");
     end_card();
 }
@@ -202,8 +211,19 @@ void landing_view_card(Draft& draft) {
 void landing_shake_card(Draft& draft) {
     begin_card(draft.menu, "s3cam-landing-shake", "LANDING SHAKE");
     ImGui::BeginDisabled(!draft.next.shake_enabled);
-    set_slider(draft, "Landing shake", "How hard the camera kicks when you land. 0 is none.", draft.next.shake.one_shot_magnitude,
+    auto& landing = draft.next.landing_shake;
+    set_slider(draft, "Landing shake", "Higher: the camera kicks harder when you land. Lower: gentler. 0: no kick.", draft.next.shake.one_shot_magnitude,
         0.0f, 10.0f, "%.2f");
+    // valid() needs full_fall > min_fall, so each slider stops short of the other.
+    set_slider(draft, "Light landings below",
+        "Higher: more landings count as light and do not shake the camera. Lower: even small drops shake it.", landing.min_fall,
+        0.0f, std::min(10.0f, landing.full_fall - 0.1f), "%.1f m");
+    set_slider(draft, "Full shake at",
+        "Higher: you must fall further for the strongest shake. Lower: smaller falls shake fully.", landing.full_fall,
+        std::max(0.5f, landing.min_fall + 0.1f), 10.0f, "%.1f m"); // 0.5-10 m keeps the slider linear
+    set_slider(draft, "Speed adds",
+        "Higher: riding fast makes landings shake harder. 0: only how far you fell counts.", landing.speed_weight, 0.0f, 1.0f,
+        "%.2f");
     ImGui::EndDisabled();
     if (!draft.next.shake_enabled) note("Camera shake is off in the FEEL tab.");
     end_card();
@@ -215,8 +235,8 @@ void landing_bounce_card(Draft& draft) {
     note("Used by the Native+ style.");
     set_toggle(draft, "Landing bounce", "The camera dips down a little when you land and springs back.", plus.landing_dip);
     ImGui::BeginDisabled(!plus.landing_dip);
-    set_slider(draft, "Bounce depth", "How far the camera dips after a hard landing.", plus.dip_depth, 0.0f, 2.0f, "%.2f m");
-    set_slider(draft, "Bounce time", "How long the camera takes to reach the lowest point.", plus.dip_peak_time, 0.02f, 2.0f,
+    set_slider(draft, "Bounce depth", "Higher: the camera dips further after a hard landing. Lower: a smaller dip.", plus.dip_depth, 0.0f, 2.0f, "%.2f m");
+    set_slider(draft, "Bounce time", "Higher: the dip is slower. Lower: it is quicker.", plus.dip_peak_time, 0.02f, 2.0f,
         "%.2f s");
     ImGui::EndDisabled();
     end_card();
@@ -230,7 +250,7 @@ void trick_turn_card(Draft& draft) {
     note("The camera swings round to show the trick, holds that angle while you keep tricking, and comes back behind you after landing.");
     set_toggle(draft, "Turn on tricks", "Swing the camera round to the side during tricks.", yaw.enabled);
     ImGui::BeginDisabled(!yaw.enabled);
-    set_slider(draft, "Turn angle", "How far round the camera swings.", yaw.angle_degrees, 0.0f, 90.0f, "%.0f degrees");
+    set_slider(draft, "Turn angle", "Higher: the camera swings round further to the side. Lower: it stays closer behind you.", yaw.angle_degrees, 0.0f, 90.0f, "%.0f degrees");
     int side = yaw.side < 0 ? 1 : yaw.side > 0 ? 2 : 0;
     if (pick(draft, draft.next_changed, "Turn side", "s3cam-trick-yaw-side", side, {"Auto", "Left", "Right"}, true,
             {"Follows the shoulder side, or your stance if the shoulder is off.", "The camera swings round to your left.",
@@ -239,45 +259,50 @@ void trick_turn_card(Draft& draft) {
     set_toggle(draft, "In the air", "Turn during airs and flip tricks.", yaw.in_air);
     set_toggle(draft, "On grinds", "Turn while grinding.", yaw.on_grinds);
     set_toggle(draft, "On manuals", "Turn while manualling.", yaw.on_manuals);
-    set_slider(draft, "Air time needed", "Time in the air before the turn starts, so a plain ollie stays centred.",
+    set_slider(draft, "Air time needed", "Higher: you must be in the air longer before the camera turns, so a plain ollie stays centred. Lower: it turns sooner.",
         yaw.min_air_time, 0.0f, 3.0f, "%.2f s");
-    set_slider(draft, "Turn time", "How long the camera takes to swing out.", yaw.in_time, 0.0f, 5.0f, "%.2f s");
-    set_slider(draft, "Hold time", "How long the angle stays after the trick. A new trick in this time keeps it.",
+    set_slider(draft, "Turn time", "Higher: the camera swings out slowly. Lower: it swings out quickly.", yaw.in_time, 0.0f, 5.0f, "%.2f s");
+    set_slider(draft, "Hold time", "Higher: the camera stays turned longer after the trick. Lower: it comes back sooner. A new trick keeps the angle.",
         yaw.hold_time, 0.0f, 5.0f, "%.2f s");
-    set_slider(draft, "Return time", "How long the camera takes to come back behind you.", yaw.return_time, 0.0f, 10.0f, "%.2f s");
+    set_slider(draft, "Return time", "Higher: the camera is slower to come back behind you. Lower: it comes back quicker.", yaw.return_time, 0.0f, 10.0f, "%.2f s");
     ImGui::EndDisabled();
     end_card();
 }
 
-void manual_card(Draft& draft) {
-    namespace sh = dingosdk::s3cam;
-    // One manual close-up for both cameras: it is shown from the active one and written to both.
-    const bool high = draft.next.angle == sh::CameraAngle::High;
-    auto& framing = high ? draft.next.framing_high : draft.next.framing;
-    auto& other = high ? draft.next.framing : draft.next.framing_high;
-    bool edited = false;
+// The manual and grind close-ups are kept separately for the Low and the High camera. They share the
+// "Set position for" choice with the CAMERA tab, so the switch reads the same on both tabs.
+void manual_card(Draft& draft, PageState& state) {
     begin_card(draft.menu, "s3cam-manual", "MANUAL");
-    toggle(draft, edited, "Closer in manuals", "The camera moves in for manuals and nose manuals.", framing.manual_camera);
+    camera_for_switch(draft, state, "Set manual for", "s3cam-manual-for", "Edit the manual close-up of the Low camera.",
+        "Edit the manual close-up of the High camera.");
+    auto& framing = framing_for(draft, state);
+    set_toggle(draft, "Closer in manuals", "On: the camera moves in close for manuals and nose manuals. Off: it keeps its normal distance.",
+        framing.manual_camera);
     ImGui::BeginDisabled(!framing.manual_camera);
-    slider(draft, edited, "Distance", "How close the camera sits in a manual, compared with normal.",
+    set_slider(draft, "Distance", "Higher: the camera sits further back in a manual. Lower: closer to you. 1x is the normal distance.",
         framing.manual_distance_scale, 0.3f, 1.5f, "%.2fx");
-    slider(draft, edited, "Height", "Raises or lowers the camera around you in a manual.", framing.manual_height_degrees, -30.0f, 45.0f,
-        "%.1f degrees");
+    set_slider(draft, "Height", "Higher: the camera sits further above you in a manual. Lower: closer to the ground.",
+        framing.manual_height_degrees, -30.0f, 45.0f, "%.1f degrees");
     ImGui::EndDisabled();
-    if (edited) {
-        other.manual_camera = framing.manual_camera;
-        other.manual_distance_scale = framing.manual_distance_scale;
-        other.manual_height_degrees = framing.manual_height_degrees;
-        draft.next_changed = true;
-    }
-    set_slider(draft, "Manual focus", "What the camera looks at in a manual. 0 is the board, 1 is your upper body.",
+    set_slider(draft, "Manual focus", "Lower: the camera looks at the board. Higher: it looks at your upper body.",
         draft.next.look.manual_focus, 0.0f, 1.0f, "%.2f");
     end_card();
 }
 
-void grind_card(Draft& draft) {
+void grind_card(Draft& draft, PageState& state) {
     begin_card(draft.menu, "s3cam-grind", "GRIND");
-    set_slider(draft, "Grind focus", "What the camera looks at in a grind. 0 is the board, 1 is your upper body.",
+    camera_for_switch(draft, state, "Set grind for", "s3cam-grind-for", "Edit the grind close-up of the Low camera.",
+        "Edit the grind close-up of the High camera.");
+    auto& framing = framing_for(draft, state);
+    set_toggle(draft, "Close-up in grinds", "On: grinds use their own close-up view. Off: the camera keeps its normal view.",
+        framing.grind_camera);
+    ImGui::BeginDisabled(!framing.grind_camera);
+    set_slider(draft, "Distance", "Higher: the camera sits further back in a grind. Lower: closer to you. 1x is the usual grind distance.",
+        framing.grind_distance_scale, 0.3f, 2.0f, "%.2fx");
+    set_slider(draft, "Height", "Higher: the camera sits further above you in a grind. Lower: closer to the ground.",
+        framing.grind_height_degrees, -30.0f, 45.0f, "%.1f degrees");
+    ImGui::EndDisabled();
+    set_slider(draft, "Grind focus", "Lower: the camera looks at the board. Higher: it looks at your upper body.",
         draft.next.look.grind_focus, 0.0f, 1.0f, "%.2f");
     end_card();
 }
@@ -287,12 +312,15 @@ void grind_card(Draft& draft) {
 void follow_card(Draft& draft) {
     auto& follow = draft.next.follow;
     begin_card(draft.menu, "s3cam-follow", "FOLLOW");
-    set_slider(draft, "Follow tightness", "1 is normal. Higher keeps the camera right behind you, lower lets it trail.",
+    set_slider(draft, "Follow tightness", "Higher: the camera stays right behind you with little trailing. Lower: it trails behind more loosely. 1x is normal.",
         follow.strength, 0.2f, 4.0f, "%.2fx");
-    set_toggle(draft, "Tighter at speed", "The camera follows tighter the faster you go.", follow.dynamic);
+    set_slider(draft, "Horizontal follow",
+        "Higher: the camera swings round behind the way you ride faster and stays there. 0 is the normal lazy swing; 10 keeps it locked straight behind you.",
+        follow.horizontal, 0.0f, 10.0f, "%.1f");
+    set_toggle(draft, "Tighter at speed", "The faster you go, the less the camera trails behind you.", follow.dynamic);
     ImGui::BeginDisabled(!follow.dynamic);
-    set_slider(draft, "Full at speed", "The speed where it is as tight as it gets.", follow.dynamic_speed, 0.5f, 60.0f, "%.1f m/s");
-    set_slider(draft, "Extra tightness", "How much tighter it gets at that speed.", follow.dynamic_boost, 0.0f, 3.0f, "+%.2f");
+    set_slider(draft, "Full at speed", "Higher: you must go faster to get the tightest follow. Lower: it tightens at lower speeds.", follow.dynamic_speed, 0.5f, 60.0f, "%.1f m/s");
+    set_slider(draft, "Extra tightness", "Higher: the camera sticks closer behind you at speed. Lower: it changes less.", follow.dynamic_boost, 0.0f, 3.0f, "+%.2f");
     ImGui::EndDisabled();
     end_card();
 }
@@ -318,8 +346,8 @@ void shoulder_card(Draft& draft) {
             {"Regular rides with the toes to the right; riding switch flips it.", "Goofy rides with the toes to the left."}))
         shoulder.goofy = stance == 1;
     ImGui::BeginDisabled(shoulder.mode == sh::ShoulderSide::Off);
-    set_slider(draft, "Sideways distance", "How far the camera slides to the side.", shoulder.offset, 0.0f, 3.0f, "%.2f m");
-    set_slider(draft, "Side change time", "How long the camera takes to slide to the other side.", shoulder.switch_time, 0.0f,
+    set_slider(draft, "Sideways distance", "Higher: you sit further to the side of the screen. Lower: closer to the middle.", shoulder.offset, 0.0f, 3.0f, "%.2f m");
+    set_slider(draft, "Side change time", "Higher: the camera slides across slowly. Lower: it slides across quickly.", shoulder.switch_time, 0.0f,
         5.0f, "%.2f s");
     ImGui::EndDisabled();
     note("L3 swaps the side when it is bound in Controls > Binds.");
@@ -332,10 +360,10 @@ void slope_card(Draft& draft) {
     set_toggle(draft, "Tilt with slope", "On the ground, the camera tips down going downhill and up going uphill.",
         look.slope_look);
     ImGui::BeginDisabled(!look.slope_look);
-    set_slider(draft, "Slope tilt amount", "How much of the slope's angle the camera tips.", look.slope_look_strength, 0.0f, 1.0f,
+    set_slider(draft, "Slope tilt amount", "Higher: the camera tips more on hills. Lower: it stays more level.", look.slope_look_strength, 0.0f, 1.0f,
         "%.2f");
     ImGui::EndDisabled();
-    set_slider(draft, "Aim ease time", "How long the camera takes to settle when its aim moves up or down.", look.response_time,
+    set_slider(draft, "Aim ease time", "Higher: the up and down tilt of the view settles slowly. Lower: it follows right away.", look.response_time,
         0.0f, 5.0f, "%.2f s");
     end_card();
 }
@@ -347,14 +375,14 @@ void shake_card(Draft& draft) {
     ImGui::BeginDisabled(!camera.shake_enabled);
     set_toggle(draft, "Speed shake", "The camera rumbles more the faster you go.", camera.speed_shake.enabled);
     ImGui::BeginDisabled(!camera.speed_shake.enabled);
-    set_slider(draft, "Speed shake strength", "How strong the rumble is.", camera.speed_shake.strength, 0.0f, 10.0f, "%.2fx");
-    set_slider(draft, "Full at speed", "The speed where the rumble is strongest.", camera.speed_shake.top_speed, 0.5f, 80.0f,
+    set_slider(draft, "Speed shake strength", "Higher: a stronger rumble at speed. Lower: a gentler one. 0: none.", camera.speed_shake.strength, 0.0f, 10.0f, "%.2fx");
+    set_slider(draft, "Full at speed", "Higher: you must go faster for the strongest rumble. Lower: it peaks at lower speeds.", camera.speed_shake.top_speed, 0.5f, 80.0f,
         "%.1f m/s");
     set_toggle(draft, "Shakier downhill", "More rumble riding downhill.", camera.speed_shake.downhill_boost);
     ImGui::BeginDisabled(!camera.speed_shake.downhill_boost);
-    set_slider(draft, "Downhill amount", "How much stronger the rumble is on a steep downhill.",
+    set_slider(draft, "Downhill amount", "Higher: the rumble gets much stronger on a steep downhill. Lower: only a little.",
         camera.speed_shake.downhill_scale, 1.0f, 10.0f, "%.2fx");
-    set_slider(draft, "Full at slope", "How steep the hill is for the full downhill amount.",
+    set_slider(draft, "Full at slope", "Higher: the hill must be steeper for the full extra rumble. Lower: a gentle hill is enough.",
         camera.speed_shake.downhill_full_degrees, 1.0f, 80.0f, "%.0f degrees");
     ImGui::EndDisabled();
     ImGui::EndDisabled();
@@ -367,13 +395,13 @@ void speed_fov_card(Draft& draft) {
     begin_card(draft.menu, "s3cam-speed-fov", "SPEED FOV");
     if (!draft.chosen.shot_fov) note("Turn on FOV override in the CAMERA tab to use this.");
     ImGui::BeginDisabled(!draft.chosen.shot_fov);
-    set_toggle(draft, "Widen with speed", "The view opens up the faster you go.", fov.speed_fov);
+    set_toggle(draft, "Widen with speed", "The faster you go, the wider the view opens up.", fov.speed_fov);
     ImGui::BeginDisabled(!fov.speed_fov);
-    set_slider(draft, "Extra angle", "How many degrees the view opens up at full speed.", fov.speed_fov_degrees, 0.0f, 40.0f,
+    set_slider(draft, "Extra angle", "Higher: the view opens up wider at speed. Lower: it changes less.", fov.speed_fov_degrees, 0.0f, 40.0f,
         "+%.1f degrees");
-    set_slider(draft, "Starts at speed", "The speed where the view starts to open up.", fov.speed_fov_min, 0.0f,
+    set_slider(draft, "Starts at speed", "Higher: you must go faster before the view starts to widen. Lower: it starts at lower speeds.", fov.speed_fov_min, 0.0f,
         std::min(60.0f, fov.speed_fov_max - 0.1f), "%.1f m/s");
-    set_slider(draft, "Full at speed", "The speed where it is fully open.", fov.speed_fov_max,
+    set_slider(draft, "Full at speed", "Higher: the view is widest at a higher speed. Lower: at a lower speed.", fov.speed_fov_max,
         std::max(0.1f, fov.speed_fov_min + 0.1f), 80.0f, "%.1f m/s");
     ImGui::EndDisabled();
     ImGui::EndDisabled();
@@ -387,14 +415,14 @@ void collision_card(Draft& draft) {
     begin_card(draft.menu, "s3cam-collision", "COLLISION", "Walls, poles and the ground");
     set_toggle(draft, "Collision", "The camera moves in front of walls and poles instead of going through them.", collision.enabled);
     ImGui::BeginDisabled(!collision.enabled);
-    set_slider(draft, "Wall gap", "Space kept between the camera and a wall.", collision.radius, 0.0f, 2.0f, "%.2f m");
-    set_slider(draft, "Closest to you", "The camera never comes closer to you than this.", collision.min_distance, 0.0f, 5.0f,
+    set_slider(draft, "Wall gap", "Higher: the camera stays further from walls. Lower: it can get right up to them.", collision.radius, 0.0f, 2.0f, "%.2f m");
+    set_slider(draft, "Closest to you", "Higher: the camera never gets closer to you than this, even in tight spots. Lower: it can squeeze in closer.", collision.min_distance, 0.0f, 5.0f,
         "%.2f m");
-    set_slider(draft, "Move-in time", "How fast the camera moves in front of an obstacle.", collision.pull_in_time, 0.0f, 2.0f,
+    set_slider(draft, "Move-in time", "Higher: the camera moves in front of a wall slowly. Lower: it moves in at once.", collision.pull_in_time, 0.0f, 2.0f,
         "%.2f s");
-    set_slider(draft, "Move-out time", "How fast the camera eases back once the way is clear.", collision.release_time, 0.0f,
+    set_slider(draft, "Move-out time", "Higher: the camera returns slowly once the wall is gone. Lower: it returns quickly.", collision.release_time, 0.0f,
         5.0f, "%.2f s");
-    set_slider(draft, "Ground gap", "Height kept above the ground under the camera.", collision.ground_clearance, 0.0f, 3.0f,
+    set_slider(draft, "Ground gap", "Higher: the camera stays further above the ground. Lower: it can sit closer to the ground.", collision.ground_clearance, 0.0f, 3.0f,
         "%.2f m");
     ImGui::EndDisabled();
     end_card();
@@ -405,10 +433,10 @@ void collision_card(Draft& draft) {
 void blend_card(Draft& draft) {
     begin_card(draft.menu, "s3cam-blend", "BLEND");
     slider(draft, draft.chosen_changed, "Blend time getting on",
-        "How long the camera takes to move from the game's camera to this one when you get on the board.",
+        "Higher: the switch to this camera takes longer when you get on the board. 0: it cuts at once.",
         draft.chosen.take_blend_time, 0.0f, 5.0f, "%.2f s");
     slider(draft, draft.chosen_changed, "Blend time getting off",
-        "How long the camera takes to move back to the game's camera when you get off the board.",
+        "Higher: the switch back to the game's camera takes longer when you get off the board. 0: it cuts at once.",
         draft.chosen.release_blend_time, 0.0f, 5.0f, "%.2f s");
     end_card();
 }
@@ -416,9 +444,9 @@ void blend_card(Draft& draft) {
 void native_plus_card(Draft& draft) {
     auto& plus = draft.next.native_plus;
     begin_card(draft.menu, "s3cam-native-plus", "NATIVE+ EXTRAS", "Only for the Native+ style");
-    set_toggle(draft, "Hold height in the air", "The camera stays at its height while you are in the air.", plus.air_hold);
-    set_toggle(draft, "Shake", "Landing and speed shake on the game's camera.", plus.shake);
-    set_toggle(draft, "Tilt", "The camera leans a little with the shot and the shake.", plus.roll);
+    set_toggle(draft, "Hold height in the air", "On: the camera stays at the same height while you are in the air.", plus.air_hold);
+    set_toggle(draft, "Shake", "On: landing and speed shake on the game's camera.", plus.shake);
+    set_toggle(draft, "Tilt", "On: the camera leans a little with the shot and the shake.", plus.roll);
     end_card();
 }
 
@@ -426,7 +454,7 @@ void other_card(Draft& draft) {
     begin_card(draft.menu, "s3cam-other", "OTHER");
     toggle(draft, draft.chosen_changed, "Logging", "Write what the camera is doing, and every landing, to ReSkate.log.",
         draft.chosen.verbose);
-    set_slider(draft, "FOV ease time", "How slowly the field of view changes, so it never snaps.", draft.next.fov.smoothing_time,
+    set_slider(draft, "FOV ease time", "Higher: the view width changes slowly. Lower: it changes quickly.", draft.next.fov.smoothing_time,
         0.0f, 5.0f, "%.2f s");
     end_card();
 }
@@ -613,8 +641,8 @@ void s3cam_page(SkateMenu& menu, const Model& model, const CallbacksV3& callback
         break;
     case 2:
         trick_turn_card(draft);
-        manual_card(draft);
-        grind_card(draft);
+        manual_card(draft, state);
+        grind_card(draft, state);
         break;
     case 3:
         follow_card(draft);

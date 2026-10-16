@@ -70,6 +70,14 @@ cs::CameraSettings tuned_camera() {
     camera.air_camera = {0.8f, 22.0f, 3.5f, 0.6f, false};
     camera.look.manual_focus = 0.1f;
     camera.look.grind_focus = 0.9f;
+    camera.framing.grind_camera = false;
+    camera.framing.grind_distance_scale = 1.4f;
+    camera.framing.grind_height_degrees = 5.0f;
+    camera.framing_high.grind_camera = true;
+    camera.framing_high.grind_distance_scale = 0.7f;
+    camera.framing_high.grind_height_degrees = -6.0f;
+    camera.follow.horizontal = 6.5f;
+    camera.landing_shake = {3.0f, 6.0f, 0.4f}; // min above the default full: the pair has to load whole
     return camera;
 }
 TestOptions tuned_options() {
@@ -104,6 +112,13 @@ void json_round_trip() {
            parsed.camera.air_camera.rise_full_height == 3.5f && parsed.camera.air_camera.ease_time == 0.6f &&
            !parsed.camera.air_camera.keep_in_frame, "the big-air camera round-trips");
     expect(parsed.camera.look.manual_focus == 0.1f && parsed.camera.look.grind_focus == 0.9f, "manual and grind focus round-trip");
+    expect(!parsed.camera.framing.grind_camera && parsed.camera.framing.grind_distance_scale == 1.4f &&
+           parsed.camera.framing.grind_height_degrees == 5.0f && parsed.camera.framing_high.grind_camera &&
+           parsed.camera.framing_high.grind_distance_scale == 0.7f && parsed.camera.framing_high.grind_height_degrees == -6.0f,
+           "the grind close-up round-trips per camera");
+    expect(parsed.camera.follow.horizontal == 6.5f && parsed.camera.landing_shake.min_fall == 3.0f &&
+           parsed.camera.landing_shake.full_fall == 6.0f && parsed.camera.landing_shake.speed_weight == 0.4f,
+           "horizontal follow and the landing shake round-trip");
     expect(parsed.camera.fov.speed_fov_min == 20.0f && parsed.camera.fov.speed_fov_max == 30.0f, "a speed FOV pair above the default maximum loads whole");
 
     const auto root = parse_text(text);
@@ -289,6 +304,26 @@ void old_preset_keeps_new_defaults() {
 }
 
 // A preset from a later version: unknown keys, an unknown top-level field and a changed unknown value type.
+// A preset from before Alpha 5 has no grind, horizontal follow or landing shake keys: they keep their defaults.
+void pre_alpha5_preset_loads() {
+    const std::string text = R"({"name":"Old","version":1,"values":{"S3Cam.Framing.ManualDistanceScale":0.5,
+        "S3Cam.FramingHigh.ManualHeightDegrees":4.0,"S3Cam.Follow.Strength":1.5}})";
+    Parsed parsed;
+    expect(sf::parse_preset(text, parsed) == sf::PresetError::none && parsed.report.refused == 0, "an old preset loads");
+    const cs::CameraSettings defaults;
+    expect(parsed.camera.framing.manual_distance_scale == 0.5f && parsed.camera.framing_high.manual_height_degrees == 4.0f &&
+           parsed.camera.follow.strength == 1.5f, "its keys apply");
+    expect(parsed.camera.framing.grind_camera == defaults.framing.grind_camera &&
+           parsed.camera.framing.grind_distance_scale == defaults.framing.grind_distance_scale &&
+           parsed.camera.framing_high.grind_height_degrees == defaults.framing_high.grind_height_degrees &&
+           parsed.camera.follow.horizontal == defaults.follow.horizontal &&
+           parsed.camera.landing_shake.min_fall == defaults.landing_shake.min_fall &&
+           parsed.camera.landing_shake.full_fall == defaults.landing_shake.full_fall &&
+           parsed.camera.landing_shake.speed_weight == defaults.landing_shake.speed_weight,
+           "the new fields keep their defaults");
+    expect(parsed.camera.valid(), "the result is valid");
+}
+
 void newer_preset_loads_known_keys() {
     Parsed parsed;
     const std::string text = R"({"name":"Future","version":2,"future_field":{"a":1},"values":{
@@ -348,20 +383,26 @@ void field_table() {
         framing += entry.first.rfind("S3Cam.Framing.", 0) == 0;
         yaw += entry.first.rfind("S3Cam.TrickYaw.", 0) == 0;
     }
-    expect(framing == 6, "six framing keys");
+    expect(framing == 9, "nine framing keys");
     expect(yaw == 10, "ten trick yaw keys");
     int high = 0, air = 0;
     for (const auto& entry : values) {
         high += entry.first.rfind("S3Cam.FramingHigh.", 0) == 0;
         air += entry.first.rfind("S3Cam.AirCamera.", 0) == 0;
     }
-    expect(high == 6 && air == 5, "six High framing keys and five big-air keys");
+    expect(high == 9 && air == 5, "nine High framing keys and five big-air keys");
     for (const auto& alias : sf::key_aliases) {
         bool found = false;
         for (const auto& entry : values) found = found || entry.first == alias.current;
         expect(found, "every alias points at a saved key");
     }
-    expect(values.size() == 82, "82 saved keys in all");
+    int landing = 0, follow = 0;
+    for (const auto& entry : values) {
+        landing += entry.first.rfind("S3Cam.LandingShake.", 0) == 0;
+        follow += entry.first == "S3Cam.Follow.Horizontal";
+    }
+    expect(landing == 3 && follow == 1, "three landing shake keys and the horizontal follow key");
+    expect(values.size() == 92, "92 saved keys in all");
 }
 } // namespace
 
@@ -373,6 +414,7 @@ int main() {
     names();
     builtins();
     old_preset_keeps_new_defaults();
+    pre_alpha5_preset_loads();
     newer_preset_loads_known_keys();
     aliases();
     field_table();
