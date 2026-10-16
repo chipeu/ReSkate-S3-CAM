@@ -396,6 +396,13 @@ S3CamObservation s3cam_observe(const SourceTrial& trial, std::uintptr_t client) 
             s.ground_clearance = s.position[1] - (*ground)[1];
             s.ground_normal = normal_at(*ground);
         }
+        // The board's real centre (its root body, +0x50 like the others): manuals and grinds aim at it.
+        {
+            Vec3 board{};
+            s.board_valid = first_person_read(bodies.parts[state_addr::board_root_body] + body_position_offset, board.data(), sizeof(board)) &&
+                std::isfinite(board[0] + board[1] + board[2]) && s3cam::length(s3cam::sub(board, s.position)) < 2.5f;
+            if (s.board_valid) s.board_position = board;
+        }
         // Board pitch against the ground: the extreme bodies along the skater's forward.
         {
             const Vec3 axis = s3cam::normalized({s.forward[0], 0.0f, s.forward[2]}, {0, 0, 1});

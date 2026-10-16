@@ -46,6 +46,8 @@ struct SubjectSnapshot {
     bool manual = false;               // native source still unknown (T7): may always be false in game
     int grind_side = 0;                // -1 ledge on the left, 0 unknown/flat, +1 on the right
     bool switch_stance = false;        // carried for the glue; no shot uses it yet
+    Vec3 board_position{0, 0, 0};      // the board's real centre (its root physics body), when board_valid
+    bool board_valid = false;          // false: use the estimate (root - board_drop)
     Vec3 ground_normal{0, 1, 0};
     float ground_clearance = 0.95f;    // m, root height above the ground beneath it (~0.95 riding)
     bool valid = false;                // false: the publisher had no trustworthy data this frame
@@ -63,7 +65,7 @@ inline bool finite3(const Vec3& v) noexcept { return std::isfinite(v[0]) && std:
 inline bool usable(const SubjectSnapshot& s) noexcept {
     using subject_detail::finite3;
     return s.valid && std::isfinite(s.time) && finite3(s.position) && finite3(s.forward) && finite3(s.velocity) &&
-           finite3(s.ground_normal) && std::isfinite(s.ground_clearance) && length(s.forward) > 1e-4f &&
+           finite3(s.ground_normal) && finite3(s.board_position) && std::isfinite(s.ground_clearance) && length(s.forward) > 1e-4f &&
            length(s.ground_normal) > 1e-4f && s.grind_side >= -1 && s.grind_side <= 1;
 }
 } // namespace dingosdk::s3cam

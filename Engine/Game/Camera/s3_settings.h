@@ -109,6 +109,9 @@ struct LookSettings {
     // upper body). Alpha 3 feedback: manuals should frame the lower body and the board.
     float manual_focus = 0.25f;
     float grind_focus = 0.5f;
+    // Manuals and grinds: the camera circles, aims and tilts around the real board instead of a point
+    // worked out from the hips (Alpha 6 feedback: "grind and manual cam need board anchoring").
+    bool board_anchor = true;
 
     bool valid() const noexcept {
         const auto ok = [](float v, float lo, float hi) { return std::isfinite(v) && v >= lo && v <= hi; };
@@ -190,6 +193,18 @@ struct SpeedShakeSettings {
     }
 };
 
+// The camera's distance from the skater, everywhere (shots, close-ups, collision): one pair of limits
+// (Alpha 6 feedback: "sometimes the grind / manual camera gets way too close"). Replaces the
+// collision's own minimum (CollisionSettings::min_distance, kept only so old presets load).
+struct DistanceLimits {
+    float min = 1.2f; // m: the camera never comes closer than this, not even pulled in by a wall
+    float max = 6.0f; // m: the camera never goes further back than this
+
+    bool valid() const noexcept {
+        return std::isfinite(min) && std::isfinite(max) && min >= 0.3f && max <= 20.0f && max >= min + 0.2f;
+    }
+};
+
 // How hard a landing was, for the landing shake (Alpha 5 feedback: a light nollie gave a full shake).
 // Measured from how far the skater fell, from the highest point of the air to the landing, which flip
 // tricks and board spin cannot fake; a little forward speed is added.
@@ -208,7 +223,7 @@ struct LandingShakeSettings {
 struct CollisionSettings {
     bool enabled = true;
     float radius = 0.25f;        // m kept between the camera and a hit surface (pulled in along the ray)
-    float min_distance = 0.5f;   // m: never closer to the look target than this
+    float min_distance = 0.5f;   // m: unused since Alpha 6 (DistanceLimits::min is the one minimum); kept so old presets load
     float pull_in_time = 0.05f;  // s: how fast the camera moves in front of an obstacle (near instant)
     float release_time = 0.4f;   // s: how fast it eases back out once clear
     float ground_clearance = 0.3f; // m above the ground under the camera itself
@@ -304,13 +319,14 @@ struct CameraSettings {
     TrickYawSettings trick_yaw;
     AirCameraSettings air_camera;
     LandingShakeSettings landing_shake;
+    DistanceLimits distance;
 
     bool valid() const noexcept {
         return std::isfinite(fov_override_deg) && fov_override_deg >= 0.0f && fov_override_deg < 180.0f && rig.valid() && orientation.valid() && air.valid() &&
                shake.valid() && trajectory.valid() && graph.valid() && points.valid() && native_plus.valid() &&
                pipeline.valid() && look.valid() && shoulder.valid() && follow.valid() && fov.valid() &&
                speed_shake.valid() && collision.valid() && framing.valid() && trick_yaw.valid() &&
-               framing_high.valid() && air_camera.valid() && landing_shake.valid();
+               framing_high.valid() && air_camera.valid() && landing_shake.valid() && distance.valid();
     }
 };
 
