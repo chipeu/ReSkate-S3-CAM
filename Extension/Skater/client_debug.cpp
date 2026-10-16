@@ -11,6 +11,7 @@
 #include "Engine/Game/Skater/velocity_boost.h"
 #include "Extension/Camera/s3cam.h"
 #include "Extension/Camera/s3cam_config.h"
+#include "Extension/Multiplayer/Hud/game_ui_state.h"
 #include "Extension/Camera/s3cam_probe.h"
 #include "Extension/Multiplayer/Remote/native_skater.h"
 #include "Extension/Objects/ParkEditor/park_editor_runtime.h"
@@ -969,6 +970,15 @@ void s3cam_tick(SourceTrial& trial, std::uintptr_t client, bool can_control, boo
     const auto now = GetTickCount64();
     // This tick's reading of the skater: the flight tick's pose uses it too.
     const auto seen = can_control ? s3cam_observe(trial, client) : S3CamObservation{};
+    // The game's own menu flag (DelMar_UI_ScreenData, game_ui_state.h; the nametags use it too): the
+    // phone (skate.'s pause menu, which also leads to the replay editor and object drops) keeps the
+    // client in normal play and the skater moving, so neither the flow state nor a pause shows it.
+    static bool menu_was_open{};
+    const bool menu_open = multiplayer::sample_game_ui_state(trial.base).in_menu;
+    if (menu_open != menu_was_open) {
+        menu_was_open = menu_open;
+        s3cam_note(menu_open ? "game menu open (phone, pause or replay editor)" : "game menu closed");
+    }
     if (now < debug.s3cam_retry_after) return;
     try {
         if (debug.s3cam_view) {
@@ -977,6 +987,7 @@ void s3cam_tick(SourceTrial& trial, std::uintptr_t client, bool can_control, boo
             // pose holds) and is tried again every tick.
             const char* screen = !can_control ? "no local control (menu, replay editor or loading)"
                 : s3cam_game_camera_away() ? "the game moved its camera away from the skater (map or customisation)"
+                : menu_open ? "a game menu is open (phone, replay editor)"
                 : seen.valid && seen.paused ? "the game is paused (pause menu or replay editor)" : nullptr;
             if (screen) {
                 if (!phase) return;
@@ -996,7 +1007,7 @@ void s3cam_tick(SourceTrial& trial, std::uintptr_t client, bool can_control, boo
         if (!can_control || !phase || debug.camera_owned || debug.camera_ambiguous || debug.noclip || debug.park_editor ||
             debug.editor_transition)
             return;
-        if (!seen.valid || !seen.wants_view || seen.wants_for < 0.15) return;
+        if (menu_open || !seen.valid || !seen.wants_view || seen.wants_for < 0.15) return;
         s3cam_take(trial, client, error);
     } catch (const SourceGuard& guard) {
         debug.status = guard.message;

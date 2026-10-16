@@ -482,7 +482,7 @@ private:
         air_w_ = rise_w_ = keep_off_ = framing_pitch_ = last_shake_pitch_ = 0.0f;
         fov_extra_stage_ = landing_w_stage_ = look_pitch_stage_ = air_w_stage_ = rise_w_stage_ = 0.0f;
         landing_point_stage_ = landing_point_;
-        coll_pull_ = coll_lift_ = 0.0f;
+        coll_pull_ = coll_lift_ = coll_pull_stage_ = coll_lift_stage_ = 0.0f;
         trick_yaw_ = TrickYawState{};
         layers_ = {};
         no_lag_timer_ = settings_.pipeline.no_lag_after_reset;
@@ -822,7 +822,7 @@ private:
             // parallel to the unshifted one. Pulling the camera in along the pivot -> camera line keeps
             // its direction, and the aim below is taken from the FINAL camera position, so the orientation
             // and the position always agree.
-            const float pulled = collide(ground, add(look_base, shift), camera, snap);
+            const float pulled = collide(ground, add(look_base, shift), camera, snap, in_air_layer);
 
             // Look at the actual reference point (not the lagged anchor): the camera holds its height
             // in the air while the skater rises through the frame. The up-tilt is capped (frame_composer.rs).
@@ -1014,11 +1014,11 @@ private:
     // to ground_clearance below it and lifts the camera to the ground + ground_clearance, eased the same
     // way. At most two rays per fixed step. A cut snaps both. Returns the metres pulled in.
     template <class Query>
-    float collide(Query& ground, const Vec3& pivot, Vec3& camera, bool snap) noexcept {
+    float collide(Query& ground, const Vec3& pivot, Vec3& camera, bool snap, bool air) noexcept {
         using camera_detail::finite3;
         const CollisionSettings& col = settings_.collision;
         if (!col.enabled) {
-            coll_pull_ = coll_lift_ = 0.0f;
+            coll_pull_ = coll_lift_ = coll_pull_stage_ = coll_lift_stage_ = 0.0f;
             return 0.0f;
         }
         const Vec3 ray = sub(camera, pivot);
@@ -1032,7 +1032,16 @@ private:
                 }
             }
         }
-        coll_pull_ = snap ? pull_goal : camera_detail::ease_to(coll_pull_, pull_goal, pull_goal > coll_pull_ ? col.pull_in_time : col.release_time, fixed_step);
+        // In the air the obstacle is usually the ramp the skater just left: the camera trails below and
+        // behind, and where the skater -> camera ray meets the ramp changes every step. A near-instant
+        // pull-in there followed every change, which read as the camera tweaking in big airs (Alpha 4 log:
+        // the airs with the largest position jumps were the ones with 1.5-1.9 m of pull). In the air the
+        // pull eases in over at least air_pull_in_time, through the gentle two-stage ease.
+        constexpr float air_pull_in_time = 0.25f;
+        const float in_time = air ? std::max(col.pull_in_time, air_pull_in_time) : col.pull_in_time;
+        coll_pull_ = snap ? (coll_pull_stage_ = pull_goal)
+                          : camera_detail::ease2_to(coll_pull_stage_, coll_pull_, pull_goal,
+                                                    pull_goal > coll_pull_stage_ ? in_time : col.release_time, fixed_step);
         // Never closer than min_distance (a rig distance already shorter than that is left alone).
         const float pull = std::min(coll_pull_, std::max(0.0f, full - col.min_distance));
         if (pull > 0.0f) camera = add(pivot, scale(ray, (full - pull) / std::max(full, 1e-3f)));
@@ -1041,7 +1050,9 @@ private:
         if (const std::optional<GroundHit> floor_hit = ground(add(camera, {0.0f, 1.0f, 0.0f}), sub(camera, {0.0f, col.ground_clearance, 0.0f}))) {
             if (finite3(floor_hit->point)) lift_goal = std::max(0.0f, floor_hit->point[1] + col.ground_clearance - camera[1]);
         }
-        coll_lift_ = snap ? lift_goal : camera_detail::ease_to(coll_lift_, lift_goal, lift_goal > coll_lift_ ? col.pull_in_time : col.release_time, fixed_step);
+        coll_lift_ = snap ? (coll_lift_stage_ = lift_goal)
+                          : camera_detail::ease2_to(coll_lift_stage_, coll_lift_, lift_goal,
+                                                    lift_goal > coll_lift_stage_ ? in_time : col.release_time, fixed_step);
         camera[1] += coll_lift_;
         return pull;
     }
@@ -1205,6 +1216,7 @@ private:
     Vec3 landing_point_stage_{0, 0, 0};
     float shoulder_value_ = 0.0f, shoulder_start_ = 0.0f, shoulder_target_ = 0.0f, shoulder_elapsed_ = 0.0f; // side -1..1
     float coll_pull_ = 0.0f, coll_lift_ = 0.0f; // FullS3: smoothed pull-in and ground lift, m
+    float coll_pull_stage_ = 0.0f, coll_lift_stage_ = 0.0f; // their ease2_to first stages
     float native_pitch_ = 0.0f;         // NativePlus: eased framing pitch offset, rad
     // Alpha 4. The eased in-air weight (follow_height), the eased rise weight, the keep-in-frame pitch offset
     // (rad), the eased manual / grind focus and the eased framing pitch (FullS3), plus what the steps need of
