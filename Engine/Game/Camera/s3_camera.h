@@ -172,6 +172,14 @@ inline float ease_rate(float time_constant, float step_time) noexcept {
 inline float ease_to(float value, float target, float time_constant, float step_time) noexcept {
     return value + (target - value) * ease_rate(time_constant, step_time);
 }
+// Two first-order filters in a row, each with half the time constant: about the same settling time
+// as ease_to, but a step in the target starts and ends the motion gently instead of with a kink. The
+// air layers' targets come from the landing prediction, which is refreshed every 0.1 s and steps a
+// little each time; through ease_to those steps showed as a 10 Hz jitter of the view in big airs.
+inline float ease2_to(float& stage, float value, float target, float time_constant, float step_time) noexcept {
+    stage = ease_to(stage, target, 0.5f * time_constant, step_time);
+    return ease_to(value, stage, 0.5f * time_constant, step_time);
+}
 } // namespace camera_detail
 
 class CameraMan {
@@ -472,6 +480,8 @@ private:
         // camera must not pop); the shoulder side and the collision state land on this frame's targets.
         fov_extra_ = landing_w_ = look_pitch_ = native_pitch_ = 0.0f;
         air_w_ = rise_w_ = keep_off_ = framing_pitch_ = last_shake_pitch_ = 0.0f;
+        fov_extra_stage_ = landing_w_stage_ = look_pitch_stage_ = air_w_stage_ = rise_w_stage_ = 0.0f;
+        landing_point_stage_ = landing_point_;
         coll_pull_ = coll_lift_ = 0.0f;
         trick_yaw_ = TrickYawState{};
         layers_ = {};
@@ -603,8 +613,13 @@ private:
             rise_goal = clamp01(std::max(flight_max_height_, drop_below) / std::max(ac.rise_full_height, 0.1f));
         }
         if (!snap) {
-            air_w_ = camera_detail::ease_to(air_w_, air ? 1.0f : 0.0f, ac.ease_time, dt);
-            rise_w_ = camera_detail::ease_to(rise_w_, rise_goal, ac.ease_time, dt);
+            // Quick in, slow out: the takeoff already knows the predicted air, and a slow build left the
+            // camera trailing below the rising skater (looking UP for the first half of a big air), while
+            // after the landing a slow release recentres gently. ease_time is the release time.
+            const float build_time = 0.5f * ac.ease_time, release_time = ac.ease_time;
+            const float follow_goal = air ? 1.0f : 0.0f;
+            air_w_ = camera_detail::ease2_to(air_w_stage_, air_w_, follow_goal, follow_goal > air_w_stage_ ? build_time : release_time, dt);
+            rise_w_ = camera_detail::ease2_to(rise_w_stage_, rise_w_, rise_goal, rise_goal > rise_w_stage_ ? build_time : release_time, dt);
         }
         const float rise_rad = rise_w_ * ac.rise_degrees * degrees;
         // The keep-in-frame layer stays on while the air weight is still easing out: the camera is still
@@ -659,7 +674,7 @@ private:
             fov_target += fv.speed_fov_degrees * clamp01((horizontal_speed - fv.speed_fov_min) / std::max(fv.speed_fov_max - fv.speed_fov_min, 1e-3f));
         if (fv.air_fov && air)
             fov_target += fv.air_fov_degrees * clamp01(flight_max_height_ / std::max(fv.air_fov_full_height, 1e-3f));
-        if (!snap) fov_extra_ = camera_detail::ease_to(fov_extra_, fov_target, fv.smoothing_time, dt);
+        if (!snap) fov_extra_ = camera_detail::ease2_to(fov_extra_stage_, fov_extra_, fov_target, fv.smoothing_time, dt);
 
         // ---- shoulder side (both presets): a sine ease over switch_time from wherever the side value is
         // now, so a change of mind mid-slide starts from the current value (position stays continuous).
@@ -768,7 +783,14 @@ private:
             const bool landing_known = air && prediction_.landed();
             float landing_goal = 0.0f;
             if (landing_known) {
-                landing_point_ = add(prediction_.landing_position, {0.0f, last_clearance_ - cs.points.board_drop, 0.0f});
+                // Each re-prediction moves the point a little: follow it through the same gentle two-stage
+                // filter as the weight, except while the look is (almost) off, where it can jump unseen.
+                const Vec3 predicted_point = add(prediction_.landing_position, {0.0f, last_clearance_ - cs.points.board_drop, 0.0f});
+                if (landing_w_ < 0.01f || snap) landing_point_ = landing_point_stage_ = predicted_point;
+                else
+                    for (std::size_t axis = 0; axis < 3; ++axis)
+                        landing_point_[axis] = camera_detail::ease2_to(landing_point_stage_[axis], landing_point_[axis],
+                                                                       predicted_point[axis], lk.response_time, dt);
                 const float drop = prediction_.predicted_landing_height + prediction_offset_;
                 if (lk.landing_look && drop < 0.0f)
                     landing_goal = lk.landing_look_strength * clamp01(-drop / std::max(lk.landing_look_full_drop, 0.1f));
@@ -776,8 +798,8 @@ private:
             // b) slope look: on the ground the pitch follows the incline (+ uphill, so downhill looks down).
             const float slope_goal = (lk.slope_look && grounded) ? lk.slope_look_strength * incline_degrees_ * degrees : 0.0f;
             if (!snap) {
-                landing_w_ = camera_detail::ease_to(landing_w_, landing_goal, lk.response_time, dt);
-                look_pitch_ = camera_detail::ease_to(look_pitch_, slope_goal, lk.response_time, dt);
+                landing_w_ = camera_detail::ease2_to(landing_w_stage_, landing_w_, landing_goal, lk.response_time, dt);
+                look_pitch_ = camera_detail::ease2_to(look_pitch_stage_, look_pitch_, slope_goal, lk.response_time, dt);
             }
             const Vec3 focused_base = focus_value_ >= 1.0f ? look_base : lerp(points[4], look_base, focus_value_);
             Vec3 look_target = lerp(focused_base, landing_point_, landing_w_);
@@ -1178,6 +1200,9 @@ private:
     float chase_lens_ = 12.0f;          // the chase shot's lens for the current angle (the shot term's zero)
     float landing_w_ = 0.0f, look_pitch_ = 0.0f; // FullS3: eased landing-look weight, slope-look pitch (rad)
     Vec3 landing_point_{0, 0, 0};       // FullS3: where the board will touch down (held when the prediction ends)
+    // The first stages of the ease2_to filters above.
+    float fov_extra_stage_ = 0.0f, landing_w_stage_ = 0.0f, look_pitch_stage_ = 0.0f, air_w_stage_ = 0.0f, rise_w_stage_ = 0.0f;
+    Vec3 landing_point_stage_{0, 0, 0};
     float shoulder_value_ = 0.0f, shoulder_start_ = 0.0f, shoulder_target_ = 0.0f, shoulder_elapsed_ = 0.0f; // side -1..1
     float coll_pull_ = 0.0f, coll_lift_ = 0.0f; // FullS3: smoothed pull-in and ground lift, m
     float native_pitch_ = 0.0f;         // NativePlus: eased framing pitch offset, rad

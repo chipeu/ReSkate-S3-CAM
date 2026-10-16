@@ -221,10 +221,10 @@ struct FramingSettings {
 // Big airs (Alpha 3 feedback: the skater left the screen in big airs, and the camera should end up
 // above, looking down at the landing as the game's own camera does). Both presets.
 struct AirCameraSettings {
-    float follow_height = 0.6f;    // 0: the camera stays at the takeoff height, 1: rises with the skater
-    float rise_degrees = 15.0f;    // the camera swings up over the skater by this much in a big air
-    float rise_full_height = 2.0f; // m: apex above the takeoff, or drop below it, for the full rise
-    float ease_time = 0.35f;       // s: how fast the rise and the height follow ease in and out
+    float follow_height = 1.0f;    // 0: the camera stays at the takeoff height, 1: rises with the skater
+    float rise_degrees = 20.0f;    // the camera swings up over the skater by this much in a big air
+    float rise_full_height = 1.5f; // m: apex above the takeoff, or drop below it, for the full rise
+    float ease_time = 0.35f;       // s: how slowly the rise and the height follow ease back after landing (they build ~3x faster)
     bool keep_in_frame = true;     // aim the view so the skater never leaves the screen in the air
 
     bool valid() const noexcept {

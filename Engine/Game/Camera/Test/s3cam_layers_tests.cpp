@@ -205,7 +205,9 @@ void test_fov_speed_term() {
     CameraMan cam;
     const Run run = drive(cam, rider, world, 1.0f, 60.0f, extras);
     const float at_tc = run.frames[static_cast<std::size_t>(std::lround(0.35f * 60.0f))].debug.fov_extra;
-    expect(close_to(at_tc, 4.2f * (1.0f - std::exp(-1.0f)), 0.15f), "fov: one smoothing_time covers 1 - 1/e of the way");
+    // Two first-order stages of smoothing_time / 2 each (ease2_to): after one smoothing_time the response
+    // to a step is 1 - e^-2 (1 + 2) = 1 - 3 e^-2.
+    expect(close_to(at_tc, 4.2f * (1.0f - 3.0f * std::exp(-2.0f)), 0.15f), "fov: one smoothing_time covers 1 - 3/e^2 of the way (two-stage ease)");
 
     // smoothing_time 0 = immediate; every term can be switched off; the override is a base too.
     CameraSettings instant;
@@ -314,6 +316,13 @@ void test_landing_look() {
     world.drop_z = rider.edge_z;
     world.drop_to = -rider.drop_height;
     CameraSettings on, off;
+    // Measure the landing look alone: the big-air rise (on by default) already tilts both cameras down
+    // toward a drop, which would hide most of the difference.
+    for (CameraSettings* c : {&on, &off}) {
+        c->air_camera.rise_degrees = 0.0f;
+        c->air_camera.follow_height = 0.0f;
+        c->air_camera.keep_in_frame = false;
+    }
     off.look.landing_look = false;
     CameraMan cam_on = make_camera(on), cam_off = make_camera(off);
     const Run with_look = drive(cam_on, rider, world, 5.0f);
@@ -1715,6 +1724,7 @@ void test_air_camera_layers() {
         // rise_degrees alone: the camera is higher and the elevation eases in and out.
         CameraSettings rise = plain;
         rise.air_camera.rise_degrees = 15.0f;
+        rise.air_camera.rise_full_height = 2.0f; // the scaling check below assumes full at 2 m (default is 1.5)
         const AirTrace risen = run_air(rise, 0, 60.0f);
         const float rise_at_apex = risen.frames[apex].debug.air_rise / degrees;
         expect(rise_at_apex > 10.0f && rise_at_apex <= 15.0f, name + "a 4 m air rises about rise_degrees at the apex");
@@ -1723,7 +1733,10 @@ void test_air_camera_layers() {
         expect(std::abs(risen.frames.back().debug.air_rise) < 0.1f * degrees, name + "the rise is back to 0 after the landing");
         float worst_rise_step = 0.0f;
         for (std::size_t i = 1; i < risen.frames.size(); ++i) worst_rise_step = std::max(worst_rise_step, std::abs(risen.frames[i].debug.air_rise - risen.frames[i - 1].debug.air_rise));
-        expect(worst_rise_step < 1.0f * degrees, name + "the rise eases (under 1 deg a frame)");
+        // The rise builds about 2x faster than it releases (Alpha 4 tuning: a slow build left the camera
+        // below the rising skater, looking up), through the two-stage ease, so it starts gently: ~1.05
+        // deg/frame at most for 15 deg.
+        expect(worst_rise_step < 1.5f * degrees, name + "the rise eases (under 1.5 deg a frame)");
         // The rise scales with the size of the air: a 1 m jump (rise_full_height 2) gets about half of a 4 m one.
         float small_peak = 0.0f, big_peak = 0.0f;
         for (const Frame& f : run_air(rise, 0, 60.0f, 1.0f).frames) small_peak = std::max(small_peak, f.debug.air_rise);

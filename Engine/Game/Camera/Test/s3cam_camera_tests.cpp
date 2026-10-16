@@ -641,6 +641,13 @@ void test_huge_dt_resumes() {
 // (the Gate 1 notes measured about 0.12 m while the air / landing weights moved the weighted point).
 void test_anchor_independent_of_weights() {
     CameraMan cam;
+    // Measure the shot weights alone: the big-air follow and rise (Alpha 4 defaults) move the orbit
+    // anchor on purpose while they release after the landing.
+    CameraSettings neutral;
+    neutral.air_camera.follow_height = 0.0f;
+    neutral.air_camera.rise_degrees = 0.0f;
+    neutral.air_camera.keep_in_frame = false;
+    cam.set_settings(neutral);
     const Session session;
     const float anchor_y = ride_height - 0.9f + 0.32f; // root - board_drop + anchor_height
     float worst = 0.0f, worst_ground = 0.0f;
