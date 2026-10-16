@@ -140,10 +140,15 @@ struct FollowSettings {
     bool dynamic = true;         // follow tighter as speed rises
     float dynamic_speed = 12.0f; // m/s where the dynamic boost is full
     float dynamic_boost = 0.5f;  // added to strength at that speed
+    // Horizontal follow, 0-10 (Alpha 5 feedback, "like vanilla"): how firmly the camera swings round
+    // behind the direction you ride. 0 keeps the normal lazy swing, 10 locks it straight behind (a fixed
+    // chase camera).
+    float horizontal = 0.0f;
 
     bool valid() const noexcept {
         const auto ok = [](float v, float lo, float hi) { return std::isfinite(v) && v >= lo && v <= hi; };
-        return ok(strength, 0.2f, 4.0f) && ok(dynamic_speed, 0.5f, 60.0f) && ok(dynamic_boost, 0.0f, 3.0f);
+        return ok(strength, 0.2f, 4.0f) && ok(dynamic_speed, 0.5f, 60.0f) && ok(dynamic_boost, 0.0f, 3.0f) &&
+               ok(horizontal, 0.0f, 10.0f);
     }
 };
 
@@ -185,6 +190,20 @@ struct SpeedShakeSettings {
     }
 };
 
+// How hard a landing was, for the landing shake (Alpha 5 feedback: a light nollie gave a full shake).
+// Measured from how far the skater fell, from the highest point of the air to the landing, which flip
+// tricks and board spin cannot fake; a little forward speed is added.
+struct LandingShakeSettings {
+    float min_fall = 0.5f;     // m: landings that fell less than this do not shake
+    float full_fall = 2.5f;    // m: a fall this big gives the full landing shake
+    float speed_weight = 0.1f; // share of the forward speed added to the impact speed
+
+    bool valid() const noexcept {
+        const auto ok = [](float v, float lo, float hi) { return std::isfinite(v) && v >= lo && v <= hi; };
+        return ok(min_fall, 0.0f, 10.0f) && ok(full_fall, 0.1f, 30.0f) && full_fall > min_fall && ok(speed_weight, 0.0f, 1.0f);
+    }
+};
+
 // Camera collision (T8 positioner): walls, poles and the ground between the skater and the camera.
 struct CollisionSettings {
     bool enabled = true;
@@ -210,11 +229,15 @@ struct FramingSettings {
     bool manual_camera = true;          // manuals / nose manuals use the manual close-up
     float manual_distance_scale = 0.75f; // the manual shots' distance relative to the chase (a grind-like close-up, not too close)
     float manual_height_degrees = 0.0f; // added to the manual shots' elevation
+    bool grind_camera = true;           // grinds use the grind close-up
+    float grind_distance_scale = 1.0f;  // the grind shots' distance (their own, ~1.5-1.7 m) times this
+    float grind_height_degrees = 0.0f;  // added to the grind shots' elevation
 
     bool valid() const noexcept {
         const auto ok = [](float v, float lo, float hi) { return std::isfinite(v) && v >= lo && v <= hi; };
         return ok(distance_scale, 0.4f, 3.0f) && ok(height_degrees, -30.0f, 45.0f) && ok(pitch_degrees, -30.0f, 30.0f) &&
-               ok(manual_distance_scale, 0.3f, 1.5f) && ok(manual_height_degrees, -30.0f, 45.0f);
+               ok(manual_distance_scale, 0.3f, 1.5f) && ok(manual_height_degrees, -30.0f, 45.0f) &&
+               ok(grind_distance_scale, 0.3f, 2.0f) && ok(grind_height_degrees, -30.0f, 45.0f);
     }
 };
 
@@ -280,13 +303,14 @@ struct CameraSettings {
     FramingSettings framing_high; // the High camera's position
     TrickYawSettings trick_yaw;
     AirCameraSettings air_camera;
+    LandingShakeSettings landing_shake;
 
     bool valid() const noexcept {
         return std::isfinite(fov_override_deg) && fov_override_deg >= 0.0f && fov_override_deg < 180.0f && rig.valid() && orientation.valid() && air.valid() &&
                shake.valid() && trajectory.valid() && graph.valid() && points.valid() && native_plus.valid() &&
                pipeline.valid() && look.valid() && shoulder.valid() && follow.valid() && fov.valid() &&
                speed_shake.valid() && collision.valid() && framing.valid() && trick_yaw.valid() &&
-               framing_high.valid() && air_camera.valid();
+               framing_high.valid() && air_camera.valid() && landing_shake.valid();
     }
 };
 
