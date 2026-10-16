@@ -743,8 +743,13 @@ void test_collision_wall() {
     world.has_wall = true;
     world.wall_z = -0.9f; // between the skater (z = 0) and the camera (about 1.79 m behind)
     const Vec3 pivot{0.0f, 0.95f, 0.0f}; // the Low standing look target
+    // Alpha 6: the collision's minimum is distance.min (default 1.2 m). This test is about the pull-in geometry with a
+    // wall 0.65 m away, which the default minimum would (rightly) not follow, so it runs with the old 0.5 m minimum.
+    // The default minimum and the lift over a close wall are tested in test_distance_limits.
+    CameraSettings narrow;
+    narrow.distance.min = 0.5f;
 
-    CameraSettings off;
+    CameraSettings off = narrow;
     off.collision.enabled = false;
     CameraMan c_off = make_camera(off);
     const Run free_run = drive(c_off, rider, world, 2.0f);
@@ -752,7 +757,7 @@ void test_collision_wall() {
     expect(free_run.frames.back().debug.collision_pull == 0.0f, "collision off: no pull");
     const float free_distance = length(sub(free_run.frames.back().pos, pivot));
 
-    CameraMan cam;
+    CameraMan cam = make_camera(narrow);
     const Run run = drive(cam, rider, world, 2.0f);
     const Frame& settled = run.frames.back();
     const float expected_z = world.wall_z + 0.25f * std::abs(normalized(sub(settled.pos, pivot))[2]);
@@ -765,13 +770,13 @@ void test_collision_wall() {
     const Vec3 to_pivot = normalized(sub(pivot, settled.pos));
     expect(dot(to_pivot, scale(settled.back, -1.0f)) > std::cos(12.0f * degrees), "collision: the skater stays within 12 degrees of the view axis");
     // A cut with the wall already there lands pulled in (the state snaps).
-    CameraMan cut;
+    CameraMan cut = make_camera(narrow);
     const Frame& first = cut.update(one_frame, rider.at(0.0f), world);
     expect(first.debug.reset && first.pos[2] > world.wall_z, "collision: a cut is already in front of the wall (no ease from outside it)");
 
     // Pull-in is near instant: the camera is in front of the wall within a few frames of it appearing.
     World clear;
-    CameraMan c2;
+    CameraMan c2 = make_camera(narrow);
     const Run before = drive(c2, rider, clear, 1.0f);
     expect(before.frames.back().pos[2] < world.wall_z, "collision: without the wall the camera is behind that place");
     float frames_to_clear = -1.0f;
@@ -812,16 +817,20 @@ void test_collision_min_distance_and_budget() {
     world.has_wall = true;
     world.wall_z = -0.1f; // almost touching the skater: radius would put the camera at the pivot
     const Vec3 pivot{0.0f, 0.95f, 0.0f};
-    CameraMan cam;
+    // Alpha 6: the minimum is DistanceLimits::min (collision.min_distance is unused). 0.5 m here, as before.
+    CameraSettings narrow;
+    narrow.distance.min = 0.5f;
+    CameraMan cam = make_camera(narrow);
     const Run run = drive(cam, rider, world, 2.0f);
     const float distance = length(sub(run.frames.back().pos, pivot));
-    expect(distance >= 0.5f - 0.01f, "collision: the camera never gets closer than min_distance (0.5 m) to the pivot");
-    expect(distance < 0.55f, "collision: and sits at min_distance when the wall is that close");
+    expect(distance >= 0.5f - 0.01f, "collision: the camera never gets closer than distance.min (0.5 m) to the pivot");
+    expect(distance < 0.7f, "collision: and sits near distance.min when the wall is that close (lifted a little over it)");
     CameraSettings wide;
-    wide.collision.min_distance = 1.2f;
+    wide.distance.min = 1.2f;
+    wide.collision.min_distance = 0.1f; // ignored
     CameraMan c2 = make_camera(wide);
     const Run r2 = drive(c2, rider, world, 2.0f);
-    expect(length(sub(r2.frames.back().pos, pivot)) >= 1.2f - 0.01f, "collision: min_distance is a setting");
+    expect(length(sub(r2.frames.back().pos, pivot)) >= 1.2f - 0.01f, "collision: distance.min is the setting, collision.min_distance is ignored");
 
     // Ray budget: at most two rays per fixed step on the ground.
     World counting;
@@ -1919,13 +1928,20 @@ void test_framing_per_angle() {
 // Allocation counter for the "nothing allocates" check: the global operator new counts its calls. The test reads
 // the counter around the camera updates only (the vectors that script the run are filled before).
 std::size_t alloc_count = 0;
-void* operator new(std::size_t bytes) {
+// GCC -O2 inlines these into the vector code and then warns that free() meets memory from operator new (a false
+// positive, the pair is ours); keeping them out of line avoids it. MSVC has no such warning.
+#if defined(__GNUC__)
+#define S3CAM_TEST_NOINLINE __attribute__((noinline))
+#else
+#define S3CAM_TEST_NOINLINE
+#endif
+S3CAM_TEST_NOINLINE void* operator new(std::size_t bytes) {
     ++alloc_count;
     if (void* block = std::malloc(bytes != 0 ? bytes : 1)) return block;
     throw std::bad_alloc();
 }
-void operator delete(void* block) noexcept { std::free(block); }
-void operator delete(void* block, std::size_t) noexcept { std::free(block); }
+S3CAM_TEST_NOINLINE void operator delete(void* block) noexcept { std::free(block); }
+S3CAM_TEST_NOINLINE void operator delete(void* block, std::size_t) noexcept { std::free(block); }
 
 
 
@@ -2407,6 +2423,7 @@ void test_grind_framing_settings() {
     expect(close_to(grind_debug(wide).distance, base.distance * 2.0f, 0.04f), "grind framing: grind_distance_scale multiplies the grind shot's own distance");
     CameraSettings tight;
     tight.framing.grind_distance_scale = 0.5f;
+    tight.distance.min = 0.5f; // Alpha 6: the default minimum (1.2 m) would clamp the halved grind distance
     expect(close_to(grind_debug(tight).distance, base.distance * 0.5f, 0.04f), "grind framing: and 0.5 halves it");
     CameraSettings tall;
     tall.framing.grind_height_degrees = 15.0f;
@@ -2456,6 +2473,269 @@ void test_grind_framing_settings() {
 }
 
 // ---------------------------------------------------------------- task 5: framing changes show at once
+
+// ---------------------------------------------------------------- Alpha 6: board anchoring, distance limits
+
+// A Script whose snapshots carry the board body's position: the estimate (root - 0.9 m) plus an offset.
+struct BoardSource {
+    Script script;
+    Vec3 board_offset{0, 0, 0};
+    bool carries_board = true;
+    SubjectSnapshot at(float time) const {
+        SubjectSnapshot snap = script.at(time);
+        if (carries_board) {
+            snap.board_position = add(snap.position, add({0.0f, -0.9f, 0.0f}, board_offset));
+            snap.board_valid = true;
+        }
+        return snap;
+    }
+    Vec3 board_at(float time) const { return add(add(script.at(time).position, {0.0f, -0.9f, 0.0f}), board_offset); }
+};
+
+BoardSource manual_source(float speed, const Vec3& board_offset) {
+    BoardSource src;
+    src.script.rider.speed = speed;
+    src.script.manuals.push_back({0.0f, 100.0f});
+    src.board_offset = board_offset;
+    return src;
+}
+BoardSource grind_source(float speed, const Vec3& board_offset) {
+    BoardSource src;
+    src.script.rider.speed = speed;
+    src.script.grinds.push_back({0.0f, 100.0f});
+    src.board_offset = board_offset;
+    return src;
+}
+std::vector<Frame> run_board(const CameraSettings& cs, const BoardSource& src, float seconds, float fps = 60.0f) {
+    World ground_world;
+    ground_world.upper_y = -1000.0f;
+    CameraMan cam_man = make_camera(cs);
+    std::vector<Frame> out_frames;
+    drive_between(cam_man, src, ground_world, 0.0f, seconds, fps, out_frames);
+    return out_frames;
+}
+// Degrees the point sits above (+) the view axis, as the camera sees it.
+float board_screen_pitch_deg(const Frame& f, const Vec3& point) {
+    const Vec3 line = normalized(sub(point, f.pos));
+    return std::asin(std::clamp(dot(line, f.up), -1.0f, 1.0f)) / degrees;
+}
+
+void test_board_anchor_follows_board() {
+    for (const bool grind : {false, true}) {
+        const char* tag = grind ? "board anchor (grind): " : "board anchor (manual): ";
+        const Vec3 away{0.4f, 0.6f, 0.0f}; // the board body sits well off the estimate
+        const BoardSource src = grind ? grind_source(3.0f, away) : manual_source(3.0f, away);
+        CameraSettings on;
+        on.look.manual_focus = on.look.grind_focus = 0.0f; // aim at the board itself
+        on.shake_enabled = false;
+        CameraSettings off = on;
+        off.look.board_anchor = false;
+        const std::vector<Frame> with_anchor = run_board(on, src, 5.0f);
+        const std::vector<Frame> without = run_board(off, src, 5.0f);
+        const Frame& fa = with_anchor.back();
+        const Frame& fo = without.back();
+        const Vec3 board = src.board_at(4.99f);
+        expect(fa.debug.board_weight > 0.99f && fo.debug.board_weight == 0.0f, std::string(tag) + "the weight is 1 on, 0 off");
+        expect(close_to(fa.debug.look_target[0], board[0], 0.03f) && close_to(fa.debug.look_target[1], board[1], 0.05f),
+               std::string(tag) + "the look target follows the real board (focus 0)");
+        expect(!close_to(fo.debug.look_target[1], board[1], 0.3f), std::string(tag) + "board_anchor off keeps aiming at the estimate");
+        // The orbit anchor: board + 0.3 m in height, and the board's side offset (the rig has no sideways lag).
+        expect(close_to(fa.debug.orbit_anchor[0], board[0], 0.03f) && close_to(fa.debug.orbit_anchor[1], board[1] + 0.3f, 0.05f),
+               std::string(tag) + "the camera orbits the board plus ~0.3 m");
+        expect(close_to(fo.debug.orbit_anchor[0], 0.0f, 0.03f), std::string(tag) + "board_anchor off orbits the root-based anchor");
+        // The 0.3 m floor is measured from the real board.
+        float lowest = 1.0e9f;
+        for (std::size_t i = 240; i < with_anchor.size(); ++i) lowest = std::min(lowest, with_anchor[i].pos[1] - src.board_at(static_cast<float>(i) / 60.0f)[1]);
+        expect(lowest > 0.3f - 0.02f, std::string(tag) + "the camera stays 0.3 m above the real board");
+        // No board_valid: the estimate is used, anchoring changes nothing.
+        BoardSource no_board = src;
+        no_board.carries_board = false;
+        const std::vector<Frame> estimate_run = run_board(on, no_board, 5.0f);
+        expect(close_to(estimate_run.back().debug.look_target[1], root_height - on.points.board_drop, 0.05f),
+               std::string(tag) + "without board_valid the estimate is the board point");
+    }
+}
+
+void test_board_anchor_smooth_and_off_unchanged() {
+    for (const float fps : {30.0f, 60.0f, 144.0f}) {
+        BoardSource src;
+        src.script.rider.speed = 3.0f;
+        src.script.manuals.push_back({2.0f, 4.0f});
+        src.board_offset = {0.5f, 0.4f, 0.0f};
+        CameraSettings on;
+        on.shake_enabled = false;
+        on.look.manual_focus = 0.0f;
+        const std::vector<Frame> frames_on = run_board(on, src, 7.0f, fps);
+        float worst_anchor = 0.0f, worst_camera = 0.0f, worst_look = 0.0f;
+        bool saw_partial = false;
+        float peak_weight = 0.0f;
+        for (std::size_t i = 1; i < frames_on.size(); ++i) {
+            // x and y only: z is the ride itself.
+            const auto side_step = [&](const Vec3& a_pos, const Vec3& b_pos) { return std::max(std::abs(a_pos[0] - b_pos[0]), std::abs(a_pos[1] - b_pos[1])); };
+            worst_anchor = std::max(worst_anchor, side_step(frames_on[i].debug.orbit_anchor, frames_on[i - 1].debug.orbit_anchor));
+            worst_camera = std::max(worst_camera, side_step(frames_on[i].pos, frames_on[i - 1].pos));
+            worst_look = std::max(worst_look, side_step(frames_on[i].debug.look_target, frames_on[i - 1].debug.look_target));
+            const float w = frames_on[i].debug.board_weight;
+            saw_partial = saw_partial || (w > 0.1f && w < 0.9f);
+            peak_weight = std::max(peak_weight, w);
+        }
+        const float budget = 0.05f * std::max(1.0f, 60.0f / fps);
+        const std::string tag = fps_tag("board anchor", fps);
+        expect(worst_anchor < budget && worst_camera < budget && worst_look < budget,
+               tag + "entering and leaving moves the anchor, camera and look target by under 5 cm per 1/60 s");
+        if (!(worst_anchor < budget && worst_camera < budget && worst_look < budget))
+            std::printf("  anchor %.3f camera %.3f look %.3f (budget %.3f)\n", static_cast<double>(worst_anchor), static_cast<double>(worst_camera),
+                        static_cast<double>(worst_look), static_cast<double>(budget));
+        expect(saw_partial && peak_weight > 0.99f && frames_on.back().debug.board_weight < 0.02f,
+               tag + "the weight eases up to 1 and back to 0 (no snap)");
+    }
+    // board_anchor off: the board position is ignored, whatever the snapshot says (same frames as a snapshot without it).
+    BoardSource with_board;
+    with_board.script.rider.speed = 7.0f;
+    with_board.script.manuals.push_back({1.0f, 3.0f});
+    with_board.script.grinds.push_back({4.0f, 5.5f});
+    with_board.board_offset = {0.5f, 0.5f, 0.2f};
+    BoardSource without_board = with_board;
+    without_board.carries_board = false;
+    CameraSettings off;
+    off.look.board_anchor = false;
+    const std::vector<Frame> fa = run_board(off, with_board, 7.0f), fb = run_board(off, without_board, 7.0f);
+    float worst_diff = 0.0f;
+    for (std::size_t i = 0; i < fa.size(); ++i) worst_diff = std::max(worst_diff, length(sub(fa[i].pos, fb[i].pos)));
+    expect(worst_diff < 1e-5f && fa.back().debug.board_weight == 0.0f, "board anchor off: the frames ignore board_position (as before)");
+    // And outside manuals / grinds the real board changes nothing even with anchoring on.
+    CameraSettings on;
+    const std::vector<Frame> ga = run_board(on, with_board, 0.9f), gb = run_board(on, without_board, 0.9f);
+    float worst_chase = 0.0f;
+    for (std::size_t i = 0; i < ga.size(); ++i) worst_chase = std::max(worst_chase, length(sub(ga[i].pos, gb[i].pos)));
+    expect(worst_chase < 1e-5f, "board anchor on: the chase shot is unchanged");
+}
+
+void test_board_anchor_pitch_steady() {
+    for (const bool grind : {false, true}) {
+        const char* tag = grind ? "board pitch (grind): " : "board pitch (manual): ";
+        const BoardSource src = grind ? grind_source(3.0f, {0.0f, 0.3f, 0.0f}) : manual_source(3.0f, {0.0f, 0.3f, 0.0f});
+        const auto screen_pitch = [&](bool anchored, float pitch_deg) {
+            CameraSettings cs;
+            cs.shake_enabled = false;
+            cs.look.manual_focus = cs.look.grind_focus = 0.0f;
+            cs.look.board_anchor = anchored;
+            cs.framing.pitch_degrees = pitch_deg;
+            const std::vector<Frame> got = run_board(cs, src, 6.0f);
+            return board_screen_pitch_deg(got.back(), src.board_at(5.99f));
+        };
+        const float a0 = screen_pitch(true, 0.0f), a_up = screen_pitch(true, 10.0f), a_down = screen_pitch(true, -10.0f);
+        const float b0 = screen_pitch(false, 0.0f), b_up = screen_pitch(false, 10.0f);
+        std::printf("  %sboard on screen (deg above the axis): anchored 0 -> %.2f, +10 -> %.2f, -10 -> %.2f; not anchored 0 -> %.2f, +10 -> %.2f\n", tag,
+                    static_cast<double>(a0), static_cast<double>(a_up), static_cast<double>(a_down), static_cast<double>(b0), static_cast<double>(b_up));
+        expect(std::abs(a_up - a0) < 1.0f && std::abs(a_down - a0) < 1.0f, std::string(tag) + "with anchoring the pitch setting keeps the board in the same place on screen");
+        expect(std::abs(b_up - b0) > 5.0f, std::string(tag) + "without it the pitch moves the board on screen (as before)");
+    }
+}
+
+// Distance from the orbit anchor to the published camera over the frames from `first` on.
+void distance_range(const std::vector<Frame>& got, std::size_t first, float& lowest, float& highest) {
+    lowest = 1.0e9f;
+    highest = 0.0f;
+    for (std::size_t i = first; i < got.size(); ++i) {
+        const float span = length(sub(got[i].pos, got[i].debug.orbit_anchor));
+        lowest = std::min(lowest, span);
+        highest = std::max(highest, span);
+    }
+}
+
+void test_distance_limits() {
+    // The manual close-up at 0.3 x the chase (about 0.8 m) is held at the 1.2 m minimum; grinds too.
+    for (const bool grind : {false, true}) {
+        const char* tag = grind ? "distance (grind close-up): " : "distance (manual close-up): ";
+        BoardSource src = grind ? grind_source(3.0f, {0.0f, 0.0f, 0.0f}) : manual_source(3.0f, {0.0f, 0.0f, 0.0f});
+        CameraSettings cs;
+        cs.shake_enabled = false;
+        cs.framing.manual_distance_scale = 0.3f;
+        cs.framing.grind_distance_scale = 0.3f;
+        for (const bool anchored : {true, false}) {
+            cs.look.board_anchor = anchored;
+            const std::vector<Frame> got = run_board(cs, src, 5.0f);
+            float lowest = 0.0f, highest = 0.0f;
+            distance_range(got, 0, lowest, highest);
+            expect(lowest >= cs.distance.min - 1e-3f, std::string(tag) + (anchored ? "never closer than distance.min (anchored)" : "never closer than distance.min (not anchored)"));
+            expect(close_to(got.back().debug.distance, cs.distance.min, 0.01f), std::string(tag) + "and the rig distance rests at the minimum");
+        }
+        CameraSettings with_shake = cs;
+        with_shake.shake_enabled = true;
+        float lowest = 0.0f, highest = 0.0f;
+        distance_range(run_board(with_shake, src, 5.0f), 0, lowest, highest);
+        expect(lowest >= cs.distance.min - 0.06f, std::string(tag) + "also with the shake on (a few cm of shake translation)");
+    }
+    // The maximum: a distance scale of 3 asks for 7 m, the limit holds it.
+    {
+        CameraSettings far_cs;
+        far_cs.shake_enabled = false;
+        far_cs.framing.distance_scale = 3.0f;
+        BoardSource ride_src;
+        ride_src.script.rider.speed = 7.0f;
+        float lowest = 0.0f, highest = 0.0f;
+        distance_range(run_board(far_cs, ride_src, 5.0f), 0, lowest, highest);
+        expect(highest <= far_cs.distance.max + 1e-3f && highest > far_cs.distance.max - 0.05f, "distance: never further than distance.max (6 m), and it reaches it");
+        far_cs.distance.max = 3.0f;
+        distance_range(run_board(far_cs, ride_src, 5.0f), 0, lowest, highest);
+        expect(highest <= 3.0f + 1e-3f, "distance: and the maximum is a setting");
+    }
+    // A wall closer than the minimum: the camera keeps the minimum and goes up over it, eased.
+    {
+        Rider still;
+        still.speed = 0.0f;
+        World wall_world;
+        wall_world.has_wall = true;
+        wall_world.wall_z = -0.3f;
+        World clear_world;
+        CameraSettings cs;
+        cs.shake_enabled = false;
+        CameraMan walled = make_camera(cs), open = make_camera(cs);
+        const Run walled_run = drive(walled, still, wall_world, 3.0f);
+        const Run open_run = drive(open, still, clear_world, 3.0f);
+        float lowest = 0.0f, highest = 0.0f;
+        distance_range(walled_run.frames, 0, lowest, highest);
+        expect(lowest >= cs.distance.min - 1e-3f, "distance: a wall closer than the minimum does not pull the camera inside it");
+        expect(walled_run.frames.back().pos[1] > open_run.frames.back().pos[1] + 0.15f, "distance: it lifts the camera up over the obstacle instead");
+        // A wall appearing mid-ride: the lift is eased (no jump).
+        CameraMan late = make_camera(cs);
+        const Run before = drive(late, still, clear_world, 1.0f);
+        (void)before;
+        Vec3 previous = late.frame().pos;
+        float worst_step = 0.0f;
+        for (int i = 0; i < 120; ++i) {
+            const Frame& f = late.update(one_frame, still.at(1.0f), wall_world);
+            worst_step = std::max(worst_step, std::abs(f.pos[1] - previous[1])); // the lift is vertical; the pull-in is near instant by design
+            previous = f.pos;
+        }
+        std::printf("  wall lift worst step %.3f\n", static_cast<double>(worst_step));
+        expect(worst_step < 0.12f, "distance: the lift over a close wall moves the camera up by under 12 cm a frame");
+    }
+    // NativePlus keeps the game's own distance: a 2 m native camera is not pushed out to a 3 m minimum.
+    {
+        CameraSettings np;
+        np.preset = CameraPreset::NativePlus;
+        np.shake_enabled = false;
+        np.distance.min = 3.0f;
+        np.distance.max = 3.5f;
+        Rider ride;
+        ride.speed = 5.0f;
+        World ground_world;
+        ground_world.upper_y = -1000.0f;
+        CameraMan cam_np = make_camera(np);
+        float closest = 1.0e9f;
+        for (int i = 0; i < 180; ++i) {
+            const SubjectSnapshot snap = ride.at(static_cast<float>(i) / 60.0f);
+            const NativePose pose = follower_pose(snap);
+            FrameExtras fx;
+            fx.native = &pose;
+            const Frame& f = cam_np.update(one_frame, snap, ground_world, fx);
+            closest = std::min(closest, length(sub(f.pos, snap.position)));
+        }
+        expect(closest < 2.6f, "distance: NativePlus leaves the native distance alone");
+    }
+}
 
 void test_framing_changes_apply_quickly() {
     World world;
@@ -2562,6 +2842,10 @@ int main() {
     test_manual_grind_floor();
     test_grind_framing_settings();
     test_framing_changes_apply_quickly();
+    test_board_anchor_follows_board();
+    test_board_anchor_smooth_and_off_unchanged();
+    test_board_anchor_pitch_steady();
+    test_distance_limits();
     if (failures == 0) std::printf("s3cam_layers_tests: all passed\n");
     return failures == 0 ? 0 : 1;
 }

@@ -236,3 +236,4 @@ with file:line and a concrete failure scenario. Do not edit code.
 - 2026-10-16: Alpha 4 fixes (menu flag hand-back, air collision smoothing) confirmed in game; Alpha 5:
   fall-based landing shake, horizontal follow, smooth close-up exits, board floor in manuals/grinds,
   immediate height, per-camera manual/grind close-ups, plain tooltips (Sonnet x2, reviewed).
+- 2026-10-16: Alpha 6: board anchoring for manual / grind close-ups (real board body, pitch about the board), one Minimum / Maximum distance replacing the collision minimum, wall lift (Sonnet, reviewed; 12 pure suites + presets green).

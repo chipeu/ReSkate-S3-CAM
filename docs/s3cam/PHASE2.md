@@ -170,3 +170,21 @@ board's touchdown velocity (a flat nollie no longer shakes fully); horizontal fo
 manual / grind close-ups blend over ~0.9 s; camera kept 0.3 m above the board in manuals and grinds;
 camera height changes show within ~0.5 s; manual and grind close-ups per Low / High; plain tooltips.
 The landing log line now shows the fall and the shake percentage.
+
+## Alpha 6 (Alpha 5 feedback)
+
+- Manual and grind close-ups anchor to the real board (root board body), not an estimate from the
+  hips: the camera orbits the board + 0.3 m, and the close-up pitch tilts the camera around the board,
+  so the board keeps its place on screen. Eases in over 0.3 s and out over 0.45 s (Camera tab,
+  "Follow the board").
+- One distance rule: Minimum / Maximum distance (Collision tab) replace "Closest to you". The camera
+  is never closer than the minimum or further than the maximum; a wall closer than the minimum lifts
+  the camera over it instead of pulling it into the skater. Fixes close-ups ending up in the face.
+
+### Alpha 6 test
+
+1. Manual and nose manual, then grinds on a rail and a ledge: the board stays in the same place on
+   screen; change the manual / grind pitch while in one.
+2. Minimum distance 2 m, manual and grind next to a wall: the camera rises over the wall, never
+   inside the skater. Maximum distance 3 m on a fast line: the camera never trails further.
+3. Send `logs\ReSkate.log`.

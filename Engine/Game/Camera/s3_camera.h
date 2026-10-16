@@ -123,6 +123,9 @@ struct FrameDebug {
     float exit_blend = 1.0f;           // 0..1, progress of the distance ease after leaving a manual / grind shot (1: none running)
     float floor_weight = 0.0f;         // 0..1, the eased weight of the manual / grind camera floor and pitch ceiling
     float height_offset = 0.0f;        // rad, the eased framing height added after the rig's elevation tracker
+    // Alpha 6.
+    float board_weight = 0.0f;         // 0..1, the eased weight of board anchoring (manual / grind shots with look.board_anchor)
+    Vec3 orbit_anchor{0, 0, 0};        // FullS3: the point the camera orbits (the rig anchor after the lag), interpolated like the pose; distance is measured from it
 };
 
 struct Frame {
@@ -284,6 +287,7 @@ private:
         Vec3 pos{0, 0, 0};
         float yaw = 0.0f, pitch = 0.0f, roll = 0.0f;
         Vec3 local{0, 0, 0};
+        Vec3 anchor{0, 0, 0};   // FullS3: the orbit anchor (debug only; interpolated with the pose)
         float fov_extra = 0.0f; // deg, added to the base fov at publish
         float shoulder = 0.0f;  // m along the camera's right. Already folded into `pos` in FullS3; NativePlus adds it at publish
         bool finite() const noexcept {
@@ -315,16 +319,19 @@ private:
         out.forward = normalized(lerp(a.forward, b.forward, f), b.forward);
         out.ground_normal = normalized(lerp(a.ground_normal, b.ground_normal, f), b.ground_normal);
         out.ground_clearance = camera_detail::lerp_f(a.ground_clearance, b.ground_clearance, f);
+        // The board body's position: interpolated when both ends have it, else the nearer end's (already in `out`).
+        if (a.board_valid && b.board_valid) out.board_position = lerp(a.board_position, b.board_position, f);
         out.valid = true;
         return out;
     }
 
     // The ten reference points (Head, Hips, Grind, COM, Board, Trajectory, Anchor, Feet, DampedCOM,
-    // unnamed) from the root position. The snapshot has no skeleton, so these are fixed offsets.
-    std::array<Vec3, 10> reference_points(const SubjectSnapshot& s) const noexcept {
+    // unnamed) from the root position. The snapshot has no skeleton, so these are fixed offsets, except the
+    // board: `board` is the estimate (root - board_drop) or, in a manual / grind with board anchoring, the
+    // real board point (Alpha 6).
+    std::array<Vec3, 10> reference_points(const SubjectSnapshot& s, const Vec3& board) const noexcept {
         const SubjectPointSettings& p = settings_.points;
         const Vec3 root = s.position;
-        const Vec3 board = add(root, {0, -p.board_drop, 0});
         Vec3 trajectory = board;
         if (s.air()) {
             const float t = p.trajectory_lookahead;
@@ -564,13 +571,15 @@ private:
         air_w_ = rise_w_ = keep_off_ = framing_pitch_ = last_shake_pitch_ = 0.0f;
         fov_extra_stage_ = landing_w_stage_ = look_pitch_stage_ = air_w_stage_ = rise_w_stage_ = 0.0f;
         landing_point_stage_ = landing_point_;
-        coll_pull_ = coll_lift_ = coll_pull_stage_ = coll_lift_stage_ = 0.0f;
+        coll_pull_ = coll_lift_ = coll_pull_stage_ = coll_lift_stage_ = coll_wall_ = coll_wall_stage_ = 0.0f;
         trick_yaw_ = TrickYawState{};
         hf_w_ = hf_w_stage_ = hf_move_w_ = hf_move_stage_ = hf_move_goal_ = 0.0f;
         travel_heading_ = travel_stage_ = 0.0f;
         exit_active_ = false;
         exit_blend_ = 1.0f;
         floor_w_ = floor_w_stage_ = height_off_ = height_stage_ = 0.0f;
+        board_w_ = board_w_stage_ = 0.0f;
+        board_rel_ = board_rel_stage_ = {0, 0, 0};
         air_peak_y_ = 0.0f;
         last_landing_fall_ = last_landing_fraction_ = 0.0f;
         layers_ = {};
@@ -611,8 +620,7 @@ private:
             leaf_ = framed(blend_shots(shots_, first.chase_blend), first.shot, first.chase_blend);
             current_ = from_ = leaf_;
         }
-        const std::array<Vec3, 10> points = reference_points(s);
-        const Vec3 anchor_pt = anchor_point(s);
+        const Vec3 anchor_pt = anchor_point(s); // the root-based orbit anchor; the reference points come after the shot pick (board anchoring)
 
         // ---- forward acceleration -> pump / push (decision 2)
         // Grounded only: the in-air forward vector spins with the trick, so its projection is not a speed. The
@@ -758,6 +766,30 @@ private:
         shot_fraction_ = shot_duration_ <= 0.0f ? 1.0f : clamp01(shot_elapsed_ / std::max(shot_duration_, 1e-6f));
         current_ = interpolate(from_, leaf_, shot_fraction_);
         current_.position_heading = blend_angle(from_.position_heading, leaf_.position_heading, sine_blend(shot_fraction_));
+
+        // ---- board anchoring (Alpha 6, FullS3, LookSettings::board_anchor): in manuals and grinds the real board
+        // point replaces the root-based estimate as the board point (focus target, the camera floor, keep-in-frame,
+        // the reference points) and the rig orbits it. The board body bounces on impacts, so only its offset from the
+        // root is smoothed (two stages, ~0.12 s): smoothing the position itself would trail a moving board by
+        // metres. The weight eases in and out (the Alpha 5 close-up timings), so entering or leaving never snaps.
+        const Vec3 board_estimate = add(s.position, {0.0f, -cs.points.board_drop, 0.0f});
+        const Vec3 board_rel_raw = sub(s.board_valid ? s.board_position : board_estimate, s.position);
+        if (snap) {
+            board_rel_ = board_rel_stage_ = board_rel_raw;
+        } else {
+            for (std::size_t axis = 0; axis < 3; ++axis)
+                board_rel_[axis] = camera_detail::ease2_to(board_rel_stage_[axis], board_rel_[axis], board_rel_raw[axis], board_smooth_time, dt);
+        }
+        const Vec3 board_real = add(s.position, board_rel_);
+        const float board_goal = (!native && cs.look.board_anchor && closeup_kind(pick.shot) != 0) ? 1.0f : 0.0f;
+        if (snap) board_w_ = board_w_stage_ = board_goal;
+        else board_w_ = camera_detail::ease2_to(board_w_stage_, board_w_, board_goal, board_goal > board_w_stage_ ? floor_in_time : exit_transition_time * 0.5f, dt);
+        const Vec3 board_point = lerp(board_estimate, board_real, board_w_);
+        const std::array<Vec3, 10> points = reference_points(s, board_point);
+        // The rig's anchor: the board + a small fixed height (blended from the root-based one). Its Y is the rig's
+        // reference height, which keeps the air-held offset.
+        const Vec3 rig_point = lerp(anchor_pt, add(board_real, {0.0f, board_anchor_height, 0.0f}), board_w_);
+        const float rig_ref_y = ref_y + (rig_point[1] - anchor_pt[1]);
         const Vec3 reference_now = weighted_point(points, current_); // the blended weights: framing only
 
         // Manual / grind focus: eased with the shot transition (from the value at the change to the new
@@ -820,8 +852,8 @@ private:
             const auto follow_smoothing = [follow_k](float shot_smoothing) { return std::pow(clamp01(shot_smoothing), follow_k); };
 
             RigInput ri;
-            ri.anchor.position = anchor_pt;
-            ri.anchor.reference_height = ref_y;
+            ri.anchor.position = rig_point;
+            ri.anchor.reference_height = rig_ref_y;
             ri.anchor.velocity = s.velocity;
             ri.anchor.push_state = push_state;
             ri.anchor.push_kick = push_kick;
@@ -851,9 +883,9 @@ private:
             // kink. Only X and Z are scaled: the Y of the rig anchor is the air-held reference height, and
             // shrinking that "lag" would make the camera chase the board up in a jump.
             const float follow_inverse = 1.0f / std::max(follow_k, 0.2f);
-            rig_out.anchor[0] = anchor_pt[0] + (rig_out.anchor[0] - anchor_pt[0]) * follow_inverse;
-            rig_out.anchor[2] = anchor_pt[2] + (rig_out.anchor[2] - anchor_pt[2]) * follow_inverse;
-            rig_out.anchor_lag = length(sub({anchor_pt[0], ref_y, anchor_pt[2]}, rig_out.anchor));
+            rig_out.anchor[0] = rig_point[0] + (rig_out.anchor[0] - rig_point[0]) * follow_inverse;
+            rig_out.anchor[2] = rig_point[2] + (rig_out.anchor[2] - rig_point[2]) * follow_inverse;
+            rig_out.anchor_lag = length(sub({rig_point[0], rig_ref_y, rig_point[2]}, rig_out.anchor));
 
             // Trick yaw: orbit the anchor by the swing angle. The heading grows toward -X and the skater's right
             // is -X when the camera looks along +Z, so swinging to the skater's right DEcreases the heading.
@@ -869,7 +901,14 @@ private:
             const float height_goal = height_goal_of(pick.shot);
             if (snap) height_off_ = height_stage_ = height_goal;
             else height_off_ = camera_detail::ease2_to(height_stage_, height_off_, height_goal, height_ease_time, dt);
-            const float elevation_used = std::clamp(rig_out.elevation + rise_rad + height_off_, -85.0f * degrees, 85.0f * degrees);
+            // The framing pitch (look.response_time ease; Low and High each have their own). With board anchoring it
+            // is measured around the board: the share board_w_ tilts the camera's orbit about the board instead of
+            // the view, so the view stays aimed at the board-anchored look target and the board keeps its place on
+            // screen (+ pitch swings the camera down, so it looks up, like the view offset it replaces).
+            const float framing_pitch_goal = active_framing().pitch_degrees * degrees;
+            framing_pitch_ = snap ? framing_pitch_goal : camera_detail::ease_to(framing_pitch_, framing_pitch_goal, cs.look.response_time, dt);
+            const float elevation_used = std::clamp(rig_out.elevation + rise_rad + height_off_ - board_w_ * framing_pitch_,
+                                                    -85.0f * degrees, 85.0f * degrees);
             last_elevation_used_ = elevation_used;
             // Leaving a manual / grind close-up: the distance follows the shot blend (a sine ease over the longer
             // exit transition) from where it was, whatever the rig's distance tracker (6 m/s, fast in the air) does.
@@ -883,6 +922,9 @@ private:
             } else {
                 exit_blend_ = 1.0f;
             }
+            // One distance rule (Alpha 6): the orbit distance is held inside DistanceLimits here, and the final camera
+            // is clamped again after the shoulder / collision below (they move it off the orbit sphere).
+            distance_now = std::clamp(distance_now, cs.distance.min, cs.distance.max);
             distance_used_ = distance_now;
             const float cos_e = std::cos(elevation_used), sin_e = std::sin(elevation_used);
             const Vec3 offset_dir{-std::sin(heading_used), 0.0f, std::cos(heading_used)};
@@ -898,7 +940,7 @@ private:
             const float floor_goal = closeup_kind(pick.shot) != 0 ? 1.0f : 0.0f;
             if (snap) floor_w_ = floor_w_stage_ = floor_goal;
             else floor_w_ = camera_detail::ease2_to(floor_w_stage_, floor_w_, floor_goal, floor_goal > floor_w_stage_ ? floor_in_time : floor_out_time, dt);
-            camera[1] += floor_w_ * std::max(0.0f, points[4][1] + manual_grind_min_height - camera[1]);
+            camera[1] += floor_w_ * std::max(0.0f, points[4][1] + manual_grind_min_height - camera[1]); // points[4]: the board point
 
             // ---- look target. The shot's board_offset lifts the base above the weighted point (Rust: along
             // the subject's board-offset direction, here world up): the Low camera sits near the board and
@@ -958,6 +1000,7 @@ private:
             // its direction, and the aim below is taken from the FINAL camera position, so the orientation
             // and the position always agree.
             const float pulled = collide(ground, add(look_base, shift), camera, snap, in_air_layer);
+            camera = clamp_distance(camera, rig_out.anchor, offset_dir);
 
             // Look at the actual reference point (not the lagged anchor): the camera holds its height
             // in the air while the skater rises through the frame. The up-tilt is capped (frame_composer.rs).
@@ -978,13 +1021,13 @@ private:
             // The player's pitch offset goes in after the look offsets and before the clamp; the tilt tracker
             // below eases a change of it.
             // Low and High each have their own pitch; it eases (look.response_time) so an angle switch is smooth.
-            const float framing_pitch_goal = active_framing().pitch_degrees * degrees;
-            framing_pitch_ = snap ? framing_pitch_goal : camera_detail::ease_to(framing_pitch_, framing_pitch_goal, lk.response_time, dt);
-            pitch_target = std::clamp(pitch_target + current_.framing[2] + look_pitch_ + framing_pitch_,
+            // (framing_pitch_ is eased above; the board-anchored share of it went into the orbit elevation.)
+            const float view_pitch_offset = (1.0f - board_w_) * framing_pitch_;
+            pitch_target = std::clamp(pitch_target + current_.framing[2] + look_pitch_ + view_pitch_offset,
                                       -89.0f * degrees, 89.0f * degrees);
             // Manuals and grinds never look up (the camera is above the board there): the pitch above the player's
             // own offset is taken off by the floor's eased weight.
-            pitch_target -= floor_w_ * std::max(0.0f, pitch_target - std::max(framing_pitch_, 0.0f));
+            pitch_target -= floor_w_ * std::max(0.0f, pitch_target - std::max(view_pitch_offset, 0.0f));
             if (snap) {
                 pan_.reset(yaw_target);
                 tilt_.reset(pitch_target);
@@ -1003,6 +1046,7 @@ private:
             out.pitch = tilt_.position() + keep_pitch;
             out.roll = roll_;
             layers_.look_target = look_target;
+            out.anchor = rig_out.anchor;
             shake_distance = length(sub(camera, rig_out.anchor));
             layers_.collision_pull = pulled;
         } else {
@@ -1048,6 +1092,7 @@ private:
         layers_.follow_weight = native ? 0.0f : hf_w_ * hf_move_w_;
         layers_.floor_weight = native ? 0.0f : floor_w_;
         layers_.height_offset = native ? 0.0f : height_off_;
+        layers_.board_weight = native ? 0.0f : board_w_;
 
         // ---- shake. Speed shake (both presets): the rumble is rebuilt per step from a copy of the
         // settings, so the landing impulse (separate fields) is untouched. When the rumble is off its
@@ -1155,17 +1200,21 @@ private:
         using camera_detail::finite3;
         const CollisionSettings& col = settings_.collision;
         if (!col.enabled) {
-            coll_pull_ = coll_lift_ = coll_pull_stage_ = coll_lift_stage_ = 0.0f;
+            coll_pull_ = coll_lift_ = coll_pull_stage_ = coll_lift_stage_ = coll_wall_ = coll_wall_stage_ = 0.0f;
             return 0.0f;
         }
         const Vec3 ray = sub(camera, pivot);
         const float full = length(ray);
-        float pull_goal = 0.0f;
+        // The minimum is DistanceLimits::min (Alpha 6), not col.min_distance, which is unused (kept so old presets load).
+        const float min_distance = settings_.distance.min;
+        float pull_goal = 0.0f, wall_goal = 0.0f;
         if (full > 1e-3f) {
             if (const std::optional<GroundHit> wall = ground(pivot, camera)) {
                 if (finite3(wall->point)) {
-                    const float allowed = std::max(col.min_distance, length(sub(wall->point, pivot)) - col.radius);
-                    pull_goal = std::max(0.0f, full - allowed);
+                    const float room = length(sub(wall->point, pivot)) - col.radius;
+                    pull_goal = std::max(0.0f, full - std::max(min_distance, room));
+                    // A wall closer than the minimum: keep the minimum and lift the camera over the obstacle instead.
+                    wall_goal = std::min(wall_lift_gain * std::max(0.0f, min_distance - room), wall_lift_max);
                 }
             }
         }
@@ -1179,9 +1228,17 @@ private:
         coll_pull_ = snap ? (coll_pull_stage_ = pull_goal)
                           : camera_detail::ease2_to(coll_pull_stage_, coll_pull_, pull_goal,
                                                     pull_goal > coll_pull_stage_ ? in_time : col.release_time, fixed_step);
-        // Never closer than min_distance (a rig distance already shorter than that is left alone).
-        const float pull = std::min(coll_pull_, std::max(0.0f, full - col.min_distance));
+        // Never closer than the minimum (a rig distance already shorter than that is left alone).
+        const float pull = std::min(coll_pull_, std::max(0.0f, full - min_distance));
         if (pull > 0.0f) camera = add(pivot, scale(ray, (full - pull) / std::max(full, 1e-3f)));
+        // The lift over a too-close wall: slower in than the near-instant pull (wall_lift_time), so it reads as a swing up.
+        coll_wall_ = snap ? (coll_wall_stage_ = wall_goal)
+                          : camera_detail::ease2_to(coll_wall_stage_, coll_wall_, wall_goal,
+                                                    wall_goal > coll_wall_stage_ ? std::max(in_time, wall_lift_time) : col.release_time, fixed_step);
+        if (coll_wall_ > 1e-4f) { // swing up about the pivot (the distance to it is kept), not away from it
+            const Vec3 raised = add(sub(camera, pivot), {0.0f, coll_wall_, 0.0f});
+            camera = add(pivot, scale(raised, length(sub(camera, pivot)) / std::max(length(raised), 1e-3f)));
+        }
 
         float lift_goal = 0.0f;
         if (const std::optional<GroundHit> floor_hit = ground(add(camera, {0.0f, 1.0f, 0.0f}), sub(camera, {0.0f, col.ground_clearance, 0.0f}))) {
@@ -1192,6 +1249,20 @@ private:
                                                     lift_goal > coll_lift_stage_ ? in_time : col.release_time, fixed_step);
         camera[1] += coll_lift_;
         return pull;
+    }
+
+    // The final camera held at DistanceLimits from the orbit anchor (FullS3, one rule for every shot, close-up,
+    // the shoulder and the collision). `fallback` is the direction to use when the camera sits on the anchor.
+    Vec3 clamp_distance(const Vec3& camera, const Vec3& anchor, const Vec3& fallback) const noexcept {
+        Vec3 offset = sub(camera, anchor);
+        float span = length(offset);
+        if (span < 1e-4f) {
+            offset = fallback;
+            span = std::max(length(offset), 1e-4f);
+        }
+        const float wanted = std::clamp(span, settings_.distance.min, settings_.distance.max);
+        if (wanted == span) return camera;
+        return add(anchor, scale(offset, wanted / std::max(span, 1e-4f)));
     }
 
     // Base fov: the override, else the game camera's own (extras.base_fov_deg, then the native pose's), else
@@ -1216,6 +1287,7 @@ private:
         o.pitch = lerp_f(prev_out_.pitch, curr_out_.pitch, alpha);
         o.roll = lerp_f(prev_out_.roll, curr_out_.roll, alpha);
         o.local = lerp(prev_out_.local, curr_out_.local, alpha);
+        o.anchor = lerp(prev_out_.anchor, curr_out_.anchor, alpha);
         o.fov_extra = lerp_f(prev_out_.fov_extra, curr_out_.fov_extra, alpha);
         o.shoulder = lerp_f(prev_out_.shoulder, curr_out_.shoulder, alpha);
 
@@ -1302,6 +1374,8 @@ private:
         dbg.exit_blend = exit_blend_;
         dbg.floor_weight = layers_.floor_weight;
         dbg.height_offset = layers_.height_offset;
+        dbg.board_weight = layers_.board_weight;
+        dbg.orbit_anchor = o.anchor;
         frame_.debug = dbg;
     }
 
@@ -1361,6 +1435,9 @@ private:
     float shoulder_value_ = 0.0f, shoulder_start_ = 0.0f, shoulder_target_ = 0.0f, shoulder_elapsed_ = 0.0f; // side -1..1
     float coll_pull_ = 0.0f, coll_lift_ = 0.0f; // FullS3: smoothed pull-in and ground lift, m
     float coll_pull_stage_ = 0.0f, coll_lift_stage_ = 0.0f; // their ease2_to first stages
+    float coll_wall_ = 0.0f, coll_wall_stage_ = 0.0f;       // FullS3: the eased lift over a wall closer than DistanceLimits::min, m
+    static constexpr float wall_lift_time = 0.15f;       // s, the lift's minimum ease-in
+    static constexpr float wall_lift_gain = 2.0f, wall_lift_max = 1.0f; // m of upward offset per m the wall is inside the minimum; its cap (TUNE)
     float native_pitch_ = 0.0f;         // NativePlus: eased framing pitch offset, rad
     // Alpha 4. The eased in-air weight (follow_height), the eased rise weight, the keep-in-frame pitch offset
     // (rad), the eased manual / grind focus and the eased framing pitch (FullS3), plus what the steps need of
@@ -1395,10 +1472,15 @@ private:
     static constexpr float manual_grind_min_height = 0.3f;  // m, the least the camera sits above the board in a manual / grind
     static constexpr float floor_in_time = 0.3f, floor_out_time = 0.5f; // s, the floor weight's ease in and out
     static constexpr float height_ease_time = 0.2f;         // s, the framing height offset's ease (settles within ~0.5 s)
+    // Alpha 6 board anchoring: the board's offset from the root (smoothed, with its first stage) and the eased weight.
+    Vec3 board_rel_{0, 0, 0}, board_rel_stage_{0, 0, 0};
+    float board_w_ = 0.0f, board_w_stage_ = 0.0f;
+    static constexpr float board_anchor_height = 0.3f; // m above the board the rig orbits (the usual anchor sits ~0.32 m above it; TUNE)
+    static constexpr float board_smooth_time = 0.12f;  // s, the board offset's two-stage smoothing (it bounces on impacts)
     struct LayerDebug {
         float landing_look_weight = 0.0f, look_pitch_offset = 0.0f, follow_strength = 1.0f, collision_pull = 0.0f, trick_yaw = 0.0f;
         float air_follow_weight = 0.0f, air_reference_height = 0.0f, air_rise = 0.0f, keep_pitch_offset = 0.0f, focus_weight = 1.0f;
-        float follow_weight = 0.0f, floor_weight = 0.0f, height_offset = 0.0f;
+        float follow_weight = 0.0f, floor_weight = 0.0f, height_offset = 0.0f, board_weight = 0.0f;
         Vec3 look_target{0, 0, 0};
     } layers_;
 
