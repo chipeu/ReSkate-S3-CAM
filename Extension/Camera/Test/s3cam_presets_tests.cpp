@@ -78,6 +78,8 @@ cs::CameraSettings tuned_camera() {
     camera.framing_high.grind_height_degrees = -6.0f;
     camera.follow.horizontal = 6.5f;
     camera.landing_shake = {3.0f, 6.0f, 0.4f}; // min above the default full: the pair has to load whole
+    camera.distance = {7.0f, 12.0f}; // min above the default maximum: the pair has to load whole
+    camera.look.board_anchor = false;
     return camera;
 }
 TestOptions tuned_options() {
@@ -120,6 +122,9 @@ void json_round_trip() {
            parsed.camera.landing_shake.full_fall == 6.0f && parsed.camera.landing_shake.speed_weight == 0.4f,
            "horizontal follow and the landing shake round-trip");
     expect(parsed.camera.fov.speed_fov_min == 20.0f && parsed.camera.fov.speed_fov_max == 30.0f, "a speed FOV pair above the default maximum loads whole");
+
+    expect(parsed.camera.distance.min == 7.0f && parsed.camera.distance.max == 12.0f && !parsed.camera.look.board_anchor,
+           "the distance limits (a pair above the default maximum) and board anchoring round-trip");
 
     const auto root = parse_text(text);
     expect(root.at("version").get<int>() == 1, "the file says version 1");
@@ -303,6 +308,44 @@ void old_preset_keeps_new_defaults() {
            "manual and grind focus stay at their defaults");
 }
 
+// Alpha 6: an old preset has no distance or board-anchor keys, and may carry the retired
+// S3Cam.Collision.MinDistance. That key loads without a refusal, changes nothing (no alias), and is not saved again.
+void alpha6_keys() {
+    const cs::CameraSettings defaults;
+    {
+        Parsed parsed;
+        const std::string text = R"({"name":"Old","version":1,"values":{"S3Cam.Collision.Radius":0.4,
+            "S3Cam.Collision.MinDistance":0.1,"S3Cam.Framing.DistanceScale":0.9}})";
+        expect(sf::parse_preset(text, parsed) == sf::PresetError::none && parsed.report.refused == 0, "an old preset with MinDistance loads without errors");
+        expect(parsed.camera.collision.radius == 0.4f && parsed.camera.framing.distance_scale == 0.9f, "its other keys apply");
+        expect(parsed.camera.distance.min == defaults.distance.min && parsed.camera.distance.max == defaults.distance.max &&
+               parsed.camera.look.board_anchor == defaults.look.board_anchor, "the new settings keep their defaults (no alias)");
+        expect(parsed.camera.collision.min_distance == defaults.collision.min_distance, "the unused collision field stays at its default");
+        expect(parsed.camera.valid(), "the result is valid");
+    }
+    {
+        Parsed parsed;
+        const std::string text = R"({"name":"New","version":1,"values":{"S3Cam.Distance.Min":2.0,"S3Cam.Distance.Max":9.5,
+            "S3Cam.Look.BoardAnchor":false}})";
+        expect(sf::parse_preset(text, parsed) == sf::PresetError::none && parsed.report.refused == 0, "the new keys load");
+        expect(parsed.camera.distance.min == 2.0f && parsed.camera.distance.max == 9.5f && !parsed.camera.look.board_anchor, "with their values");
+    }
+    {
+        // A pair that breaks max >= min + 0.2 is refused on its own; the other half and the rest still load.
+        Parsed parsed;
+        const std::string text = R"({"name":"Bad","version":1,"values":{"S3Cam.Distance.Min":8.0,"S3Cam.Distance.Max":1.0,
+            "S3Cam.Look.BoardAnchor":false}})";
+        expect(sf::parse_preset(text, parsed) == sf::PresetError::none && parsed.report.refused >= 1, "a bad distance pair is refused");
+        expect(parsed.camera.valid() && parsed.camera.distance.valid() && !parsed.camera.look.board_anchor, "the result stays valid and the rest loads");
+    }
+    {
+        const auto text = sf::preset_text("Saved", defaults, TestOptions{});
+        expect(text.find("S3Cam.Collision.MinDistance") == std::string::npos, "MinDistance is no longer saved");
+        expect(text.find("S3Cam.Distance.Min") != std::string::npos && text.find("S3Cam.Distance.Max") != std::string::npos &&
+               text.find("S3Cam.Look.BoardAnchor") != std::string::npos, "the new keys are saved");
+    }
+}
+
 // A preset from a later version: unknown keys, an unknown top-level field and a changed unknown value type.
 // A preset from before Alpha 5 has no grind, horizontal follow or landing shake keys: they keep their defaults.
 void pre_alpha5_preset_loads() {
@@ -402,7 +445,7 @@ void field_table() {
         follow += entry.first == "S3Cam.Follow.Horizontal";
     }
     expect(landing == 3 && follow == 1, "three landing shake keys and the horizontal follow key");
-    expect(values.size() == 92, "92 saved keys in all");
+    expect(values.size() == 94, "94 saved keys in all");
 }
 } // namespace
 
@@ -415,6 +458,7 @@ int main() {
     builtins();
     old_preset_keeps_new_defaults();
     pre_alpha5_preset_loads();
+    alpha6_keys();
     newer_preset_loads_known_keys();
     aliases();
     field_table();

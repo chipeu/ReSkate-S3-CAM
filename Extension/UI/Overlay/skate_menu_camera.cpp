@@ -135,6 +135,15 @@ void camera_position_card(Draft& draft, PageState& state) {
         framing.height_degrees, -30.0f, 45.0f, "%.1f degrees");
     set_slider(draft, "Tilt", "Higher: the view tilts up and shows more sky. Lower: it tilts down and shows more ground. The camera itself does not move.",
         framing.pitch_degrees, -30.0f, 30.0f, "%.1f degrees");
+    // One pair of limits for both cameras (outside the Low / High switch). valid() needs max >= min + 0.2,
+    // so each slider stops 0.2 m short of the other.
+    auto& distance = draft.next.distance;
+    set_slider(draft, "Minimum distance",
+        "Higher: the camera always stays further away from you, even in close-ups or near walls. Lower: it can come in closer.",
+        distance.min, 0.3f, std::min(5.0f, distance.max - 0.2f), "%.2f m");
+    set_slider(draft, "Maximum distance",
+        "Higher: the camera can pull further back. Lower: it never goes further back than this.",
+        distance.max, std::max(2.0f, distance.min + 0.2f), 20.0f, "%.1f m");
     end_card();
 }
 
@@ -286,6 +295,9 @@ void manual_card(Draft& draft, PageState& state) {
     ImGui::EndDisabled();
     set_slider(draft, "Manual focus", "Lower: the camera looks at the board. Higher: it looks at your upper body.",
         draft.next.look.manual_focus, 0.0f, 1.0f, "%.2f");
+    set_toggle(draft, "Follow the board",
+        "On: in manuals and grinds the camera circles and aims at your board. Off: it aims at your body as usual.",
+        draft.next.look.board_anchor);
     end_card();
 }
 
@@ -304,6 +316,9 @@ void grind_card(Draft& draft, PageState& state) {
     ImGui::EndDisabled();
     set_slider(draft, "Grind focus", "Lower: the camera looks at the board. Higher: it looks at your upper body.",
         draft.next.look.grind_focus, 0.0f, 1.0f, "%.2f");
+    set_toggle(draft, "Follow the board",
+        "On: in manuals and grinds the camera circles and aims at your board. Off: it aims at your body as usual.",
+        draft.next.look.board_anchor);
     end_card();
 }
 
@@ -416,8 +431,6 @@ void collision_card(Draft& draft) {
     set_toggle(draft, "Collision", "The camera moves in front of walls and poles instead of going through them.", collision.enabled);
     ImGui::BeginDisabled(!collision.enabled);
     set_slider(draft, "Wall gap", "Higher: the camera stays further from walls. Lower: it can get right up to them.", collision.radius, 0.0f, 2.0f, "%.2f m");
-    set_slider(draft, "Closest to you", "Higher: the camera never gets closer to you than this, even in tight spots. Lower: it can squeeze in closer.", collision.min_distance, 0.0f, 5.0f,
-        "%.2f m");
     set_slider(draft, "Move-in time", "Higher: the camera moves in front of a wall slowly. Lower: it moves in at once.", collision.pull_in_time, 0.0f, 2.0f,
         "%.2f s");
     set_slider(draft, "Move-out time", "Higher: the camera returns slowly once the wall is gone. Lower: it returns quickly.", collision.release_time, 0.0f,

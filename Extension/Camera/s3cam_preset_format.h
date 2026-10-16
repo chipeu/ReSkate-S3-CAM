@@ -67,6 +67,11 @@ template <class Group> bool group_ok(const Group& group) noexcept {
 template <class Options, class Visit> void visit_fields(cfg::CameraSettings& camera, Options& options, Visit&& visit) {
     visit("S3Cam.ShakeEnabled", camera, &cfg::CameraSettings::shake_enabled);
 
+    // One minimum and maximum camera distance for both Low and High. The loader checks the pair through
+    // DistanceLimits::valid(), so a saved pair loads whole in either order (second pass).
+    visit("S3Cam.Distance.Min", camera.distance, &cfg::DistanceLimits::min);
+    visit("S3Cam.Distance.Max", camera.distance, &cfg::DistanceLimits::max);
+
     visit("S3Cam.Framing.DistanceScale", camera.framing, &cfg::FramingSettings::distance_scale);
     visit("S3Cam.Framing.HeightDegrees", camera.framing, &cfg::FramingSettings::height_degrees);
     visit("S3Cam.Framing.PitchDegrees", camera.framing, &cfg::FramingSettings::pitch_degrees);
@@ -113,6 +118,7 @@ template <class Options, class Visit> void visit_fields(cfg::CameraSettings& cam
     visit("S3Cam.Look.ResponseTime", camera.look, &cfg::LookSettings::response_time);
     visit("S3Cam.Look.ManualFocus", camera.look, &cfg::LookSettings::manual_focus);
     visit("S3Cam.Look.GrindFocus", camera.look, &cfg::LookSettings::grind_focus);
+    visit("S3Cam.Look.BoardAnchor", camera.look, &cfg::LookSettings::board_anchor);
 
     visit("S3Cam.Shoulder.Offset", camera.shoulder, &cfg::ShoulderSettings::offset);
     visit("S3Cam.Shoulder.SwitchTime", camera.shoulder, &cfg::ShoulderSettings::switch_time);
@@ -146,7 +152,8 @@ template <class Options, class Visit> void visit_fields(cfg::CameraSettings& cam
 
     visit("S3Cam.Collision.Enabled", camera.collision, &cfg::CollisionSettings::enabled);
     visit("S3Cam.Collision.Radius", camera.collision, &cfg::CollisionSettings::radius);
-    visit("S3Cam.Collision.MinDistance", camera.collision, &cfg::CollisionSettings::min_distance);
+    // S3Cam.Collision.MinDistance is no longer saved (CollisionSettings::min_distance is unused since
+    // Alpha 6); files that still carry it load fine, the key is simply ignored.
     visit("S3Cam.Collision.PullInTime", camera.collision, &cfg::CollisionSettings::pull_in_time);
     visit("S3Cam.Collision.ReleaseTime", camera.collision, &cfg::CollisionSettings::release_time);
     visit("S3Cam.Collision.GroundClearance", camera.collision, &cfg::CollisionSettings::ground_clearance);
@@ -185,6 +192,10 @@ struct KeyAlias {
     const char* current;
 };
 inline constexpr std::array<KeyAlias, 0> key_aliases{}; // no key has been renamed yet
+// Deliberately NOT aliased: S3Cam.Collision.MinDistance -> S3Cam.Distance.Min. The alias table falls
+// back to the old key whenever the new one is missing and cannot say "only if valid": an old value
+// outside 0.3..max-0.2 would count as a refused value, and the old collision default (0.5) would
+// silently replace the new 1.2 m default. Old presets get the default distance limits instead.
 
 // ---- Loading ----
 
@@ -310,6 +321,7 @@ inline void drop_invalid_groups(cfg::CameraSettings& camera) noexcept {
     fix(camera.trick_yaw);
     fix(camera.air_camera);
     fix(camera.landing_shake);
+    fix(camera.distance);
 }
 
 // Applies every value `source` has over `camera` and `options`. A field is accepted on its own; a
