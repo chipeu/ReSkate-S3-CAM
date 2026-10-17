@@ -176,6 +176,19 @@ unzip ReSkateServer-Linux-<version>.zip -d reskate-server && cd reskate-server
 Details (Steam `.so` files, `world-layers.json`, `systemd`, ports, building from source with
 `cmake --preset linux-x64`) are in [Server/README-linux.md](Server/README-linux.md).
 
+## S3Cam (beta)
+
+S3Cam is a Skate 3-style onboard camera for skate. It is client-side only: only your own view changes,
+so it is fine in multiplayer and other players are not affected.
+
+- Turn it on in the ReSkate menu (**Insert**) under the **S3 CAMERA** tab, or with `s3cam 1` in the console.
+- Settings and presets save automatically. Presets are files in `%LOCALAPPDATA%\ReSkate\S3Cam Presets\`.
+- Bind **S3Cam: swap shoulder side** in the controller binds (L3 in Skate 3) to switch which shoulder the camera sits on.
+  The game's camera height button (R3) switches between the Low and High camera.
+- S3Cam hands the camera back to the game when you are on foot, in menus and in the replay editor, and takes it again when you ride.
+
+The camera behaviour is adapted from SK8-ENGINE/skate-3-rust-engine (GPL-3.0).
+
 ## Building from source
 
 ### Requirements

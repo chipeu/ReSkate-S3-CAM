@@ -625,8 +625,9 @@ void update_model(std::uintptr_t client, TickState& frame) {
             record("{\"event\":\"controller_binding_triggered\",\"action\":\"offboard_up_velocity\"}");
         }
     }
+    // Modes that drive the camera tick every frame; otherwise the debug model refreshes every 100 ms.
     if (debug_request || r.debug_model.free_camera || r.debug_model.first_person || r.debug_model.noclip ||
-        now >= r.next_debug) {
+        r.debug_model.s3cam || now >= r.next_debug) {
         ScheduledWorkScope work{r, debug_request.has_value()};
         r.next_debug = now + 100;
         const bool debug_ready = !r.observer_failed && !debug_busy && (state == 13 || state == 21) && native_context_ready();
@@ -643,6 +644,7 @@ void update_model(std::uintptr_t client, TickState& frame) {
         // camera), can have replaced the native camera: validate it again.
         if (debug_request || debug.free_camera != r.debug_model.free_camera ||
             debug.first_person != r.debug_model.first_person || debug.noclip != r.debug_model.noclip ||
+            debug.s3cam_view != r.debug_model.s3cam_view ||
             debug.park_editor != r.debug_model.park_editor)
             frame.camera_issue.reset();
         if (debug_ready && phase_issue && !debug.camera_available) {

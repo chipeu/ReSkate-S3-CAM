@@ -77,6 +77,7 @@ enum class DebugAction {
     set_first_person_camera_cycle,
     reset_first_person_arm,
     set_free_camera_fov,  // 0 = the game's own FOV
+    set_s3cam,            // S3Cam (Extension/Camera/s3cam.h)
     // Keep the last action in sync with the bound in request_scheduler.h.
 };
 
@@ -109,6 +110,8 @@ struct DebugModel {
     bool ui_available = false;
     bool free_camera = false;
     bool first_person = false;
+    bool s3cam = false;       // S3Cam is on (it may have handed the view back for now)
+    bool s3cam_view = false;  // S3Cam drives the view this tick
     // Vertical degrees applied to the first-person view; 0 keeps the camera's own.
     float first_person_fov = 0;
     float free_camera_fov = 0;  // 0 = the game's own FOV
