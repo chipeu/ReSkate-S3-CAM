@@ -86,6 +86,9 @@ void all_addons(SkateMenu& menu, const Model& model) {
     next();
     addon_tile(menu, "addon-music", "MUSIC", "Spotify, YouTube Music, your own files and online radio through the game's music player.",
                nullptr, 0, addon_music);
+    next();
+    addon_tile(menu, "addon-s3-camera", "DYNAMIC CAMERA", "The camera reacts to your jumps, landings, tricks, manuals and grinds. Adjust the settings to get the camera feel you like.",
+               on_off(model.debug.available, model.debug.s3cam), colour(model.debug.available, model.debug.s3cam), addon_s3_camera);
 }
 }
 
@@ -99,7 +102,7 @@ void addons_page(SkateMenu& menu, const Model& model, const CallbacksV3& callbac
     // A window lists the addons in its side rail; full screen has no rail, so they are tabs here
     // (LT / RT on a controller), without the hidden ones.
     if (menu.fullscreen_drawn) {
-        static constexpr std::array<const char*, addon_count> names{"ALL ADDONS", "DRONE", "BOARD BREAK", "ROAD RASH", "HALL OF MEAT",
+        static constexpr std::array<const char*, addon_count> names{"ALL ADDONS", "DRONE", "DYNAMIC CAMERA", "BOARD BREAK", "ROAD RASH", "HALL OF MEAT",
                                                                     "GRIND EXITS", "MUSIC"};
         std::vector<const char*> labels;
         std::vector<int> shown;
@@ -112,6 +115,7 @@ void addons_page(SkateMenu& menu, const Model& model, const CallbacksV3& callbac
     ImGui::PushID(menu.addon);
     switch (menu.addon) {
     case addon_drone: drone_page(menu, model, callbacks); break;
+    case addon_s3_camera: s3cam_page(menu, model, callbacks); break;
     case addon_music: music_page(menu, model, callbacks); break;
     default:
         ImGui::BeginChild("addon", ImVec2(0, page_body_height(menu)), ImGuiChildFlags_NavFlattened);

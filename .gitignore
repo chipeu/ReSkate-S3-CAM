@@ -30,6 +30,15 @@ analysis/raw/**/*.res
 /docs/
 /release
 
+# Local notes, handoffs, logs and personal test files stay on this machine.
+/CLAUDE.md
+/.claude/
+*HANDOFF*.md
+*.log
+*.dmp
+/package-beta.ps1
+/package-s3cam-beta.ps1
+
 # Drone model sources (assets/models/fpv/CREDITS.md): large; only the prepared drone.glb is kept.
 /assets/models/fpv/dji_avata2.glb
 /assets/models/fpv/fpv_drone.glb

@@ -108,6 +108,8 @@ void multiplayer_page(SkateMenu&, const Model&, const CallbacksV3&);
 void map_page(SkateMenu&, const Model&, const CallbacksV3&);
 void build_page(SkateMenu&, const Model&, const CallbacksV3&);
 void skater_page(SkateMenu&, const Model&, const CallbacksV3&);
+// Extension/UI/Overlay/skate_menu_camera.cpp: S3Cam's switch and every tunable.
+void s3cam_page(SkateMenu&, const Model&, const CallbacksV3&);
 void settings_page(SkateMenu&, const Model&, const CallbacksV3&);
 // Settings > Post FX (skate_menu_world.cpp).
 void graphics_page(SkateMenu&, const Model&, const CallbacksV3&);
@@ -145,7 +147,7 @@ enum Page {
     page_home, page_map, page_build, page_skater, page_sandbox, page_addons, page_online, page_progress, page_mods,
     page_settings, page_developer, page_count
 };
-enum Addon { addon_all, addon_drone, addon_board_break, addon_road_rash, addon_hall_of_meat, addon_grind_exits, addon_music, addon_count };
+enum Addon { addon_all, addon_drone, addon_s3_camera, addon_board_break, addon_road_rash, addon_hall_of_meat, addon_grind_exits, addon_music, addon_count };
 void open_page(SkateMenu&, int page, int addon = -1);
 // An addon made from an official mod whose feature did not start (the mod is turned off in the
 // launcher, or this game build cannot run it) is listed nowhere in the menu (skate_menu_addons.cpp).

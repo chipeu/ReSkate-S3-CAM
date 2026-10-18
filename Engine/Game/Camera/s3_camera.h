@@ -1,0 +1,1579 @@
+#pragma once
+// SPDX-License-Identifier: GPL-3.0-only
+// Adapted from SK8-ENGINE/skate-3-rust-engine (dumbad and contributors, GPL-3.0-only):
+// crates/skate-core/src/camera/manager.rs (CameraMan::prepare / update order), manager_state.rs
+// (update_air, update_incline), manager_subject.rs, manager_rig.rs (bind_shot: shot -> rig),
+// manager_blends.rs, manager_frame.rs (lens_field_of_view), manager_output.rs (finish_frame: shake
+// after orientation), frame_composer.rs (reference point framing, maximum pitch, roll response),
+// rig_orientation.rs (pan/tilt trackers, smoothing derived from the shot) and shot_manager.rs
+// (transition: previous = interpolated at the change, eased by elapsed / duration). Semantics are
+// ported; the bit-exact VMX constants and quaternion round trips are replaced by ordinary float
+// arithmetic.
+#include "Engine/Game/Camera/s3_air.h"
+#include "Engine/Game/Camera/s3_graph.h"
+#include "Engine/Game/Camera/s3_math.h"
+#include "Engine/Game/Camera/s3_rig.h"
+#include "Engine/Game/Camera/s3_settings.h"
+#include "Engine/Game/Camera/s3_shake.h"
+#include "Engine/Game/Camera/s3_shot.h"
+#include "Engine/Game/Camera/s3_subject.h"
+#include "Engine/Game/Camera/s3_tracker.h"
+#include "Engine/Game/Camera/s3_trajectory.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstddef>
+#include <optional>
+#include <string_view>
+
+// CameraMan: turns a SubjectSnapshot stream into a camera Frame. Pure and header-only, no
+// heap allocation, update() is noexcept.
+//
+// Order of operations per FIXED step:
+//   prepare (air / landing, then incline) -> graph select -> shot blend -> rig -> orientation and
+//   framing -> shake -> write.
+// Alpha 2 layers inside those stages (FullS3 unless noted): fov extras after the shot blend (both presets), follow
+// strength k around the rig, look layers (landing look, slope look, vertical follow) building the look target,
+// shoulder shift of the camera (both presets), collision after the shoulder, speed shake rebuilding the shake
+// settings before shake.update (both presets).
+// Alpha 3 layers: the framing (distance / height scale on every shot, the manual close-up) is applied where the
+// shot is resolved, so shot blends and settings changes ease it (FullS3; the pitch offset also in NativePlus); the
+// trick yaw swings the rig heading round to the side during airs / grinds / manuals (FullS3).
+// Alpha 5 layers: the landing shake / dip strength comes from the fall height (peak root height of the air minus
+// the landing height, plus a little speed), not from the board's velocity; the horizontal follow (FollowSettings::
+// horizontal) swings the orbit heading toward the filtered travel heading, before the trick yaw; leaving a manual /
+// grind shot uses a longer transition and eases the distance; manuals and grinds keep the camera above the board and
+// never look up at it; the framing height is an eased offset added after the rig's slow elevation tracker.
+// update() takes the real frame dt, runs as many fixed 1/60 s steps (s3_math.h fixed_step, the Rust
+// camera STEP) as the accumulator holds (the subject is interpolated between
+// the previous and current snapshot across them) and returns the pose interpolated between the last two steps. Trackers, blends and shake never
+// see the frame dt.
+//
+// Conventions: world is Y up. Heading 0 looks down +Z and grows toward -X (heading = atan2(-x, z)).
+// Frame rows are right, up, back, position with right x up = +back (handedness +1, measured in game), so the camera looks along -back. Roll > 0 turns right toward up.
+namespace dingosdk::s3cam {
+
+// The game's own camera pose (NativePlus input), same row convention as Frame.
+struct NativePose {
+    Vec3 right{1, 0, 0};
+    Vec3 up{0, 1, 0};
+    Vec3 back{0, 0, 1};
+    Vec3 position{0, 0, 0};
+    float fov_deg = 0.0f; // > 0: the base fov unless FrameExtras::base_fov_deg or fov_override_deg is set
+};
+
+struct FrameExtras {
+    float aspect = 16.0f / 9.0f;       // width / height; a non-finite or non-positive value keeps the last good one
+    const NativePose* native = nullptr; // required each update in NativePlus, ignored in FullS3
+    // The game camera's own vertical FOV in degrees; 0 (or non-finite) = unknown. The caller supplies a
+    // SMOOTH value: CameraMan adds its eased extra terms on top and never smooths the base itself.
+    float base_fov_deg = 0.0f;
+};
+
+struct FrameDebug {
+    std::string_view shot_name{"chase"};
+    bool reset = false;        // this frame is a cut (spawn, teleport, preset change, resume after a long gap)
+    bool held = false;         // the input was unusable; the previous frame is returned unchanged
+    CameraPreset preset = CameraPreset::FullS3;
+    int steps = 0;             // fixed steps run by this update
+    float accumulator = 0.0f;  // s left over after those steps
+    bool airborne = false;
+    bool landing_active = false;
+    bool transitioning = false;
+    float shot_fraction = 1.0f;       // 0..1 progress of the current shot transition
+    float chase_blend = 0.0f;         // slow -> fast blend value
+    bool prediction_valid = false;    // the last trajectory prediction landed
+    float predicted_max_height = 0.0f; // m above takeoff
+    float predicted_air_time = 0.0f;   // s, takeoff to landing
+    float predicted_landing_delta = 0.0f; // m, landing surface minus takeoff surface
+    float air_hold_delta = 0.0f;       // m, held reference height minus the actual anchor height (<= 0 while rising)
+    float anchor_lag = 0.0f;           // m
+    float heading = 0.0f, elevation = 0.0f, distance = 0.0f; // rig, radians / metres (elevation includes the big-air rise)
+    float impulse = 0.0f;              // shake landing impulse
+    float landing_dip = 0.0f;          // m below the native pose (NativePlus)
+    float speed = 0.0f;                // m/s, |velocity . forward| on the ground; held at the last grounded value in the air
+    float incline_degrees = 0.0f;
+    float forward_acceleration = 0.0f; // m/s^2, filtered; feeds pump / push
+    bool push_state = false;
+    bool push_kick = false;
+    // Alpha 2 layers.
+    float fov_base = 0.0f;             // deg, the base the extras ride on (override, else base_fov_deg, else the native / chase lens)
+    float fov_extra = 0.0f;            // deg, the eased shot + speed + air terms
+    float landing_look_weight = 0.0f;  // 0..1, how far the look target has moved toward the predicted landing
+    float look_pitch_offset = 0.0f;    // rad, the eased slope look added to the pitch
+    float shoulder = 0.0f;             // m, signed sideways offset applied to the camera (+ = along the camera's right)
+    float follow_strength = 1.0f;      // k after the dynamic boost and the [0.2, 7] clamp
+    float collision_pull = 0.0f;       // m the camera was pulled in toward the look target
+    // Alpha 3.
+    float trick_yaw = 0.0f;            // rad, the camera's swing round the skater (+ = toward the skater's right; FullS3)
+    // Alpha 4.
+    float air_follow_weight = 0.0f;    // 0..1, the eased "in the air" weight that scales air_camera.follow_height
+    float air_reference_height = 0.0f; // m, the reference height after follow_height (what the rig / hold uses)
+    float air_rise = 0.0f;             // rad, the eased extra elevation of the big-air rise
+    float keep_pitch_offset = 0.0f;    // rad, the keep-in-frame pitch added to the view (+ looks up)
+    float focus_weight = 1.0f;         // 0..1, how far the look target sits from the board toward the usual point (manual / grind focus)
+    Vec3 look_target{0, 0, 0};         // FullS3: the point the view aims at, after the focus and the look layers
+    // Alpha 5.
+    float landing_fall = 0.0f;         // m, the fall of the last landing (peak root height of the air minus the landing's)
+    float landing_fraction = 0.0f;     // 0..1, how hard that landing was (before the squared shaping); drives shake and dip
+    float follow_weight = 0.0f;        // 0..1, how far the orbit heading is pulled onto the travel heading (horizontal follow)
+    float travel_heading = 0.0f;       // rad, the filtered heading of the horizontal travel direction
+    float exit_blend = 1.0f;           // 0..1, progress of the distance ease after leaving a manual / grind shot (1: none running)
+    float floor_weight = 0.0f;         // 0..1, the eased weight of the manual / grind camera floor and pitch ceiling
+    float height_offset = 0.0f;        // rad, the eased framing height added after the rig's elevation tracker
+    // Alpha 6.
+    float board_weight = 0.0f;         // 0..1, the eased weight of board anchoring (manual / grind shots with look.board_anchor)
+    Vec3 orbit_anchor{0, 0, 0};        // FullS3: the point the camera orbits (the rig anchor after the lag), interpolated like the pose; distance is measured from it
+};
+
+struct Frame {
+    Vec3 right{1, 0, 0};
+    Vec3 up{0, 1, 0};
+    Vec3 back{0, 0, 1};
+    Vec3 pos{0, 0, 0};
+    float fov_deg = 0.0f;
+    ShotId shot = ShotId::Chase;
+    FrameDebug debug;
+    bool valid = false; // false until the first usable snapshot has produced a pose
+};
+
+// manager_frame.rs lens_field_of_view: the angle subtended by a 35 mm frame at `lens` mm, in
+// degrees, scaled by 1 / sqrt(aspect + 1). Non-finite or non-positive input gives 0.
+inline float lens_field_of_view_degrees(float lens_length, float aspect) noexcept {
+    if (!std::isfinite(lens_length) || !std::isfinite(aspect) || !(lens_length > 0.0f) || !(aspect > 0.0f)) return 0.0f;
+    const float degrees_full = std::atan(35.0f / (lens_length * 2.0f)) * (2.0f * 180.0f / pi);
+    return std::sqrt(degrees_full * degrees_full / (aspect + 1.0f));
+}
+
+namespace camera_detail {
+inline bool finite3(const Vec3& v) noexcept { return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]); }
+inline Vec3 rotate_about(const Vec3& v, const Vec3& axis, float angle) noexcept {
+    const float c = std::cos(angle), s = std::sin(angle);
+    return add(add(scale(v, c), scale(cross(axis, v), s)), scale(axis, dot(axis, v) * (1.0f - c)));
+}
+// Right-handed orthonormal rows with right x up = back, from loosely orthogonal input.
+inline void orthonormalize(Vec3& right, Vec3& up, Vec3& back) noexcept {
+    right = normalized(right, {1, 0, 0});
+    Vec3 u = sub(up, scale(right, dot(up, right)));
+    if (length(u) < 1e-4f) { // up parallel to right: pick any perpendicular
+        u = std::abs(right[1]) < 0.9f ? Vec3{0, 1, 0} : Vec3{0, 0, 1};
+        u = sub(u, scale(right, dot(u, right)));
+    }
+    up = normalized(u, {0, 1, 0});
+    back = cross(right, up);
+}
+// Rows for a camera looking along (yaw, pitch) with roll about the view axis. Positive pitch looks up.
+inline void basis_from_angles(float yaw, float pitch, float roll, Vec3& right, Vec3& up, Vec3& back) noexcept {
+    const float limit = 89.0f * degrees;
+    const float p = std::clamp(pitch, -limit, limit);
+    const float cp = std::cos(p);
+    const Vec3 look{-std::sin(yaw) * cp, std::sin(p), std::cos(yaw) * cp};
+    back = scale(look, -1.0f);
+    right = normalized(cross({0, 1, 0}, back), {1, 0, 0});
+    up = cross(back, right);
+    const float c = std::cos(roll), s = std::sin(roll);
+    const Vec3 r = add(scale(right, c), scale(up, s));
+    const Vec3 u = sub(scale(up, c), scale(right, s));
+    right = r;
+    up = u;
+}
+inline float lerp_f(float a, float b, float t) noexcept { return a + (b - a) * t; }
+// Per-step share of the gap an exponential filter with `time_constant` closes (0 = take it all).
+// The floor keeps the division visibly non-zero for MSVC's C4723 on inlined paths.
+inline float ease_rate(float time_constant, float step_time) noexcept {
+    return time_constant > 0.0f ? 1.0f - std::exp(-step_time / std::max(time_constant, 1e-6f)) : 1.0f;
+}
+inline float ease_to(float value, float target, float time_constant, float step_time) noexcept {
+    return value + (target - value) * ease_rate(time_constant, step_time);
+}
+// Two first-order filters in a row, each with half the time constant: about the same settling time
+// as ease_to, but a step in the target starts and ends the motion gently instead of with a kink. The
+// air layers' targets come from the landing prediction, which is refreshed every 0.1 s and steps a
+// little each time; through ease_to those steps showed as a 10 Hz jitter of the view in big airs.
+inline float ease2_to(float& stage, float value, float target, float time_constant, float step_time) noexcept {
+    stage = ease_to(stage, target, 0.5f * time_constant, step_time);
+    return ease_to(value, stage, 0.5f * time_constant, step_time);
+}
+} // namespace camera_detail
+
+class CameraMan {
+public:
+    // Replaces the settings. Invalid settings are rejected (returns false, old ones kept). Changing
+    // the preset cuts the camera on the next update; changing the angle blends through a shot transition.
+    bool set_settings(const CameraSettings& settings) noexcept {
+        if (!settings.valid()) return false;
+        settings_ = settings;
+        return true;
+    }
+    const CameraSettings& settings() const noexcept { return settings_; }
+
+    // Cut on the next update: spawn, teleport, respawn after a bail, taking ownership.
+    void request_reset() noexcept { reset_requested_ = true; }
+
+    const Frame& frame() const noexcept { return frame_; }
+
+    // One rendered frame. `dt` is the real frame time in seconds; `ground` is the world query the
+    // trajectory prediction rays through (segment start, end -> optional GroundHit, see s3_trajectory.h).
+    // Returns the new frame, or the previous one with debug.held set when `dt`, the snapshot or (in
+    // NativePlus) the native pose is unusable. Off the board the camera keeps following the skater: the
+    // glue decides when to hand the view back, and a held frame there showed as a freeze (hippy jumps).
+    template <GroundQuery Query>
+    const Frame& update(float dt, const SubjectSnapshot& subject, Query&& ground, const FrameExtras& extras = {}) noexcept {
+        const bool native_mode = settings_.preset == CameraPreset::NativePlus;
+        const bool dt_ok = std::isfinite(dt) && dt >= 0.0f;
+        const bool native_ok = !native_mode || (extras.native != nullptr && native_usable(*extras.native));
+        if (!dt_ok || !native_ok || !usable(subject)) {
+            if (dt_ok) invalid_time_ += dt;
+            return hold();
+        }
+        if (std::isfinite(extras.aspect) && extras.aspect > 0.0f) aspect_ = extras.aspect;
+        if (native_mode) native_distance_ = length(sub(extras.native->position, subject.position));
+        // What the steps need of the extras: the keep-in-frame layer reads the lens (fov_base_deg) and the native pose.
+        extras_base_fov_ = extras.base_fov_deg;
+        native_fov_ = native_mode ? extras.native->fov_deg : 0.0f;
+        if (native_mode) native_pose_ = *extras.native;
+
+        const PipelineSettings& pipe = settings_.pipeline;
+        const bool cut = reset_requested_ || !initialized_ || last_preset_ != settings_.preset ||
+                         invalid_time_ > pipe.resume_reset_time ||
+                         length(sub(subject.position, cur_snap_.position)) > pipe.teleport_distance;
+        invalid_time_ = 0.0f;
+
+        FrameDebug dbg;
+        kick_in_update_ = false;
+        if (cut) {
+            reset_requested_ = false;
+            initialized_ = true;
+            last_preset_ = settings_.preset;
+            cut_to(subject, ground);
+            dbg.reset = true;
+        } else {
+            const float step = fixed_step;
+            const float carry = acc_;
+            // Clamp BEFORE the int cast: a huge dt would overflow it (undefined) and freeze the camera.
+            const float limit = static_cast<float>(pipe.max_steps_per_update + 1) * step;
+            const bool capped = carry + dt >= limit; // a long stall: the steps are capped below
+            acc_ = std::min(carry + dt, limit);
+            int steps = static_cast<int>(std::floor(acc_ / step));
+            if (steps > pipe.max_steps_per_update) { // drop the surplus rather than spiral
+                const float fraction = std::max(0.0f, acc_ - static_cast<float>(steps) * step);
+                steps = pipe.max_steps_per_update;
+                acc_ = static_cast<float>(steps) * step + fraction;
+            }
+            for (int i = 1; i <= steps; ++i) {
+                // Where in this frame's interval the step lands: the sim clock lags the snapshot clock
+                // by the accumulator carried in, so the subject is interpolated, never extrapolated.
+                // When the cap dropped steps the survivors cover (0, 1] evenly instead of stopping short.
+                const float f = capped ? static_cast<float>(i) / static_cast<float>(steps)
+                                       : dt > 0.0f ? clamp01((static_cast<float>(i) * step - carry) / std::max(dt, 1e-9f)) : 1.0f;
+                const SubjectSnapshot sub_snap = blend_snapshot(cur_snap_, subject, f);
+                step_once(sub_snap, ground, false);
+            }
+            acc_ -= static_cast<float>(steps) * step;
+            if (acc_ < 0.0f) acc_ = 0.0f;
+            dbg.steps = steps;
+            cur_snap_ = subject;
+        }
+        dbg.accumulator = acc_;
+        publish(dbg, extras);
+        return frame_;
+    }
+
+private:
+    // One fixed step's result. FullS3: the absolute camera pose, shake included. NativePlus: offsets to
+    // lay over the native pose (world position offset, angle deltas, camera-local shake translation).
+    struct StepOut {
+        Vec3 pos{0, 0, 0};
+        float yaw = 0.0f, pitch = 0.0f, roll = 0.0f;
+        Vec3 local{0, 0, 0};
+        Vec3 anchor{0, 0, 0};   // FullS3: the orbit anchor (debug only; interpolated with the pose)
+        float fov_extra = 0.0f; // deg, added to the base fov at publish
+        float shoulder = 0.0f;  // m along the camera's right. Already folded into `pos` in FullS3; NativePlus adds it at publish
+        bool finite() const noexcept {
+            return camera_detail::finite3(pos) && camera_detail::finite3(local) && std::isfinite(yaw) && std::isfinite(pitch) &&
+                   std::isfinite(roll) && std::isfinite(fov_extra) && std::isfinite(shoulder);
+        }
+    };
+
+    static bool native_usable(const NativePose& n) noexcept {
+        using camera_detail::finite3;
+        return finite3(n.right) && finite3(n.up) && finite3(n.back) && finite3(n.position) && std::isfinite(n.fov_deg) &&
+               length(n.right) > 1e-4f && length(n.up) > 1e-4f && length(n.back) > 1e-4f;
+    }
+
+    const Frame& hold() noexcept {
+        frame_.debug.held = true;
+        frame_.debug.reset = false;
+        frame_.debug.steps = 0;
+        return frame_;
+    }
+
+    // The snapshot `f` of the way from `a` to `b`. Continuous fields interpolate; discrete ones switch at
+    // the midpoint so a state change lands roughly where the position says it happened.
+    static SubjectSnapshot blend_snapshot(const SubjectSnapshot& a, const SubjectSnapshot& b, float f) noexcept {
+        SubjectSnapshot out = f >= 0.5f ? b : a;
+        out.time = camera_detail::lerp_f(a.time, b.time, f);
+        out.position = lerp(a.position, b.position, f);
+        out.velocity = lerp(a.velocity, b.velocity, f);
+        out.forward = normalized(lerp(a.forward, b.forward, f), b.forward);
+        out.ground_normal = normalized(lerp(a.ground_normal, b.ground_normal, f), b.ground_normal);
+        out.ground_clearance = camera_detail::lerp_f(a.ground_clearance, b.ground_clearance, f);
+        // The board body's position: interpolated when both ends have it, else the nearer end's (already in `out`).
+        if (a.board_valid && b.board_valid) out.board_position = lerp(a.board_position, b.board_position, f);
+        out.valid = true;
+        return out;
+    }
+
+    // The ten reference points (Head, Hips, Grind, COM, Board, Trajectory, Anchor, Feet, DampedCOM,
+    // unnamed) from the root position. The snapshot has no skeleton, so these are fixed offsets, except the
+    // board: `board` is the estimate (root - board_drop) or, in a manual / grind with board anchoring, the
+    // real board point (Alpha 6).
+    std::array<Vec3, 10> reference_points(const SubjectSnapshot& s, const Vec3& board) const noexcept {
+        const SubjectPointSettings& p = settings_.points;
+        const Vec3 root = s.position;
+        Vec3 trajectory = board;
+        if (s.air()) {
+            const float t = p.trajectory_lookahead;
+            trajectory = add(board, {s.velocity[0] * t, s.velocity[1] * t - 0.5f * settings_.trajectory.gravity * t * t,
+                                     s.velocity[2] * t});
+        }
+        const Vec3 com = add(root, {0, p.com_height, 0});
+        return {add(root, {0, p.head_height, 0}), root, board, com, board, trajectory, root, board, com, root};
+    }
+    // The point the rig orbits (Rust: subject.anchors[shot.anchor], manager.rs bind_anchor). It does not
+    // depend on the shot's reference weights, so a shot change cannot move the camera's height; the
+    // weighted reference point below only feeds the framing.
+    Vec3 anchor_point(const SubjectSnapshot& s) const noexcept {
+        const SubjectPointSettings& p = settings_.points;
+        return add(s.position, {0.0f, p.anchor_height - p.board_drop, 0.0f});
+    }
+    // Weighted mean of the reference points (reference_point() in shot.rs); the board if the weights vanish.
+    static Vec3 weighted_point(const std::array<Vec3, 10>& points, const Shot& shot) noexcept {
+        Vec3 sum{0, 0, 0};
+        float total = 0.0f;
+        for (std::size_t i = 0; i < points.size(); ++i) {
+            const float w = shot.reference_weights[i];
+            if (!(w > 0.0f)) continue;
+            sum = add(sum, scale(points[i], w));
+            total += w;
+        }
+        return total > 1e-4f ? scale(sum, 1.0f / total) : points[4];
+    }
+
+    // Low and High have their own camera position (CameraSettings::framing / framing_high). The angle in use is
+    // the one the shots are resolved with (settings_.angle), so a switch blends through the shot transition.
+    const FramingSettings& active_framing() const noexcept {
+        return settings_.angle == CameraAngle::High ? settings_.framing_high : settings_.framing;
+    }
+
+    // The shot with the player's framing applied (FullS3): distance scale and elevation offset on every shot,
+    // plus the manual close-up on the two manual shots. NativePlus keeps the game's own distance and height.
+    Shot framed(Shot shot, ShotId id, float chase_blend) const noexcept {
+        if (settings_.preset == CameraPreset::NativePlus) return shot;
+        (void)chase_blend;
+        const FramingSettings& fr = active_framing();
+        // The close-ups have their own distances (Beta feedback: they were scaled with the main camera's distance).
+        if (fr.manual_camera && closeup_kind(id) == 1) shot.distance = fr.manual_distance;
+        else if (fr.grind_camera && closeup_kind(id) == 2) shot.distance = fr.grind_distance;
+        else shot.distance *= fr.distance_scale;
+        // The framing height is NOT part of the shot's elevation any more (Alpha 5): the rig's elevation tracker
+        // moves only ~3.6 deg/s, so a slider change took many seconds. It is an eased offset added after the
+        // tracker (height_goal_of), the shot's own elevation still goes through the tracker.
+        return shot;
+    }
+
+    // 0: neither, 1: a manual shot, 2: a grind shot. Leaving one kind for any other shot is an "exit".
+    static int closeup_kind(ShotId id) noexcept {
+        switch (id) {
+        case ShotId::ManualFar:
+        case ShotId::ManualClose: return 1;
+        case ShotId::GrindFlat:
+        case ShotId::GrindLedgeL:
+        case ShotId::GrindLedgeR: return 2;
+        default: return 0;
+        }
+    }
+
+    // The framing height for a shot, radians: height_degrees plus the manual_ / grind_ one on those shots
+    // (FullS3 only; NativePlus keeps the game's height).
+    float height_goal_of(ShotId id) const noexcept {
+        if (settings_.preset == CameraPreset::NativePlus) return 0.0f;
+        const FramingSettings& fr = active_framing();
+        if (fr.manual_camera && closeup_kind(id) == 1) return fr.manual_height_degrees * degrees; // its own, not added to the main height
+        if (fr.grind_camera && closeup_kind(id) == 2) return fr.grind_height_degrees * degrees;
+        return fr.height_degrees * degrees;
+    }
+    // The view pitch for a shot, radians: the close-ups have their own.
+    float pitch_goal_of(ShotId id) const noexcept {
+        const FramingSettings& fr = active_framing();
+        if (fr.manual_camera && closeup_kind(id) == 1) return fr.manual_pitch_degrees * degrees;
+        if (fr.grind_camera && closeup_kind(id) == 2) return fr.grind_pitch_degrees * degrees;
+        return fr.pitch_degrees * degrees;
+    }
+    // The distance limits in force: the main camera's (DistanceLimits), relaxed to the close-ups' own range
+    // (closeup_min_distance .. 8 m) as the close-up weight floor_w_ eases in and out.
+    float distance_min() const noexcept { return camera_detail::lerp_f(settings_.distance.min, closeup_min_distance, floor_w_); }
+    float distance_max() const noexcept { return camera_detail::lerp_f(settings_.distance.max, 8.0f, floor_w_); }
+
+    // How hard a landing was, 0..1: the impact speed sqrt(2 g fall) + speed_weight * horizontal speed, placed between the
+    // impact speeds of min_fall and full_fall (the same sqrt(2 g h)). Falls come from the root heights, which flip
+    // tricks and the board's physics spikes cannot fake.
+    float landing_fraction_of(float fall_height, float flat_speed) const noexcept {
+        const LandingShakeSettings& ls = settings_.landing_shake;
+        const float grav = std::max(settings_.trajectory.gravity, 1e-3f);
+        const auto impact_of = [grav](float h) { return std::sqrt(2.0f * grav * std::max(h, 0.0f)); };
+        const float impact = impact_of(fall_height) + ls.speed_weight * flat_speed;
+        const float low = impact_of(ls.min_fall), high = impact_of(ls.full_fall);
+        return clamp01((impact - low) / std::max(high - low, 1e-3f));
+    }
+
+    // The slope of the direction of travel along the ground, degrees, + uphill (manager_state.rs update_incline).
+    // The slope along the way the skater travels (+ uphill). It comes from the velocity on the surface, faded
+    // out below incline_full_speed: the old sign test (velocity . forward) flipped back and forth as the speed
+    // crossed zero near the top of a ramp, so the camera kept switching between looking up and down.
+    static float incline_of(const SubjectSnapshot& s, const Vec3& normal) noexcept {
+        constexpr float incline_min_speed = 0.5f, incline_full_speed = 2.0f; // m/s
+        const Vec3 along = sub(s.velocity, scale(normal, dot(s.velocity, normal)));
+        const float l = length(along);
+        if (!(l > incline_min_speed)) return 0.0f;
+        const float weight = clamp01((l - incline_min_speed) / (incline_full_speed - incline_min_speed));
+        return weight * std::asin(std::clamp(along[1] / l, -1.0f, 1.0f)) / degrees;
+    }
+
+    // Where the look target sits between the board (0) and the shot's usual point (1): manuals and grinds
+    // frame the lower body (LookSettings::manual_focus / grind_focus), every other shot is 1.
+    float focus_of(ShotId id) const noexcept {
+        switch (id) {
+        case ShotId::ManualFar:
+        case ShotId::ManualClose: return settings_.look.manual_focus;
+        case ShotId::GrindFlat:
+        case ShotId::GrindLedgeL:
+        case ShotId::GrindLedgeR: return settings_.look.grind_focus;
+        default: return 1.0f;
+        }
+    }
+
+    // Pitch of the line camera -> point, radians (+ above the camera). 0 when they coincide.
+    static float elevation_to(const Vec3& from_pos, const Vec3& to_pos) noexcept {
+        const Vec3 line = sub(to_pos, from_pos);
+        const float span = length(line);
+        return span > 1e-3f ? std::asin(std::clamp(line[1] / std::max(span, 1e-3f), -1.0f, 1.0f)) : 0.0f;
+    }
+
+    // Keep the skater inside the vertical view while airborne (air_camera.keep_in_frame). `view_pitch` is the
+    // view's pitch BEFORE this offset; the points are the skater's reference point, root and board. The goal is
+    // the pitch that brings a point that is beyond ~70% of the half vertical FOV back to that edge; the offset
+    // eases toward it (no snap). A last guard keeps every point within 90% of the half FOV even when the ease
+    // is behind (it is a clamp of a continuous quantity, so it never jumps). Returns the offset, radians.
+    float update_keep_in_frame(const Vec3& cam_pos, float view_pitch, const std::array<Vec3, 3>& points, bool air, bool snap) noexcept {
+        const float half_fov = 0.5f * std::clamp(fov_base_deg() + fov_extra_, 1.0f, 170.0f) * degrees;
+        const float soft = 0.7f * half_fov, hard = 0.9f * half_fov;
+        const bool active = settings_.air_camera.keep_in_frame && air && !snap;
+        float goal_up = 0.0f, goal_down = 0.0f, range_lo = -1.0e3f, range_hi = 1.0e3f;
+        for (const Vec3& point : points) {
+            const float error = elevation_to(cam_pos, point) - view_pitch; // + the point is above the view axis
+            goal_up = std::max(goal_up, error - soft);
+            goal_down = std::max(goal_down, -error - soft);
+            range_lo = std::max(range_lo, error - hard);
+            range_hi = std::min(range_hi, error + hard);
+        }
+        if (snap) keep_off_ = 0.0f;
+        else keep_off_ = camera_detail::ease_to(keep_off_, active ? goal_up - goal_down : 0.0f, keep_response_time, fixed_step);
+        if (active) {
+            // range_lo > range_hi: the points cannot all fit, aim between the limits. Only while the layer is
+            // active: after the landing the offset just eases out (a clamp would pin it).
+            keep_off_ = range_lo <= range_hi ? std::clamp(keep_off_, range_lo, range_hi) : 0.5f * (range_lo + range_hi);
+        }
+        return keep_off_;
+    }
+
+    // The trick-yaw state machine (one fixed step). Tricking = airborne for min_air_time, grinding or in a
+    // manual, each only if its switch is on. The target is angle * side while tricking and for hold_time
+    // after the last trick step (a new trick inside it keeps the angle, there is no dip), then 0. Out uses
+    // in_time, back uses return_time; both are sine eases, so the angular velocity starts at 0. A bail is
+    // not a trick and cancels the hold. Disabled eases back to 0; a cut snaps to 0.
+    void update_trick_yaw(const SubjectSnapshot& s, bool snap, float dt) noexcept {
+        const TrickYawSettings& ty = settings_.trick_yaw;
+        TrickYawState& st = trick_yaw_;
+        if (snap) {
+            st = TrickYawState{};
+            return;
+        }
+        const bool tricking = ty.enabled && !s.bailing &&
+                              ((ty.in_air && s.air() && air_time_ >= ty.min_air_time) || (ty.on_grinds && s.grinding()) ||
+                               (ty.on_manuals && s.manual));
+        float goal = 0.0f;
+        if (tricking) {
+            // Same rule as the shoulder's Auto side: +1 regular (toes to the right), -1 goofy XOR switch.
+            int side = ty.side;
+            if (side == 0)
+                side = settings_.shoulder.mode == ShoulderSide::Manual ? settings_.shoulder.side
+                                                                       : ((settings_.shoulder.goofy != s.switch_stance) ? -1 : 1);
+            st.hold_left = ty.hold_time;
+            goal = ty.angle_degrees * degrees * static_cast<float>(side);
+        } else {
+            st.hold_left = (ty.enabled && !s.bailing) ? std::max(0.0f, st.hold_left - dt) : 0.0f;
+            goal = st.hold_left > 0.0f ? st.target : 0.0f;
+        }
+        if (goal != st.target) { // retarget: ease from wherever the value is now
+            st.start = st.value;
+            st.target = goal;
+            st.elapsed = 0.0f;
+            st.duration = goal == 0.0f ? ty.return_time : ty.in_time;
+        }
+        st.elapsed += dt;
+        const float fraction = st.duration > 1e-4f ? clamp01(st.elapsed / std::max(st.duration, 1e-4f)) : 1.0f;
+        st.value = st.start + (st.target - st.start) * sine_blend(fraction);
+    }
+
+    // Transitions (quarter pipes, vert, banks): riding a surface steeper than transition_on_degrees starts it, and it
+    // lasts through the air off it, until the skater has ridden transition_off_time on a surface flatter than
+    // transition_off_degrees. Meanwhile the compass and the horizontal follow keep their heading: on the ramp the travel
+    // direction slows, stops and reverses, and following it turned the camera round on the spot (Beta feedback: the
+    // camera came close, into the skater, then spun). Once off the ramp the heading swings round behind the new travel
+    // direction at the compass's own rate, orbiting at full distance. transition_w_ eases the anchor-lag cut in and out.
+    void update_transition(bool snap, bool grounded, const Vec3& normal, float dt) noexcept {
+        const float on_y = std::cos(transition_on_degrees * degrees), off_y = std::cos(transition_off_degrees * degrees);
+        if (snap) {
+            transition_ = grounded && normal[1] < on_y;
+            transition_shallow_ = 0.0f;
+            transition_w_ = transition_w_stage_ = transition_ ? 1.0f : 0.0f;
+            return;
+        }
+        if (grounded && normal[1] < on_y) {
+            transition_ = true;
+            transition_shallow_ = 0.0f;
+        } else if (grounded && normal[1] > off_y) {
+            transition_shallow_ += dt;
+            if (transition_shallow_ >= transition_off_time) transition_ = false;
+        }
+        transition_w_ = camera_detail::ease2_to(transition_w_stage_, transition_w_, transition_ ? 1.0f : 0.0f, transition_ease_time, dt);
+    }
+
+    // Horizontal follow, "Turn with you" (FollowSettings::horizontal, 0-10, FullS3), as vanilla skate.'s horizontal follow
+    // strength: it ties the camera to the direction you ride. Returns the orbit heading: the rig's own (compass-driven,
+    // lazy) heading pulled toward `travel + the shot's position heading` by w = horizontal / 10. At 10 the camera is
+    // locked to the travel direction: flat tricks, reverts and spins in place do not turn it, a carve turns it with you.
+    // The travel heading follows the horizontal velocity through a two-stage filter whose time and turn-rate cap come
+    // from the setting (higher = quicker). It is updated only on the ground, while moving, and outside transitions; slower
+    // than follow_min_speed it HOLDS. Beta feedback: fading the follow out at low speed handed the camera to the lazy
+    // heading (which lines up behind the skater's facing) and fading it back in as speed returned yanked it behind:
+    // after a slow 180 the camera snapped, and at the top of a ramp the same thing turned it round.
+    float update_horizontal_follow(const SubjectSnapshot& s, bool snap, bool grounded, float flat_speed, float rig_heading, float dt) noexcept {
+        const float level = clamp01(settings_.follow.horizontal / 10.0f);
+        const float raw_heading = heading_of({s.velocity[0], 0.0f, s.velocity[2]});
+        if (snap) {
+            travel_heading_ = travel_stage_ = flat_speed > follow_min_speed ? raw_heading : wrap_angle(rig_heading - current_.position_heading);
+            hf_w_ = hf_w_stage_ = level;
+        } else {
+            if (!(hf_w_ > 0.0f)) travel_heading_ = travel_stage_ = wrap_angle(rig_heading - current_.position_heading); // off: start from the camera
+            if (grounded && flat_speed > follow_min_speed) {
+                const float time = camera_detail::lerp_f(follow_slowest_time, follow_fastest_time, level);
+                const float rate = camera_detail::ease_rate(0.5f * time, dt);
+                const float max_turn = camera_detail::lerp_f(follow_slowest_turn, follow_fastest_turn, level) * degrees * dt;
+                travel_stage_ = blend_angle(travel_stage_, raw_heading, rate);
+                const float step = wrap_angle(blend_angle(travel_heading_, travel_stage_, rate) - travel_heading_);
+                travel_heading_ = wrap_angle(travel_heading_ + std::clamp(step, -max_turn, max_turn));
+            }
+            hf_w_ = camera_detail::ease2_to(hf_w_stage_, hf_w_, level, follow_ease_time, dt);
+        }
+        if (!(hf_w_ > 0.0f)) return rig_heading;
+        return blend_angle(rig_heading, wrap_angle(travel_heading_ + current_.position_heading), hf_w_);
+    }
+
+    // Camera cut: every tracker lands on this frame's targets with zero velocity, shake and dip clear.
+    template <class Query>
+    void cut_to(const SubjectSnapshot& s, Query& ground) noexcept {
+        cur_snap_ = s;
+        acc_ = 0.0f;
+        graph_.reset();
+        shake_.reset();
+        dip_x_ = dip_v_ = 0.0f;
+        accel_ready_ = false;
+        accel_filtered_ = prev_accel_ = 0.0f;
+        push_timer_ = 0.0f;
+        was_air_ = false;
+        air_time_ = 0.0f;
+        prediction_ = {};
+        // Layers: the FOV extras and look offsets restart from 0 and ease in (the handover from the game
+        // camera must not pop); the shoulder side and the collision state land on this frame's targets.
+        fov_extra_ = landing_w_ = look_pitch_ = native_pitch_ = 0.0f;
+        air_w_ = rise_w_ = keep_off_ = framing_pitch_ = last_shake_pitch_ = 0.0f;
+        fov_extra_stage_ = landing_w_stage_ = look_pitch_stage_ = air_w_stage_ = rise_w_stage_ = 0.0f;
+        landing_point_stage_ = landing_point_;
+        coll_pull_ = coll_lift_ = coll_pull_stage_ = coll_lift_stage_ = coll_wall_ = coll_wall_stage_ = 0.0f;
+        trick_yaw_ = TrickYawState{};
+        hf_w_ = hf_w_stage_ = 0.0f;
+        travel_heading_ = travel_stage_ = 0.0f;
+        exit_active_ = false;
+        exit_blend_ = 1.0f;
+        transition_ = false;
+        transition_w_ = transition_w_stage_ = transition_shallow_ = 0.0f;
+        floor_w_ = floor_w_stage_ = height_off_ = height_stage_ = 0.0f;
+        board_w_ = board_w_stage_ = 0.0f;
+        board_rel_ = board_rel_stage_ = {0, 0, 0};
+        air_peak_y_ = 0.0f;
+        last_landing_fall_ = last_landing_fraction_ = 0.0f;
+        layers_ = {};
+        no_lag_timer_ = settings_.pipeline.no_lag_after_reset;
+        step_once(s, ground, true);
+        prev_out_ = curr_out_;
+    }
+
+    template <class Query>
+    void step_once(const SubjectSnapshot& s, Query& ground, bool snap) noexcept {
+        using camera_detail::finite3;
+        const CameraSettings& cs = settings_;
+        const float dt = fixed_step;
+        const bool native = cs.preset == CameraPreset::NativePlus;
+        const bool air = s.air();
+        const bool grounded = !air;
+        const Vec3 up_world{0, 1, 0};
+        const Vec3 normal = normalized(s.ground_normal, up_world);
+        const float clearance_now = std::clamp(s.ground_clearance, 0.0f, 3.0f);
+        const float forward_speed = dot(s.velocity, normalized(s.forward, {0, 0, 1}));
+        const float horizontal_speed = length({s.velocity[0], 0.0f, s.velocity[2]});
+        // The camera speed (graph blend, debug): |velocity . forward| on the ground. In the air the entity
+        // forward spins through flips and 360s, which would swing a forward-projected speed between +v and
+        // -v, so the last grounded value is held. A cut in mid-air has none yet and seeds the horizontal speed.
+        if (grounded) held_speed_ = std::abs(forward_speed);
+        else if (snap) held_speed_ = horizontal_speed;
+        const float speed = held_speed_;
+
+        if (snap) {
+            // A cut has no previous shot, but the framing below needs this frame's shot: resolve the
+            // one the graph would pick first.
+            graph_.reset();
+            const GraphOutput first = graph_.select(graph_input(s, dt, false, 0.0f, speed, normal), cs.graph);
+            graph_.reset();
+            angle_ = cs.angle;
+            id_ = first.shot;
+            shots_ = lookup_shots(id_, angle_);
+            leaf_ = framed(blend_shots(shots_, first.chase_blend), first.shot, first.chase_blend);
+            current_ = from_ = leaf_;
+        }
+        const Vec3 anchor_pt = anchor_point(s); // the root-based orbit anchor; the reference points come after the shot pick (board anchoring)
+
+        // ---- forward acceleration -> pump / push
+        // Grounded only: the in-air forward vector spins with the trick, so its projection is not a speed. The
+        // first grounded step after the air re-seeds the previous value, so landing is not an acceleration spike.
+        if (!accel_ready_) {
+            prev_forward_speed_ = forward_speed;
+            accel_filtered_ = prev_accel_ = 0.0f;
+            accel_ready_ = true;
+        } else if (grounded && was_air_) {
+            prev_forward_speed_ = forward_speed;
+        }
+        const float raw_accel = grounded ? (forward_speed - prev_forward_speed_) / dt : 0.0f;
+        if (grounded) prev_forward_speed_ = forward_speed;
+        const float smoothing_time = cs.pipeline.accel_smoothing_time;
+        const float blend = smoothing_time > 0.0f ? 1.0f - std::exp(-dt / std::max(smoothing_time, 1e-6f)) : 1.0f;
+        accel_filtered_ += (raw_accel - accel_filtered_) * blend;
+        const bool push_kick = grounded && !s.grinding() && prev_accel_ < cs.pipeline.push_accel_threshold &&
+                               accel_filtered_ >= cs.pipeline.push_accel_threshold;
+        prev_accel_ = accel_filtered_;
+        push_timer_ = push_kick ? cs.pipeline.push_window : std::max(0.0f, push_timer_ - dt);
+        const bool push_state = push_timer_ > 0.0f;
+        if (!snap) no_lag_timer_ = std::max(0.0f, no_lag_timer_ - dt);
+        const bool no_lag = s.bailing || no_lag_timer_ > 0.0f;
+
+        // ---- prepare 1: air / landing (before the incline)
+        if (grounded) {
+            last_clearance_ = clearance_now;
+            last_ground_normal_ = normal;
+        } else if (snap) {
+            last_clearance_ = clearance_now; // reset mid-air: the surface under the skater is the datum
+            last_ground_normal_ = normal;
+        }
+        const bool entered_air = air && (!was_air_ || snap);
+        if (entered_air) {
+            air_time_ = 0.0f;
+            flight_max_height_ = 0.0f;
+            air_peak_y_ = s.position[1];
+            takeoff_surface_y_ = s.position[1] - last_clearance_;
+            repredict_timer_ = 0.0f;
+            predict(s, ground);
+        } else if (air) {
+            air_time_ += dt;
+            air_peak_y_ = std::max(air_peak_y_, s.position[1]); // one max per step: the highest root height of this air
+            repredict_timer_ += dt;
+            if (cs.pipeline.repredict_interval > 0.0f && repredict_timer_ >= cs.pipeline.repredict_interval) {
+                repredict_timer_ = 0.0f;
+                predict(s, ground);
+            }
+        }
+        const bool touchdown = !snap && was_air_ && grounded && air_time_ >= cs.graph.landing_min_air_time;
+
+        AirInput air_in;
+        air_in.grounded = grounded;
+        air_in.set_prediction(prediction_, prediction_offset_);
+        if (air_in.trajectory_valid) air_in.trajectory_duration += prediction_time_base_;
+        air_in.trajectory_time = air_time_;
+        air_in.velocity = s.velocity;
+        air_in.ground_normal = normal;
+        air_in.anchor_height = anchor_pt[1];
+        air_in.follow_anchor_in_air = current_.follow_subject_in_air;
+        air_in.snap_height = snap;
+        if (snap) air_.reset(anchor_pt[1], grounded);
+        const AirOutput air_out = air_.update(dt, air_in, cs.air);
+        // Landing response (Alpha 5): the strength comes from how far the skater fell (the highest root height of
+        // this air minus the landing's) plus a little horizontal speed, not from the velocity at touchdown, which
+        // comes from the board's physics body and spikes in flip tricks. The first grounded step after an air
+        // counts, whatever the (possibly spiked) velocity says; a landing that fell less than min_fall gives 0.
+        if (!snap && was_air_ && grounded) {
+            last_landing_fall_ = std::max(0.0f, air_peak_y_ - s.position[1]);
+            last_landing_fraction_ = landing_fraction_of(last_landing_fall_, horizontal_speed);
+            shake_.landing_impulse_fraction(last_landing_fraction_, cs.shake);
+            kick_dip(last_landing_fraction_);
+        }
+        // ---- prepare 2: incline (after the landing response has read the previous normal)
+        incline_degrees_ = incline_of(s, normal);
+
+        // ---- graph select
+        // The apex is latched over the flight: after the apex a re-prediction reports the current
+        // height as its apex, which would flip Big back to Normal on the way down.
+        if (air && prediction_.status != TrajectoryStatus::Invalid)
+            flight_max_height_ = std::max(flight_max_height_, prediction_.predicted_max_height + prediction_offset_);
+        const float max_height = air ? flight_max_height_ : 0.0f;
+        const GraphOutput pick = graph_.select(graph_input(s, dt, touchdown, max_height, speed, normal), cs.graph);
+
+        // ---- air camera (Alpha 4, both presets). air_w_ is the eased "in the air" weight, so the height
+        // follow starts and ends smoothly. The reference height blends from the held one toward the live
+        // anchor: ref = held + follow_height * air_w * (anchor - held); follow_height 0 leaves it untouched.
+        // The rise is up to rise_degrees of extra elevation, scaled by how big the air is (the higher of the
+        // predicted apex above the takeoff and the predicted drop below it); it eases in and, after the
+        // landing, back out with the same time.
+        const AirCameraSettings& ac = cs.air_camera;
+        float rise_goal = 0.0f;
+        if (air && ac.rise_degrees > 0.0f) {
+            const float drop_below = prediction_.landed() ? -(prediction_.predicted_landing_height + prediction_offset_) : 0.0f;
+            rise_goal = clamp01(std::max(flight_max_height_, drop_below) / std::max(ac.rise_full_height, 0.1f));
+        }
+        if (!snap) {
+            // Quick in, slow out: the takeoff already knows the predicted air, and a slow build left the
+            // camera trailing below the rising skater (looking UP for the first half of a big air), while
+            // after the landing a slow release recentres gently. ease_time is the release time.
+            const float build_time = 0.5f * ac.ease_time, release_time = ac.ease_time;
+            const float follow_goal = air ? 1.0f : 0.0f;
+            air_w_ = camera_detail::ease2_to(air_w_stage_, air_w_, follow_goal, follow_goal > air_w_stage_ ? build_time : release_time, dt);
+            rise_w_ = camera_detail::ease2_to(rise_w_stage_, rise_w_, rise_goal, rise_goal > rise_w_stage_ ? build_time : release_time, dt);
+        }
+        const float rise_rad = rise_w_ * ac.rise_degrees * degrees;
+        // The keep-in-frame layer stays on while the air weight is still easing out: the camera is still
+        // settling after a landing (a low camera can have the board below the view for a few frames).
+        const bool in_air_layer = air || air_w_ > 0.02f;
+        // The published frame is up to a step behind the skater (the pose is interpolated between steps), so the
+        // keep-in-frame layer looks 1.5 steps ahead along his velocity.
+        const Vec3 keep_lead = scale(s.velocity, 1.5f * dt);
+        const float held_ref = air_out.reference_height;
+        const float ref_y = held_ref + ac.follow_height * air_w_ * (anchor_pt[1] - held_ref);
+
+        // ---- shot blend (shot_manager.rs: previous = interpolated at the change, eased by elapsed/duration)
+        const bool changed = snap || pick.shot != id_ || cs.angle != angle_;
+        // Leaving a manual / grind close-up for any other kind of shot: a longer transition (and, below, an eased
+        // distance), so the camera does not snap out of the close-up (Alpha 5 feedback).
+        const bool leaving_closeup = changed && !snap && closeup_kind(id_) != 0 && closeup_kind(pick.shot) != closeup_kind(id_);
+        if (changed) shots_ = lookup_shots(pick.shot, cs.angle); // cached until the selection changes
+        // The player's framing is part of the resolved shot, every step: a shot change blends old -> new with it
+        // baked into both, and a settings change moves only the target, which the rig's distance / elevation
+        // trackers then ease (nothing snaps).
+        leaf_ = framed(blend_shots(shots_, pick.chase_blend), pick.shot, pick.chase_blend);
+        if (changed) {
+            chase_lens_ = resolve_shot(ShotId::Chase, cs.angle, 0.0f).lens_length; // the fov shot term's zero
+            from_ = snap ? leaf_ : current_;
+            shot_elapsed_ = 0.0f;
+            shot_duration_ = snap ? 0.0f : cs.graph.transition_time[static_cast<std::size_t>(pick.shot)];
+            if (leaving_closeup) {
+                shot_duration_ = cs.look.closeup_exit_time; // the player's ease-out time, quicker or slower than the shot's own
+                exit_active_ = true;
+                exit_start_distance_ = distance_used_; // continuous with the camera's last distance, also when another exit still runs
+                exit_elapsed_ = 0.0f;
+                exit_duration_ = shot_duration_;
+            }
+            if (snap) exit_active_ = false;
+            id_ = pick.shot;
+            angle_ = cs.angle;
+        }
+        shot_elapsed_ += dt;
+        shot_fraction_ = shot_duration_ <= 0.0f ? 1.0f : clamp01(shot_elapsed_ / std::max(shot_duration_, 1e-6f));
+        current_ = interpolate(from_, leaf_, shot_fraction_);
+        current_.position_heading = blend_angle(from_.position_heading, leaf_.position_heading, sine_blend(shot_fraction_));
+
+        // ---- board anchoring (Alpha 6, FullS3, LookSettings::board_anchor): in manuals and grinds the real board
+        // point replaces the root-based estimate as the board point (focus target, the camera floor, keep-in-frame,
+        // the reference points) and the rig orbits it. The board body bounces on impacts, so only its offset from the
+        // root is smoothed (two stages, ~0.12 s): smoothing the position itself would trail a moving board by
+        // metres. The weight eases in and out (the Alpha 5 close-up timings), so entering or leaving never snaps.
+        const Vec3 board_estimate = add(s.position, {0.0f, -cs.points.board_drop, 0.0f});
+        const Vec3 board_rel_raw = sub(s.board_valid ? s.board_position : board_estimate, s.position);
+        // Leaving the close-up (board_goal 0, below) the offset is held where it was: a trick out of a manual flips and
+        // spins the board, and following it while the anchoring fades out jerked the camera (Beta feedback).
+        const bool board_wanted = !native && cs.look.board_anchor && closeup_kind(pick.shot) != 0;
+        if (snap) {
+            board_rel_ = board_rel_stage_ = board_rel_raw;
+        } else if (board_wanted) {
+            for (std::size_t axis = 0; axis < 3; ++axis)
+                board_rel_[axis] = camera_detail::ease2_to(board_rel_stage_[axis], board_rel_[axis], board_rel_raw[axis], board_smooth_time, dt);
+        }
+        const Vec3 board_real = add(s.position, board_rel_);
+        const float board_goal = board_wanted ? 1.0f : 0.0f;
+        if (snap) board_w_ = board_w_stage_ = board_goal;
+        else board_w_ = camera_detail::ease2_to(board_w_stage_, board_w_, board_goal, board_goal > board_w_stage_ ? floor_in_time : cs.look.closeup_exit_time * 0.5f, dt);
+        const Vec3 board_point = lerp(board_estimate, board_real, board_w_);
+        const std::array<Vec3, 10> points = reference_points(s, board_point);
+        // The rig's anchor: the board + a small fixed height (blended from the root-based one). Its Y is the rig's
+        // reference height, which keeps the air-held offset.
+        const Vec3 rig_point = lerp(anchor_pt, add(board_real, {0.0f, board_anchor_height, 0.0f}), board_w_);
+        const float rig_ref_y = ref_y + (rig_point[1] - anchor_pt[1]);
+        const Vec3 reference_now = weighted_point(points, current_); // the blended weights: framing only
+
+        // Manual / grind focus: eased with the shot transition (from the value at the change to the new
+        // shot's), then with the look response time if a setting moves. Every other shot is 1.
+        const float focus_goal = focus_of(pick.shot);
+        if (snap) {
+            focus_value_ = focus_from_ = focus_goal;
+        } else {
+            if (changed) focus_from_ = focus_value_;
+            focus_value_ = shot_fraction_ < 1.0f ? camera_detail::lerp_f(focus_from_, focus_goal, sine_blend(shot_fraction_))
+                                                 : camera_detail::ease_to(focus_value_, focus_goal, cs.look.response_time, dt);
+        }
+
+        // ---- FOV extras (both presets): shot, speed and air terms, eased by one exponential filter.
+        // The base (override / game / lens) is added at publish and is never smoothed here. A cut starts
+        // the extras at 0 and eases them in.
+        const FovSettings& fv = cs.fov;
+        float fov_target = 0.0f;
+        if (fv.shot_fov)
+            fov_target += lens_field_of_view_degrees(current_.lens_length, aspect_) - lens_field_of_view_degrees(chase_lens_, aspect_);
+        if (fv.speed_fov)
+            fov_target += fv.speed_fov_degrees * clamp01((horizontal_speed - fv.speed_fov_min) / std::max(fv.speed_fov_max - fv.speed_fov_min, 1e-3f));
+        if (fv.air_fov && air)
+            fov_target += fv.air_fov_degrees * clamp01(flight_max_height_ / std::max(fv.air_fov_full_height, 1e-3f));
+        if (!snap) fov_extra_ = camera_detail::ease2_to(fov_extra_stage_, fov_extra_, fov_target, fv.smoothing_time, dt);
+
+        // ---- shoulder side (both presets): a sine ease over switch_time from wherever the side value is
+        // now, so a change of mind mid-slide starts from the current value (position stays continuous).
+        const ShoulderSettings& sh_set = cs.shoulder;
+        float side_target = 0.0f;
+        if (sh_set.mode == ShoulderSide::Manual) side_target = static_cast<float>(sh_set.side);
+        else if (sh_set.mode == ShoulderSide::Auto) side_target = (sh_set.goofy != s.switch_stance) ? -1.0f : 1.0f;
+        if (snap) {
+            shoulder_value_ = shoulder_start_ = shoulder_target_ = side_target;
+            shoulder_elapsed_ = sh_set.switch_time;
+        } else {
+            if (side_target != shoulder_target_) {
+                shoulder_start_ = shoulder_value_;
+                shoulder_target_ = side_target;
+                shoulder_elapsed_ = 0.0f;
+            }
+            shoulder_elapsed_ += dt;
+            const float slide = sh_set.switch_time > 1e-4f ? clamp01(shoulder_elapsed_ / std::max(sh_set.switch_time, 1e-4f)) : 1.0f;
+            shoulder_value_ = shoulder_start_ + (shoulder_target_ - shoulder_start_) * sine_blend(slide);
+        }
+        const float shoulder_metres = shoulder_value_ * sh_set.offset;
+
+        // ---- rig (FullS3) / native layers (NativePlus), orientation and framing
+        StepOut out;
+        RigOutput rig_out;
+        float shake_distance = native_distance_;
+        const float roll_step = std::min(1.0f, cs.orientation.roll_response * dt);
+        float follow_k = 1.0f;
+        if (!native) {
+            // Follow strength: k scales the shot's smoothing (s -> s^k, k > 1 tighter) and shortens the
+            // anchor lag (below). Boosted with speed when follow.dynamic.
+            const FollowSettings& fo = cs.follow;
+            follow_k = std::clamp(fo.strength + (fo.dynamic ? fo.dynamic_boost * clamp01(horizontal_speed / std::max(fo.dynamic_speed, 0.5f)) : 0.0f),
+                                  0.2f, 7.0f);
+            const auto follow_smoothing = [follow_k](float shot_smoothing) { return std::pow(clamp01(shot_smoothing), follow_k); };
+
+            RigInput ri;
+            ri.anchor.position = rig_point;
+            ri.anchor.reference_height = rig_ref_y;
+            ri.anchor.velocity = s.velocity;
+            ri.anchor.push_state = push_state;
+            ri.anchor.push_kick = push_kick;
+            ri.anchor.pump_acceleration = accel_filtered_;
+            ri.anchor.no_lag = no_lag;
+            update_transition(snap, grounded, normal, dt);
+            ri.compass.hold = transition_;
+            ri.compass.position = s.position;
+            ri.compass.forward = s.forward;
+            const Vec3 flat_velocity{s.velocity[0], 0.0f, s.velocity[2]};
+            ri.compass.grind_direction = horizontal_speed > 0.5f ? normalized(flat_velocity, s.forward) : s.forward;
+            ri.compass.grinding = s.grinding();
+            ri.compass.wiping_out = s.bailing;
+            ri.compass.crouching = s.physics_state == physics_state::crouch;
+            ri.heading_from_compass = true;
+            ri.shot_heading = current_.position_heading;
+            ri.heading_smoothing = follow_smoothing(current_.smoothing[0]);   // manager_rig.rs bind_shot: direction smoothing
+            ri.elevation_target = current_.position_elevation;
+            ri.elevation_smoothing = follow_smoothing(current_.smoothing[1]); // and elevation smoothing
+            ri.distance.target = current_.distance;
+            ri.distance.fast = air || pick.landing_active || s.bailing; // TUNE: the fast set where the view must keep up
+            ri.distance.wipeout = s.bailing;
+            ri.distance.snap = snap;
+            if (snap) rig_.reset(ri, cs.rig);
+            rig_out = rig_.update(dt, ri, cs.rig);
+
+            // Anchor lag / follow_k, on the OUTPUT only: the rig's own tracker (its latch timers, velocity
+            // and position) runs untouched, so nothing feeds back and k can change every step without a
+            // kink. Only X and Z are scaled: the Y of the rig anchor is the air-held reference height, and
+            // shrinking that "lag" would make the camera chase the board up in a jump.
+            // In a transition the anchor lag is cut (eased), so a skater coming back down the ramp toward the camera
+            // does not ride into it before the heading swings round.
+            const float follow_inverse = (1.0f - transition_lag_cut * transition_w_) / std::max(follow_k, 0.2f);
+            rig_out.anchor[0] = rig_point[0] + (rig_out.anchor[0] - rig_point[0]) * follow_inverse;
+            rig_out.anchor[2] = rig_point[2] + (rig_out.anchor[2] - rig_point[2]) * follow_inverse;
+            rig_out.anchor_lag = length(sub({rig_point[0], rig_ref_y, rig_point[2]}, rig_out.anchor));
+
+            // Trick yaw: orbit the anchor by the swing angle. The heading grows toward -X and the skater's right
+            // is -X when the camera looks along +Z, so swinging to the skater's right DEcreases the heading.
+            // The pan tracker below keeps the view aimed at the skater.
+            update_trick_yaw(s, snap, dt);
+            // Horizontal follow: the orbit heading is pulled onto the (filtered) travel heading, the trick yaw goes on top.
+            const float follow_heading = update_horizontal_follow(s, snap, grounded && !transition_, horizontal_speed, rig_out.heading, dt);
+            const float heading_used = follow_heading - trick_yaw_.value;
+            // The big-air rise rides on the rig's tracked elevation (not its target): the elevation tracker is slow
+            // (it takes seconds to move a few degrees), so a rise fed through it would hardly show in an air.
+            // The framing height does the same (Alpha 5): an eased offset after the tracker, so a slider change
+            // shows within half a second instead of at the tracker's ~3.6 deg/s.
+            const float height_goal = height_goal_of(pick.shot);
+            if (snap) height_off_ = height_stage_ = height_goal;
+            else height_off_ = camera_detail::ease2_to(height_stage_, height_off_, height_goal, height_ease_time, dt);
+            // The framing pitch (look.response_time ease; Low and High each have their own). With board anchoring it
+            // is measured around the board: the share board_w_ tilts the camera's orbit about the board instead of
+            // the view, so the view stays aimed at the board-anchored look target and the board keeps its place on
+            // screen (+ pitch swings the camera down, so it looks up, like the view offset it replaces).
+            const float framing_pitch_goal = pitch_goal_of(pick.shot);
+            framing_pitch_ = snap ? framing_pitch_goal : camera_detail::ease_to(framing_pitch_, framing_pitch_goal, cs.look.response_time, dt);
+            const float elevation_used = std::clamp(rig_out.elevation + rise_rad + height_off_ - board_w_ * framing_pitch_,
+                                                    -85.0f * degrees, 85.0f * degrees);
+            last_elevation_used_ = elevation_used;
+            // Leaving a manual / grind close-up: the distance follows a sine ease over the player's ease-out time
+            // (LookSettings::closeup_exit_time) from where it was to the shot's distance, whatever the rig's distance
+            // tracker (6 m/s) does; at the end the tracker takes over from that distance, so nothing jumps.
+            float distance_now = rig_out.distance;
+            if (exit_active_ && !snap) {
+                exit_elapsed_ += dt;
+                const float exit_fraction = clamp01(exit_elapsed_ / std::max(exit_duration_, 1e-3f));
+                distance_now = camera_detail::lerp_f(exit_start_distance_, current_.distance, sine_blend(exit_fraction));
+                exit_blend_ = exit_fraction;
+                if (exit_fraction >= 1.0f) {
+                    exit_active_ = false;
+                    rig_.reset_distance(distance_now);
+                }
+            } else {
+                exit_blend_ = 1.0f;
+            }
+            // One distance rule (Alpha 6): the orbit distance is held inside DistanceLimits here, and the final camera
+            // is clamped again after the shoulder / collision below (they move it off the orbit sphere).
+            distance_now = std::clamp(distance_now, distance_min(), std::max(distance_max(), distance_min()));
+            distance_used_ = distance_now;
+            const float cos_e = std::cos(elevation_used), sin_e = std::sin(elevation_used);
+            const Vec3 offset_dir{-std::sin(heading_used), 0.0f, std::cos(heading_used)};
+            Vec3 camera = add(rig_out.anchor, add(scale(offset_dir, distance_now * cos_e), {0, distance_now * sin_e, 0}));
+            // Only while the ground under the skater is measured: clearance_now is clamped to 3 m, so in a
+            // higher air the floor would sit above the real ground and hold the camera up (hiding the rise).
+            // The collision layer's own ground ray covers the camera there.
+            if (cs.pipeline.floor_clearance > 0.0f && s.ground_clearance < 3.0f)
+                camera[1] = std::max(camera[1], s.position[1] - clearance_now + cs.pipeline.floor_clearance);
+            // Manuals and grinds: the camera stays at least manual_grind_min_height above the board (the Low
+            // shots sat below it, looking up at it). The floor's weight is eased in and out (two-stage), and the
+            // lift is that weight times the shortfall, so it grows continuously instead of clamping in.
+            const float floor_goal = closeup_kind(pick.shot) != 0 ? 1.0f : 0.0f;
+            if (snap) floor_w_ = floor_w_stage_ = floor_goal;
+            else floor_w_ = camera_detail::ease2_to(floor_w_stage_, floor_w_, floor_goal, floor_goal > floor_w_stage_ ? floor_in_time : cs.look.closeup_exit_time * floor_out_share, dt);
+            camera[1] += floor_w_ * std::max(0.0f, points[4][1] + manual_grind_min_height - camera[1]); // points[4]: the board point
+
+            // ---- look target. The shot's board_offset lifts the base above the weighted point (Rust: along
+            // the subject's board-offset direction, here world up): the Low camera sits near the board and
+            // looks up at the skater. `look_base` is where the skater is; the layers below bend the point
+            // the VIEW aims at, but the collision pivot stays on the skater (a camera that looks down at a
+            // landing must not be pulled in by the ledge it jumps off).
+            const Vec3 look_base = add(reference_now, {0.0f, current_.board_offset, 0.0f});
+
+            // a) landing look: while a prediction says the landing is below the takeoff surface (same datum
+            // as debug.predicted_landing_delta), the target moves toward where the BOARD will touch down.
+            // The root rests last_clearance_ above the surface and the board hangs board_drop below it, so the
+            // aim point is the landing surface point + (last_clearance_ - board_drop): it matches the
+            // look_base convention (the board region), so a same-level landing would aim at the same spot.
+            // The weight eases with look.response_time, and the point is held when the prediction ends, so
+            // a re-prediction that misses fades the look out instead of jerking it.
+            const LookSettings& lk = cs.look;
+            const bool landing_known = air && prediction_.landed();
+            float landing_goal = 0.0f;
+            if (landing_known) {
+                // Each re-prediction moves the point a little: follow it through the same gentle two-stage
+                // filter as the weight, except while the look is (almost) off, where it can jump unseen.
+                const Vec3 predicted_point = add(prediction_.landing_position, {0.0f, last_clearance_ - cs.points.board_drop, 0.0f});
+                if (landing_w_ < 0.01f || snap) landing_point_ = landing_point_stage_ = predicted_point;
+                else
+                    for (std::size_t axis = 0; axis < 3; ++axis)
+                        landing_point_[axis] = camera_detail::ease2_to(landing_point_stage_[axis], landing_point_[axis],
+                                                                       predicted_point[axis], lk.response_time, dt);
+                const float drop = prediction_.predicted_landing_height + prediction_offset_;
+                if (lk.landing_look && drop < 0.0f)
+                    landing_goal = lk.landing_look_strength * clamp01(-drop / std::max(lk.landing_look_full_drop, 0.1f));
+            }
+            // b) slope look: on the ground the pitch follows the incline (+ uphill, so downhill looks down).
+            const float slope_goal = (lk.slope_look && grounded) ? lk.slope_look_strength * incline_degrees_ * degrees : 0.0f;
+            if (!snap) {
+                landing_w_ = camera_detail::ease2_to(landing_w_stage_, landing_w_, landing_goal, lk.response_time, dt);
+                look_pitch_ = camera_detail::ease2_to(look_pitch_stage_, look_pitch_, slope_goal, lk.response_time, dt);
+            }
+            const Vec3 focused_base = focus_value_ >= 1.0f ? look_base : lerp(points[4], look_base, focus_value_);
+            Vec3 look_target = lerp(focused_base, landing_point_, landing_w_);
+            // c) vertical follow: 1 = the pitch follows the skater's height, 0 = it stays level with the
+            // air-held reference height (applied last, so it also limits the landing look's vertical part).
+            const float held_y = ref_y;
+            look_target[1] = held_y + lk.vertical_follow * (look_target[1] - held_y);
+
+            // ---- shoulder: slide the camera along its own right. The yaw is the camera's current one (the
+            // pan tracker before this step's update; on a cut, the yaw it is about to snap to), so the
+            // shift is along the right of the final camera basis to within one step of pan motion.
+            const Vec3 to_pre = sub(look_target, camera);
+            float yaw_pre = pan_.position();
+            if (to_pre[0] * to_pre[0] + to_pre[2] * to_pre[2] > 1e-8f) yaw_pre = std::atan2(-to_pre[0], to_pre[2]);
+            const float yaw_now = snap ? wrap_angle(yaw_pre + current_.framing[1]) : pan_.position();
+            const Vec3 shift = scale(Vec3{-std::cos(yaw_now), 0.0f, -std::sin(yaw_now)}, shoulder_metres);
+            camera = add(camera, shift);
+
+            // ---- collision (simplified): the pivot moves with the shoulder so the ray stays
+            // parallel to the unshifted one. Pulling the camera in along the pivot -> camera line keeps
+            // its direction, and the aim below is taken from the FINAL camera position, so the orientation
+            // and the position always agree.
+            const float pulled = collide(ground, add(look_base, shift), camera, snap, in_air_layer, horizontal_speed);
+            camera = clamp_distance(camera, rig_out.anchor, offset_dir);
+
+            // Look at the actual reference point (not the lagged anchor): the camera holds its height
+            // in the air while the skater rises through the frame. The up-tilt is capped (frame_composer.rs).
+            const Vec3 to_ref = sub(add(look_target, shift), camera);
+            const float to_len = length(to_ref);
+            float yaw_target = pan_.position();
+            float pitch_target = tilt_.position();
+            if (to_len > 1e-4f) {
+                const float horizontal = std::sqrt(to_ref[0] * to_ref[0] + to_ref[2] * to_ref[2]);
+                if (horizontal > 1e-4f) yaw_target = std::atan2(-to_ref[0], to_ref[2]);
+                const float ceiling = std::sin(cs.orientation.max_pitch_degrees * degrees);
+                pitch_target = std::asin(std::min(to_ref[1] / std::max(to_len, 1e-4f), ceiling));
+            }
+            yaw_target = wrap_angle(yaw_target + current_.framing[1]);
+            // frame_composer.rs: pitch = -framing[2] is applied in the look basis (columns right, up, at),
+            // which tilts the view DOWN by that angle, so a positive authored pitch looks up from the
+            // camera-to-reference line and a negative one (the Low shots) looks down.
+            // The player's pitch offset goes in after the look offsets and before the clamp; the tilt tracker
+            // below eases a change of it.
+            // Low and High each have their own pitch; it eases (look.response_time) so an angle switch is smooth.
+            // (framing_pitch_ is eased above; the board-anchored share of it went into the orbit elevation.)
+            const float view_pitch_offset = (1.0f - board_w_) * framing_pitch_;
+            pitch_target = std::clamp(pitch_target + current_.framing[2] + look_pitch_ + view_pitch_offset,
+                                      -89.0f * degrees, 89.0f * degrees);
+            // Manuals and grinds never look up (the camera is above the board there): the pitch above the player's
+            // own offset is taken off by the floor's eased weight.
+            pitch_target -= floor_w_ * std::max(0.0f, pitch_target - std::max(view_pitch_offset, 0.0f));
+            if (snap) {
+                pan_.reset(yaw_target);
+                tilt_.reset(pitch_target);
+                roll_ = current_.framing[0];
+            } else {
+                pan_.update(yaw_target, dt, orientation_tracker(cs.orientation.pan, follow_smoothing(current_.smoothing[2]), cs.orientation));
+                tilt_.update(pitch_target, dt, orientation_tracker(cs.orientation.tilt, follow_smoothing(current_.smoothing[3]), cs.orientation));
+                roll_ += (current_.framing[0] - roll_) * roll_step;
+            }
+            // Keep the skater in the vertical view in the air (an offset on the eased view pitch, so it also
+            // works past the max-pitch ceiling above).
+            const float keep_pitch = update_keep_in_frame(camera, tilt_.position() + last_shake_pitch_,
+                                                       {add(look_base, keep_lead), add(points[4], keep_lead), add(s.position, keep_lead)}, in_air_layer, snap);
+            out.pos = camera;
+            out.yaw = pan_.position();
+            out.pitch = tilt_.position() + keep_pitch;
+            out.roll = roll_;
+            layers_.look_target = look_target;
+            out.anchor = rig_out.anchor;
+            shake_distance = length(sub(camera, rig_out.anchor));
+            layers_.collision_pull = pulled;
+        } else {
+            if (snap) roll_ = current_.framing[0];
+            else roll_ += (current_.framing[0] - roll_) * roll_step;
+            const float hold = cs.native_plus.air_hold ? ref_y - anchor_pt[1] : 0.0f;
+            // Critically damped spring, semi-implicit Euler (stable: omega * dt << 1).
+            const float omega = 1.0f / std::max(cs.native_plus.dip_peak_time, 1e-3f);
+            dip_v_ += (-2.0f * omega * dip_v_ - omega * omega * dip_x_) * dt;
+            dip_x_ += dip_v_ * dt;
+            // The rise: swing the camera up over the skater by raising the native position by distance * sin(rise)
+            // and pitching the view down so the skater stays in the same screen spot. The pitch is the change of
+            // the camera -> skater elevation the lift causes (about `rise` when the skater is level with the
+            // view, less when he is far above or below it, where a flat `rise` would push him off the axis).
+            const float dip_now = cs.native_plus.landing_dip ? dip_x_ : 0.0f;
+            const Vec3 unraised = add(native_pose_.position, {0.0f, hold - dip_now, 0.0f});
+            const float lift = native_distance_ * std::sin(rise_rad);
+            const float rise_pitch = elevation_to(add(unraised, {0.0f, lift, 0.0f}), s.position) - elevation_to(unraised, s.position);
+            out.pos = {0.0f, hold - dip_now + lift, 0.0f};
+            out.roll = cs.native_plus.roll ? roll_ : 0.0f;
+            // Framing pitch (the only framing NativePlus has): a cut eases it in from 0 like the other layers.
+            if (!snap) native_pitch_ = camera_detail::ease_to(native_pitch_, active_framing().pitch_degrees * degrees, cs.look.response_time, dt);
+            const float native_view_pitch = std::asin(std::clamp(-native_pose_.back[1] / std::max(length(native_pose_.back), 1e-4f), -1.0f, 1.0f)) +
+                                            native_pitch_ + rise_pitch + last_shake_pitch_;
+            const Vec3 head_point = add(s.position, {0.0f, cs.points.head_height, 0.0f});
+            const float keep_pitch = update_keep_in_frame(add(native_pose_.position, out.pos), native_view_pitch,
+                                                          {add(s.position, keep_lead), add(points[4], keep_lead), add(head_point, keep_lead)}, in_air_layer, snap);
+            out.pitch = native_pitch_ + rise_pitch + keep_pitch;
+            layers_.collision_pull = 0.0f;
+            trick_yaw_ = TrickYawState{};
+        }
+        out.shoulder = shoulder_metres;
+        out.fov_extra = fov_extra_;
+        layers_.landing_look_weight = native ? 0.0f : landing_w_;
+        layers_.look_pitch_offset = native ? 0.0f : look_pitch_;
+        layers_.follow_strength = follow_k;
+        layers_.trick_yaw = trick_yaw_.value;
+        layers_.air_follow_weight = air_w_;
+        layers_.air_reference_height = ref_y;
+        layers_.air_rise = rise_rad;
+        layers_.keep_pitch_offset = keep_off_;
+        layers_.focus_weight = focus_value_;
+        layers_.follow_weight = native ? 0.0f : hf_w_;
+        layers_.floor_weight = native ? 0.0f : floor_w_;
+        layers_.height_offset = native ? 0.0f : height_off_;
+        layers_.board_weight = native ? 0.0f : board_w_;
+
+        // ---- shake. Speed shake (both presets): the rumble is rebuilt per step from a copy of the
+        // settings, so the landing impulse (separate fields) is untouched. When the rumble is off its
+        // amplitude is 0; otherwise amplitude_max scales with strength and the downhill factor, and the
+        // speed that gives the full rumble (amplitude and frequency) is speed_shake.top_speed.
+        ShakeSettings shake_cfg = cs.shake;
+        const SpeedShakeSettings& rumble = cs.speed_shake;
+        if (!rumble.enabled) {
+            shake_cfg.amplitude_min = shake_cfg.amplitude_max = 0.0f;
+        } else {
+            float downhill = 1.0f;
+            if (rumble.downhill_boost && incline_degrees_ < 0.0f)
+                downhill = 1.0f + (rumble.downhill_scale - 1.0f) * clamp01(-incline_degrees_ / std::max(rumble.downhill_full_degrees, 1.0f));
+            shake_cfg.amplitude_max *= rumble.strength * downhill;
+            shake_cfg.amplitude_top_speed = shake_cfg.frequency_top_speed = rumble.top_speed;
+        }
+        const bool shake_on = cs.shake_enabled && (!native || cs.native_plus.shake);
+        const ShakeOutput sh = shake_.update(dt, horizontal_speed, shake_distance * cs.pipeline.shake_distance_scale,
+                                             shake_on && !s.bailing, shake_cfg);
+        out.yaw += sh.yaw;
+        out.pitch += sh.pitch;
+        last_shake_pitch_ = sh.pitch; // the next step's keep-in-frame counts it (the shake is computed after)
+        out.roll += sh.roll;
+        out.local = sh.translation;
+
+        // ---- write (a non-finite step is dropped: the previous output stays)
+        was_air_ = air;
+        last_pick_ = pick;
+        last_speed_ = speed;
+        last_rig_ = rig_out;
+        last_push_state_ = push_state;
+        last_push_kick_ = push_kick;
+        kick_in_update_ = kick_in_update_ || push_kick;
+        last_hold_ = ref_y - anchor_pt[1];
+        if (out.finite()) {
+            prev_out_ = curr_out_;
+            curr_out_ = out;
+        }
+    }
+
+    // Pan / tilt smoothing from the shot (rig_orientation.rs bind_shot): 1 - (1 - s)^2 where
+    // s is the shot's smoothing... derived as in manager_rig.rs, then capped.
+    static AngleTrackerSettings orientation_tracker(AngleTrackerSettings base, float shot_smoothing,
+                                                    const OrientationSettings& set) noexcept {
+        const float inverse = 1.0f - std::clamp(shot_smoothing, 0.0f, 1.0f);
+        const float smoothing = std::min(1.0f - inverse * inverse, set.smoothing_cap);
+        base.smoothing_min = base.smoothing_max = clamp01(smoothing);
+        return base;
+    }
+
+    GraphInput graph_input(const SubjectSnapshot& s, float dt, bool touchdown, float max_height, float speed,
+                           const Vec3& normal) const noexcept {
+        GraphInput g;
+        g.dt = dt;
+        g.bailing = s.bailing;
+        g.air = s.air();
+        g.grinding = s.grinding();
+        g.grind_side = s.grind_side;
+        g.manual = s.manual;
+        g.touchdown = touchdown;
+        g.speed = speed;
+        g.predicted_max_height = max_height;
+        g.incline_degrees = incline_of(s, normal);
+        return g;
+    }
+
+    // Ballistic prediction from the surface-level point (position - up * clearance).
+    template <class Query>
+    void predict(const SubjectSnapshot& s, Query& ground) noexcept {
+        TrajectoryLaunch launch;
+        // The launch point sits last_clearance_ (the takeoff clearance) under the root, but never below the ground
+        // measured under the skater now: near touchdown the skater compresses over the board, that point ended up
+        // under the landing surface, every chord started inside it, and the prediction found ground 4-20 m below
+        // (Beta 2b log: 44 of 298 landings, plain ollies predicted at -4.5 to -20.7 m).
+        const float live_clearance = std::isfinite(s.ground_clearance) ? s.ground_clearance : last_clearance_;
+        const float surface_y = s.position[1] - std::min(last_clearance_, std::max(launch_above_ground, live_clearance - launch_above_ground));
+        launch.position = {s.position[0], surface_y, s.position[2]};
+        launch.velocity = s.velocity;
+        launch.launch_normal = last_ground_normal_;
+        launch.camera_distance = current_.distance;
+        prediction_ = predict_trajectory(launch, ground, settings_.trajectory);
+        // Express everything against the takeoff surface: set_prediction's launch_clearance adds
+        // (this launch point - takeoff surface), so a re-prediction mid-flight reports the same datum.
+        prediction_offset_ = surface_y - takeoff_surface_y_;
+        prediction_time_base_ = air_time_;
+    }
+
+    // Landing dip: a velocity kick into the critically damped spring whose peak depth is dip_depth * fraction^2, the
+    // fraction being landing_fraction_of (the same 0..1 as the shake impulse).
+    void kick_dip(float fraction) noexcept {
+        const NativePlusSettings& np = settings_.native_plus;
+        if (settings_.preset != CameraPreset::NativePlus || !np.landing_dip) return;
+        if (!(fraction > 0.0f)) return;
+        const float peak = np.dip_depth * clamp01(fraction) * clamp01(fraction);
+        const float omega = 1.0f / std::max(np.dip_peak_time, 1e-3f);
+        constexpr float e = 2.71828182845905f;
+        dip_v_ = std::max(dip_v_, peak * omega * e); // x(t) = v0 t exp(-omega t) peaks at v0 / (omega e)
+    }
+
+    // Camera collision (simplified; FullS3). Ray 1 runs pivot -> camera: a hit allows
+    // max(min_distance, hit distance - radius) along that line, and the camera sits at
+    // pivot + dir * (full - pull). The smoothing runs on the PULL (metres taken off the rig's own
+    // distance) rather than on the allowed distance itself: equal while an obstacle is there, but a clear
+    // ray then costs nothing, so the rig's distance changes pass through without an extra lag. Pulling in
+    // eases with pull_in_time, letting out with release_time. Ray 2 runs from 1 m above the camera down
+    // to ground_clearance below it and lifts the camera to the ground + ground_clearance, eased the same
+    // way. At most two rays per fixed step. A cut snaps both. Returns the metres pulled in.
+    template <class Query>
+    float collide(Query& ground, const Vec3& pivot, Vec3& camera, bool snap, bool air, float speed) noexcept {
+        using camera_detail::finite3;
+        CollisionSettings col = settings_.collision.automatic ? automatic_collision() : settings_.collision;
+        // Automatic, on the ground: the faster the skater, the quicker the camera lets go once an obstacle is gone. On a
+        // drop-in the deck holds the camera up behind the skater; at the bottom it then took ~0.6 s to come down and
+        // back out (Beta feedback: "struggles to follow"). Skate 3 likewise drops its anchor lag to 0 by 8 m/s.
+        if (settings_.collision.automatic && !air)
+            col.release_time *= std::clamp(fast_release_speed / std::max(speed, 0.1f), fast_release_floor, 1.0f);
+        if (!col.enabled) {
+            coll_pull_ = coll_lift_ = coll_pull_stage_ = coll_lift_stage_ = coll_wall_ = coll_wall_stage_ = 0.0f;
+            return 0.0f;
+        }
+        const Vec3 ray = sub(camera, pivot);
+        const float full = length(ray);
+        // The minimum is DistanceLimits::min (Alpha 6), not col.min_distance, which is unused (kept so old presets load).
+        const float min_distance = distance_min();
+        float pull_goal = 0.0f, wall_goal = 0.0f;
+        if (full > 1e-3f) {
+            const std::optional<GroundHit> wall = query_point(ground, pivot, camera);
+            if (wall && finite3(wall->point) && (!settings_.collision.automatic || wide_obstacle(ground, pivot, camera, *wall))) {
+                const float room = length(sub(wall->point, pivot)) - col.radius;
+                pull_goal = std::max(0.0f, full - std::max(min_distance, room));
+                // A wall closer than the minimum: keep the minimum and lift the camera over the obstacle instead.
+                wall_goal = std::min(wall_lift_gain * std::max(0.0f, min_distance - room), wall_lift_max);
+            }
+        }
+        // In the air the obstacle is usually the ramp the skater just left: the camera trails below and
+        // behind, and where the skater -> camera ray meets the ramp changes every step. A near-instant
+        // pull-in there followed every change, which read as the camera tweaking in big airs (Alpha 4 log:
+        // the airs with the largest position jumps were the ones with 1.5-1.9 m of pull). In the air the
+        // pull eases in over at least air_pull_in_time, through the gentle two-stage ease.
+        constexpr float air_pull_in_time = 0.25f;
+        const float in_time = air ? std::max(col.pull_in_time, air_pull_in_time) : col.pull_in_time;
+        coll_pull_ = snap ? (coll_pull_stage_ = pull_goal)
+                          : camera_detail::ease2_to(coll_pull_stage_, coll_pull_, pull_goal,
+                                                    pull_goal > coll_pull_stage_ ? in_time : col.release_time, fixed_step);
+        // Never closer than the minimum (a rig distance already shorter than that is left alone).
+        const float pull = std::min(coll_pull_, std::max(0.0f, full - min_distance));
+        if (pull > 0.0f) camera = add(pivot, scale(ray, (full - pull) / std::max(full, 1e-3f)));
+        // The lift over a too-close wall: slower in than the near-instant pull (wall_lift_time), so it reads as a swing up.
+        coll_wall_ = snap ? (coll_wall_stage_ = wall_goal)
+                          : camera_detail::ease2_to(coll_wall_stage_, coll_wall_, wall_goal,
+                                                    wall_goal > coll_wall_stage_ ? std::max(in_time, wall_lift_time) : col.release_time, fixed_step);
+        if (coll_wall_ > 1e-4f) { // swing up about the pivot (the distance to it is kept), not away from it
+            const Vec3 raised = add(sub(camera, pivot), {0.0f, coll_wall_, 0.0f});
+            camera = add(pivot, scale(raised, length(sub(camera, pivot)) / std::max(length(raised), 1e-3f)));
+        }
+
+        float lift_goal = 0.0f;
+        if (const std::optional<GroundHit> floor_hit = query_point(ground, add(camera, {0.0f, 1.0f, 0.0f}), sub(camera, {0.0f, col.ground_clearance, 0.0f}))) {
+            if (finite3(floor_hit->point)) lift_goal = std::max(0.0f, floor_hit->point[1] + col.ground_clearance - camera[1]);
+        }
+        coll_lift_ = snap ? (coll_lift_stage_ = lift_goal)
+                          : camera_detail::ease2_to(coll_lift_stage_, coll_lift_, lift_goal,
+                                                    lift_goal > coll_lift_stage_ ? in_time : col.release_time, fixed_step);
+        camera[1] += coll_lift_;
+        return pull;
+    }
+
+    // Automatic collision: the stock values (the player's own are only used with automatic off) and the enabled switch.
+    CollisionSettings automatic_collision() const noexcept {
+        CollisionSettings col;
+        col.enabled = settings_.collision.enabled;
+        return col;
+    }
+    // Automatic collision: a hit on the camera ray counts only when a ray beside it, wide_whisker metres to either side
+    // (along the horizontal right of the ray), also meets something no more than wide_depth beyond it. A lamp post,
+    // a pole or a rail between the skater and the camera then passes by instead of yanking the camera in. Two more
+    // rays, only when the camera ray hits.
+    template <class Query>
+    bool wide_obstacle(Query& ground, const Vec3& pivot, const Vec3& camera, const GroundHit& hit) noexcept {
+        const Vec3 ray = sub(camera, pivot);
+        const Vec3 right = normalized(Vec3{ray[2], 0.0f, -ray[0]}, {1.0f, 0.0f, 0.0f});
+        const float reach = length(sub(hit.point, pivot)) + wide_depth;
+        for (const float side : {-1.0f, 1.0f}) {
+            const Vec3 offset = scale(right, side * wide_whisker);
+            if (const std::optional<GroundHit> beside = query_point(ground, add(pivot, offset), add(camera, offset)))
+                if (camera_detail::finite3(beside->point) && length(sub(beside->point, add(pivot, offset))) <= reach) return true;
+        }
+        return false;
+    }
+
+    // The final camera held at DistanceLimits from the orbit anchor (FullS3, one rule for every shot, close-up,
+    // the shoulder and the collision). `fallback` is the direction to use when the camera sits on the anchor.
+    Vec3 clamp_distance(const Vec3& camera, const Vec3& anchor, const Vec3& fallback) const noexcept {
+        Vec3 offset = sub(camera, anchor);
+        float span = length(offset);
+        if (span < 1e-4f) {
+            offset = fallback;
+            span = std::max(length(offset), 1e-4f);
+        }
+        const float wanted = std::clamp(span, distance_min(), std::max(distance_max(), distance_min()));
+        if (wanted == span) return camera;
+        return add(anchor, scale(offset, wanted / std::max(span, 1e-4f)));
+    }
+
+    // Base fov: the override, else the game camera's own (extras.base_fov_deg, then the native pose's), else
+    // the chase shot's lens. The shot term in the extras is relative to the chase lens, so the current shot's
+    // lens is counted once. The base is not smoothed here.
+    float fov_base_deg() const noexcept {
+        float base_fov = lens_field_of_view_degrees(chase_lens_, aspect_);
+        if (settings_.preset == CameraPreset::NativePlus && native_fov_ > 0.0f) base_fov = native_fov_;
+        if (std::isfinite(extras_base_fov_) && extras_base_fov_ > 0.0f) base_fov = extras_base_fov_;
+        if (settings_.fov_override_deg > 0.0f) base_fov = settings_.fov_override_deg;
+        return base_fov;
+    }
+
+    // The frame from the last two steps, interpolated by the accumulator.
+    void publish(FrameDebug dbg, const FrameExtras& extras) noexcept {
+        const NativePose* native_pose = extras.native;
+        using namespace camera_detail;
+        const float alpha = clamp01(acc_ * fixed_hz);
+        StepOut o;
+        o.pos = lerp(prev_out_.pos, curr_out_.pos, alpha);
+        o.yaw = blend_angle(prev_out_.yaw, curr_out_.yaw, alpha);
+        o.pitch = lerp_f(prev_out_.pitch, curr_out_.pitch, alpha);
+        o.roll = lerp_f(prev_out_.roll, curr_out_.roll, alpha);
+        o.local = lerp(prev_out_.local, curr_out_.local, alpha);
+        o.anchor = lerp(prev_out_.anchor, curr_out_.anchor, alpha);
+        o.fov_extra = lerp_f(prev_out_.fov_extra, curr_out_.fov_extra, alpha);
+        o.shoulder = lerp_f(prev_out_.shoulder, curr_out_.shoulder, alpha);
+
+        Vec3 right, up, back, position;
+        // Base fov: the override, else the game camera's own (extras.base_fov_deg, then the native pose's),
+        // else the chase shot's lens. The shot term in the extras is relative to the chase lens, so the
+        // current shot's lens is counted once. The base is not smoothed here.
+        const float fov_base = fov_base_deg();
+        if (settings_.preset == CameraPreset::FullS3) {
+            basis_from_angles(o.yaw, o.pitch, o.roll, right, up, back);
+            position = add(o.pos, add(add(scale(right, o.local[0]), scale(up, o.local[1])), scale(back, o.local[2])));
+        } else {
+            right = native_pose->right;
+            up = native_pose->up;
+            back = native_pose->back;
+            orthonormalize(right, up, back);
+            // Camera-local rotations: yaw about -up, pitch about right, roll about back.
+            const auto spin = [&](const Vec3& axis, float angle) {
+                right = rotate_about(right, axis, angle);
+                up = rotate_about(up, axis, angle);
+                back = rotate_about(back, axis, angle);
+            };
+            spin(scale(up, -1.0f), o.yaw);
+            spin(right, o.pitch);
+            spin(back, o.roll);
+            orthonormalize(right, up, back);
+            position = add(add(native_pose->position, o.pos),
+                           add(add(scale(right, o.local[0] + o.shoulder), scale(up, o.local[1])), scale(back, o.local[2])));
+        }
+        const float fov = std::clamp(fov_base + o.fov_extra, 1.0f, 170.0f);
+        if (!finite3(right) || !finite3(up) || !finite3(back) || !finite3(position) || !std::isfinite(fov)) {
+            hold();
+            return;
+        }
+        frame_.right = right;
+        frame_.up = up;
+        frame_.back = back;
+        frame_.pos = position;
+        frame_.fov_deg = fov;
+        frame_.shot = id_;
+        frame_.valid = true;
+
+        dbg.shot_name = shot_id_name(id_);
+        dbg.preset = settings_.preset;
+        dbg.airborne = was_air_;
+        dbg.landing_active = last_pick_.landing_active;
+        dbg.transitioning = shot_fraction_ < 1.0f;
+        dbg.shot_fraction = shot_fraction_;
+        dbg.chase_blend = last_pick_.chase_blend;
+        dbg.prediction_valid = prediction_.landed();
+        dbg.predicted_max_height = was_air_ ? flight_max_height_ : 0.0f;
+        dbg.predicted_air_time = prediction_.landed() ? prediction_time_base_ + prediction_.predicted_air_time : 0.0f;
+        dbg.predicted_landing_delta = prediction_.landed() ? prediction_.predicted_landing_height + prediction_offset_ : 0.0f;
+        dbg.air_hold_delta = last_hold_;
+        dbg.anchor_lag = last_rig_.anchor_lag;
+        dbg.heading = last_rig_.heading;
+        dbg.elevation = settings_.preset == CameraPreset::FullS3 ? last_elevation_used_ : last_rig_.elevation; // with the rise, so camera = anchor + distance * sin(elevation)
+        dbg.distance = settings_.preset == CameraPreset::FullS3 ? distance_used_ : last_rig_.distance; // with the exit ease
+        dbg.impulse = shake_.impulse();
+        dbg.landing_dip = dip_x_;
+        dbg.speed = last_speed_;
+        dbg.incline_degrees = incline_degrees_;
+        dbg.forward_acceleration = accel_filtered_;
+        dbg.push_state = last_push_state_;
+        dbg.push_kick = kick_in_update_;
+        dbg.fov_base = fov_base;
+        dbg.fov_extra = o.fov_extra;
+        dbg.landing_look_weight = layers_.landing_look_weight;
+        dbg.look_pitch_offset = layers_.look_pitch_offset;
+        dbg.shoulder = o.shoulder;
+        dbg.follow_strength = layers_.follow_strength;
+        dbg.collision_pull = layers_.collision_pull;
+        dbg.trick_yaw = layers_.trick_yaw;
+        dbg.air_follow_weight = layers_.air_follow_weight;
+        dbg.air_reference_height = layers_.air_reference_height;
+        dbg.air_rise = layers_.air_rise;
+        dbg.keep_pitch_offset = layers_.keep_pitch_offset;
+        dbg.focus_weight = layers_.focus_weight;
+        dbg.look_target = layers_.look_target;
+        dbg.landing_fall = last_landing_fall_;
+        dbg.landing_fraction = last_landing_fraction_;
+        dbg.follow_weight = layers_.follow_weight;
+        dbg.travel_heading = travel_heading_;
+        dbg.exit_blend = exit_blend_;
+        dbg.floor_weight = layers_.floor_weight;
+        dbg.height_offset = layers_.height_offset;
+        dbg.board_weight = layers_.board_weight;
+        dbg.orbit_anchor = o.anchor;
+        frame_.debug = dbg;
+    }
+
+    CameraSettings settings_{};
+    Frame frame_{};
+
+    // pipeline
+    ShotGraph graph_;
+    AirHeight air_;
+    Rig rig_;
+    Shake shake_;
+    AngleTracker pan_, tilt_;
+    float roll_ = 0.0f;
+
+    // shot blend
+    Shot from_{}, leaf_{}, current_{};
+    ResolvedShots shots_{}; // the table shots of id_ / angle_, looked up on a shot change only
+    ShotId id_ = ShotId::Chase;
+    CameraAngle angle_ = CameraAngle::Low;
+    float shot_elapsed_ = 0.0f, shot_duration_ = 0.0f, shot_fraction_ = 1.0f;
+
+    // fixed-step driver
+    SubjectSnapshot cur_snap_{};
+    StepOut prev_out_{}, curr_out_{};
+    float acc_ = 0.0f;
+    float aspect_ = 16.0f / 9.0f;
+    float invalid_time_ = 0.0f;
+    bool initialized_ = false;
+    bool reset_requested_ = false;
+    CameraPreset last_preset_ = CameraPreset::FullS3;
+
+    // air / prediction
+    bool was_air_ = false;
+    float air_time_ = 0.0f, repredict_timer_ = 0.0f;
+    float flight_max_height_ = 0.0f; // m above the takeoff surface: the highest predicted apex this flight (latched)
+    float takeoff_surface_y_ = 0.0f, last_clearance_ = 0.95f;
+    Vec3 last_ground_normal_{0, 1, 0};
+    TrajectoryPrediction prediction_{};
+    float prediction_offset_ = 0.0f, prediction_time_base_ = 0.0f;
+
+    // acceleration / push
+    bool accel_ready_ = false;
+    float prev_forward_speed_ = 0.0f, accel_filtered_ = 0.0f, prev_accel_ = 0.0f, push_timer_ = 0.0f;
+    float no_lag_timer_ = 0.0f;
+
+    // NativePlus
+    float dip_x_ = 0.0f, dip_v_ = 0.0f, native_distance_ = 3.0f;
+
+    // Alpha 2 layers (both presets unless noted)
+    float fov_extra_ = 0.0f;            // deg, eased shot + speed + air terms
+    float chase_lens_ = 12.0f;          // the chase shot's lens for the current angle (the shot term's zero)
+    float landing_w_ = 0.0f, look_pitch_ = 0.0f; // FullS3: eased landing-look weight, slope-look pitch (rad)
+    Vec3 landing_point_{0, 0, 0};       // FullS3: where the board will touch down (held when the prediction ends)
+    // The first stages of the ease2_to filters above.
+    float fov_extra_stage_ = 0.0f, landing_w_stage_ = 0.0f, look_pitch_stage_ = 0.0f, air_w_stage_ = 0.0f, rise_w_stage_ = 0.0f;
+    Vec3 landing_point_stage_{0, 0, 0};
+    float shoulder_value_ = 0.0f, shoulder_start_ = 0.0f, shoulder_target_ = 0.0f, shoulder_elapsed_ = 0.0f; // side -1..1
+    float coll_pull_ = 0.0f, coll_lift_ = 0.0f; // FullS3: smoothed pull-in and ground lift, m
+    float coll_pull_stage_ = 0.0f, coll_lift_stage_ = 0.0f; // their ease2_to first stages
+    float coll_wall_ = 0.0f, coll_wall_stage_ = 0.0f;       // FullS3: the eased lift over a wall closer than DistanceLimits::min, m
+    static constexpr float wall_lift_time = 0.15f;       // s, the lift's minimum ease-in
+    static constexpr float wall_lift_gain = 2.0f, wall_lift_max = 1.0f; // m of upward offset per m the wall is inside the minimum; its cap (TUNE)
+    float native_pitch_ = 0.0f;         // NativePlus: eased framing pitch offset, rad
+    // Alpha 4. The eased in-air weight (follow_height), the eased rise weight, the keep-in-frame pitch offset
+    // (rad), the eased manual / grind focus and the eased framing pitch (FullS3), plus what the steps need of
+    // the frame's extras.
+    float air_w_ = 0.0f, rise_w_ = 0.0f, keep_off_ = 0.0f, focus_value_ = 1.0f, focus_from_ = 1.0f, framing_pitch_ = 0.0f;
+    float last_elevation_used_ = 0.0f;  // FullS3: the rig elevation plus the rise, rad
+    float extras_base_fov_ = 0.0f, native_fov_ = 0.0f, last_shake_pitch_ = 0.0f;
+    NativePose native_pose_{};
+    static constexpr float keep_response_time = 0.08f; // s, the keep-in-frame ease (TUNE)
+    float held_speed_ = 0.0f;           // m/s, |velocity . forward| at the last grounded step (the in-air speed)
+    // Trick yaw (FullS3): a sine ease from `start` to `target` over `duration`, restarted from the current
+    // value whenever the target changes, so it never jumps. `value` > 0 swings to the skater's right.
+    struct TrickYawState {
+        float value = 0.0f, start = 0.0f, target = 0.0f, elapsed = 0.0f, duration = 0.0f;
+        float hold_left = 0.0f; // s of hold remaining after the last trick step
+    } trick_yaw_;
+    // Alpha 5. Landing: the highest root height of the current air, and the last landing's fall and strength.
+    float air_peak_y_ = 0.0f, last_landing_fall_ = 0.0f, last_landing_fraction_ = 0.0f;
+    // Horizontal follow: the filtered travel heading (and its first stage), the eased follow weight and speed weight.
+    float travel_heading_ = 0.0f, travel_stage_ = 0.0f, hf_w_ = 0.0f, hf_w_stage_ = 0.0f;
+    static constexpr float follow_min_speed = 1.0f;          // m/s: slower, the travel heading holds
+    static constexpr float follow_slowest_time = 0.45f, follow_fastest_time = 0.1f; // s, the travel heading filter at 0+ and at 10
+    static constexpr float follow_slowest_turn = 90.0f, follow_fastest_turn = 240.0f; // deg/s, its turn-rate cap at 0+ and at 10
+    static constexpr float follow_ease_time = 0.4f;         // s, a change of the horizontal setting eases in over this
+    // Leaving a manual / grind close-up: the distance ease (start distance, elapsed, duration), the last distance used.
+    bool exit_active_ = false;
+    // Transitions (update_transition).
+    bool transition_ = false;
+    float transition_w_ = 0.0f, transition_w_stage_ = 0.0f, transition_shallow_ = 0.0f;
+    float exit_start_distance_ = 0.0f, exit_elapsed_ = 0.0f, exit_duration_ = 0.0f, exit_blend_ = 1.0f, distance_used_ = 0.0f;
+    static constexpr float launch_above_ground = 0.05f; // m: a prediction's launch point stays this far over the ground below
+    static constexpr float wide_whisker = 0.35f, wide_depth = 0.75f; // m: automatic collision's thin-obstacle test
+    static constexpr float fast_release_speed = 3.0f, fast_release_floor = 0.25f; // m/s, share: automatic release at speed
+    static constexpr float transition_on_degrees = 40.0f, transition_off_degrees = 25.0f; // ramp steepness that starts / ends it
+    static constexpr float transition_off_time = 0.35f, transition_ease_time = 0.3f;       // s
+    static constexpr float transition_lag_cut = 0.8f;                                      // share of the anchor lag removed
+    // Manual / grind camera floor: the eased weight, its first stage; the framing height offset (rad) and its stage.
+    float floor_w_ = 0.0f, floor_w_stage_ = 0.0f, height_off_ = 0.0f, height_stage_ = 0.0f;
+    static constexpr float manual_grind_min_height = 0.3f;  // m, the least the camera sits above the board in a manual / grind
+    static constexpr float floor_in_time = 0.3f;  // s, the floor weight's ease in
+    static constexpr float floor_out_share = 0.55f; // of LookSettings::closeup_exit_time: the floor weight's ease out (0.5 s at 0.9 s)
+    static constexpr float height_ease_time = 0.2f;         // s, the framing height offset's ease (settles within ~0.5 s)
+    // Alpha 6 board anchoring: the board's offset from the root (smoothed, with its first stage) and the eased weight.
+    Vec3 board_rel_{0, 0, 0}, board_rel_stage_{0, 0, 0};
+    float board_w_ = 0.0f, board_w_stage_ = 0.0f;
+    static constexpr float board_anchor_height = 0.3f; // m above the board the rig orbits (the usual anchor sits ~0.32 m above it; TUNE)
+    static constexpr float board_smooth_time = 0.12f;  // s, the board offset's two-stage smoothing (it bounces on impacts)
+    struct LayerDebug {
+        float landing_look_weight = 0.0f, look_pitch_offset = 0.0f, follow_strength = 1.0f, collision_pull = 0.0f, trick_yaw = 0.0f;
+        float air_follow_weight = 0.0f, air_reference_height = 0.0f, air_rise = 0.0f, keep_pitch_offset = 0.0f, focus_weight = 1.0f;
+        float follow_weight = 0.0f, floor_weight = 0.0f, height_offset = 0.0f, board_weight = 0.0f;
+        Vec3 look_target{0, 0, 0};
+    } layers_;
+
+    // diagnostics from the last step (kick is sticky over one update: a frame can hold several steps)
+    bool kick_in_update_ = false;
+    GraphOutput last_pick_{};
+    RigOutput last_rig_{};
+    float last_speed_ = 0.0f, last_hold_ = 0.0f, incline_degrees_ = 0.0f;
+    bool last_push_state_ = false, last_push_kick_ = false;
+};
+
+} // namespace dingosdk::s3cam

@@ -108,6 +108,10 @@ struct InteractiveDebug {
     // "Third person on foot": first person handed the camera back while the
     // skater walks and takes it again once they are back on the board.
     bool first_person_paused{}, first_person_last_on_foot{};
+    // S3Cam (Extension/Camera/s3cam.h): `s3cam` is the player's choice; `s3cam_view` while it
+    // drives Freecam's owned mode-1 camera. Handed back on foot and in menus, taken again on board.
+    bool s3cam{}, s3cam_view{};
+    ULONGLONG s3cam_retry_after{};
     ULONGLONG first_person_foot_since{}, first_person_retry_after{};
     // "First person in the camera cycle": after first person could not start, the camera height
     // button switches height as the game does until this time.

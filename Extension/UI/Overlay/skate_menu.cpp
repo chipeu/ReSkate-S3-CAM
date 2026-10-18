@@ -817,9 +817,9 @@ constexpr std::array<const char*, page_count> page_subtitles{
     "Everything, a button away.", "Pick your spot. Set the vibe.", "Make the park yours.", "Ride it your way.",
     "Tune it. Drill it.", "What ReSkate adds to skate.", "Bring your crew.", "Pick up where you want.",
     "Bring your own.", "Your controls, your screen.", "Under the hood."};
-constexpr std::array<const char*, addon_count> addon_names{"ADDONS", "DRONE", "BOARD BREAK", "ROAD RASH", "HALL OF MEAT", "GRIND EXITS", "MUSIC"};
+constexpr std::array<const char*, addon_count> addon_names{"ADDONS", "DRONE", "DYNAMIC CAMERA", "BOARD BREAK", "ROAD RASH", "HALL OF MEAT", "GRIND EXITS", "MUSIC"};
 constexpr std::array<const char*, addon_count> addon_subtitles{
-    "What ReSkate adds to skate.", "Take it to the sky.", "Slams snap your board.", "Bails leave their mark.", "Every bone counts.", "Pick the side you pop out.",
+    "What ReSkate adds to skate.", "Take it to the sky.", "A camera that moves with your riding.", "Slams snap your board.", "Bails leave their mark.", "Every bone counts.", "Pick the side you pop out.",
     "Your sound, in the game."};
 // The side rail's groups: the heading above the page that starts each.
 const char* group_of(int page) {
@@ -1013,7 +1013,8 @@ void draw_page_body(SkateMenu& menu, const Model& model, const CallbacksV3& call
     if (!menu.feedback.empty() && ImGui::GetTime() < menu.feedback_until) {
         // The feedback line sits in a dark strip with a blue edge, like the game's toasts.
         ImGui::Spacing();
-        const bool debug_page = menu.page == page_skater || menu.page == page_sandbox || (menu.page == page_settings && menu.settings_tab == 1);
+        const bool debug_page = menu.page == page_skater || menu.page == page_sandbox || (menu.page == page_settings && menu.settings_tab == 1) ||
+            (menu.page == page_addons && menu.addon == addon_s3_camera);
         const auto& result = debug_page && !model.debug.status.empty() && ImGui::GetTime() > menu.feedback_until - 5.75 ? model.debug.status
                                                                                                                        : menu.feedback;
         const auto at = ImGui::GetCursorScreenPos();

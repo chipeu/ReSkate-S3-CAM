@@ -89,7 +89,7 @@ struct ControllerInput {
 struct ActionBind {
     std::string_view key, name, label, command;
 };
-inline constexpr std::array<ActionBind, 9> action_binds{{
+inline constexpr std::array<ActionBind, 10> action_binds{{
     {"reskate_menu", "reskatemenu", "Open the ReSkate menu", "menu"},
     {"first_person", "firstperson", "First person", "firstperson toggle"},
     {"hide_hud", "hidehud", "Hide HUD", "hideui toggle"},
@@ -99,6 +99,7 @@ inline constexpr std::array<ActionBind, 9> action_binds{{
     {"challenges", "challenges", "Show / hide challenges", "challenges toggle"},
     {"nametags", "nametags", "Player nametags", "mp nametags toggle"},
     {"nametag_dots", "nametagdots", "Player dots", "mp nametag-dots toggle"},
+    {"s3cam_side", "dyncamside", "Dynamic Camera: swap shoulder side", "dyncam_side swap"}, // L3 in Skate 3
 }};
 struct ControllerBindingsModel {
     bool available{};
