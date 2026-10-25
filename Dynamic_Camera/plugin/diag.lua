@@ -3,9 +3,12 @@
 -- a fault (the view pitching or turning too fast, the camera jumping relative to the skater, a sudden collision pull, the board
 -- or the skater leaving the frame) dumps the half second before and after it, at most once per cooldown and max_dumps times in a run.
 --
--- Differences from the DLL: reskate.log takes 50 lines a second, so the dumps and the running log go to files in the data
--- folder (diag/snap_1.txt .. snap_10.txt, taken in turn, and diag/camera_log.txt, the last ~800 lines) and the log gets one
--- summary line per dump. Nothing is recorded or written while logging is off.
+-- Differences from the DLL: reskate.log takes 50 lines a second, so the per-frame samples and the dumps go to files in the data
+-- folder (diag/snap_1.txt .. snap_10.txt, taken in turn) and the log gets one summary line per dump. The running log (state and
+-- shot changes, manuals, landings, the once-a-second summary) goes to diag/camera_log.txt, the last 5000 lines, and every line of
+-- it is also sent to ReSkate.log with a "dyncam: " prefix: that is the file a player sends, so the story of a ride has to be in
+-- it. Never more than M.log_burst of those a second, the rest are counted in one line. Nothing is recorded or written while
+-- logging is off.
 --
 --   local d = Diag.new()
 --   d:begin_run(); d:push(Diag.sample_of(t, state, manual, frame, snapshot)); d:note("line"); d:tick(now); d:end_run(reason)
@@ -18,7 +21,10 @@ M.post_frames = 30
 M.cooldown = 2.0 -- s between two dumps
 M.max_dumps = 30 -- dumps in one run
 M.snap_files = 10 -- snapshot files in turn
-M.log_lines = 800 -- lines kept in camera_log.txt
+M.log_lines = 5000 -- lines kept in camera_log.txt
+M.log_bytes = 900000 -- and at most this much text: ReSkate writes a file of 1 MB at most, and the summary lines are long
+M.log_burst = 30 -- lines a second sent on to ReSkate.log (it takes 50 from the whole plugin)
+M.log_path = "Mods\\.reskate_plugin_data\\Dynamic_Camera\\diag\\camera_log.txt"
 M.log_flush = 3.0 -- s between writes of the running log
 
 -- What counts as a fault. The gates' own limits where there is one, with room for the vert swing.
@@ -202,7 +208,8 @@ local Diag = {}
 Diag.__index = Diag
 
 function M.new()
-	return setmetatable({ rec = Recorder.new(), dump = nil, dump_count = 0, log = {}, log_dirty = false, log_at = 0.0, written = 0 }, Diag)
+	return setmetatable({ rec = Recorder.new(), dump = nil, dump_count = 0, log = {}, log_bytes = 0, log_dirty = false, log_at = 0.0,
+		written = 0, path_told = false, mirror_second = -1, mirror_count = 0, mirror_left_out = 0 }, Diag)
 end
 
 local function write(path, text)
@@ -210,9 +217,39 @@ local function write(path, text)
 	return ok and wrote == true
 end
 
+-- Sends a line to ReSkate.log, at most M.log_burst a second; what does not fit is counted and told in the next second.
+function Diag:mirror(text)
+	local ok_now, ms = pcall(reskate.time.now)
+	local second = ok_now and math.floor(ms / 1000) or 0
+	if second ~= self.mirror_second then
+		self.mirror_second = second
+		self.mirror_count = 0
+		if self.mirror_left_out > 0 then
+			local left = self.mirror_left_out
+			self.mirror_left_out = 0
+			pcall(reskate.log, string.format("dyncam: %d more lines in a second are only in camera_log.txt", left))
+		end
+	end
+	if self.mirror_count >= M.log_burst then
+		self.mirror_left_out += 1
+		return
+	end
+	self.mirror_count += 1
+	pcall(reskate.log, "dyncam: " .. text)
+end
+
+-- Where the file is, said once.
+function Diag:tell_path()
+	if not self.path_told then
+		self.path_told = true
+		pcall(reskate.log, "dyncam: detailed log in " .. M.log_path)
+	end
+end
+
 function Diag:begin_run()
 	self.rec = Recorder.new()
 	self.dump = nil
+	self:tell_path()
 end
 
 function Diag:flush_dump(reason)
@@ -244,21 +281,51 @@ function Diag:push(sample)
 	end
 end
 
--- A line for the running log (state changes, shot changes, the once-a-second status, landings).
-function Diag:note(line)
+-- Drops the oldest lines until the log fits M.log_lines (less `extra_lines`) and M.log_bytes (a line costs its length and a newline).
+function Diag:trim(extra_lines)
+	local log = self.log
+	local drop, bytes = 0, self.log_bytes
+	while #log - drop > M.log_lines - (extra_lines or 0) or (bytes > M.log_bytes and #log - drop > 1) do
+		drop += 1
+		bytes -= #log[drop] + 1
+	end
+	if drop > 0 then
+		local count = #log
+		table.move(log, drop + 1, count, 1)
+		for i = count, count - drop + 1, -1 do
+			log[i] = nil
+		end
+		self.log_bytes = bytes
+	end
+end
+
+-- A line for the running log (state changes, shot changes, the once-a-second status, landings). It goes to the file and to
+-- ReSkate.log; `logged` says the caller has put it in ReSkate.log already (Glue:note does).
+function Diag:note(line, logged)
+	self:tell_path()
 	local log = self.log
 	log[#log + 1] = line
-	if #log > M.log_lines then
-		table.remove(log, 1)
+	self.log_bytes += #line + 1
+	-- Trimmed in steps of 50 lines so that a full log does not shift 5000 entries for every new one.
+	if #log > M.log_lines + 50 or self.log_bytes > M.log_bytes + 50000 then
+		self:trim(50)
 	end
 	self.log_dirty = true
+	if not logged then
+		self:mirror(line)
+	end
+end
+
+function Diag:write_log()
+	self:trim(0)
+	write("diag/camera_log.txt", table.concat(self.log, "\n") .. "\n")
 end
 
 function Diag:tick(now)
 	if self.log_dirty and now - self.log_at >= M.log_flush then
 		self.log_at = now
 		self.log_dirty = false
-		write("diag/camera_log.txt", table.concat(self.log, "\n") .. "\n")
+		self:write_log()
 	end
 end
 
@@ -266,7 +333,7 @@ function Diag:end_run(reason)
 	self:flush_dump(reason or "run ended")
 	if self.log_dirty then
 		self.log_dirty = false
-		write("diag/camera_log.txt", table.concat(self.log, "\n") .. "\n")
+		self:write_log()
 	end
 end
 

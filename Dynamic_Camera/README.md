@@ -4,7 +4,8 @@ Dynamic Camera
 A Skate 3 style riding camera for ReSkate, as a plugin. While you ride (and through bails) it takes over the camera and
 follows your movement: it lags and catches up with your speed, turns to show tricks, moves in close for manuals and grinds,
 rises over you in big airs and tilts to show the landing, shakes with speed and landings, and widens the field of view with
-speed. On foot, in menus and in the Replay Editor the game's own camera is used.
+speed. Off the board it stays with you too: an orbit camera for walking, running and bails that you steer with the right stick, with a close
+over-the-shoulder style. In menus and in the Replay Editor the game's own camera is used.
 
 Install
 -------
@@ -18,7 +19,7 @@ is saved.
 
 Controls
 --------
-* Binds page of ReSkate's settings: "Dynamic Camera on / off" and "Switch shoulder side" (L3 in Skate 3). Both start unbound.
+* Settings > Binds > PLUGINS: "Dynamic_Camera: camera on / off" (Ctrl+Shift+D) and "Dynamic_Camera: switch shoulder side" (Ctrl+Shift+S, the L3 swap of Skate 3). Record another key or clear either there.
 * R3 switches between the Low and High camera views (setting: Switch camera view with R3).
 * Console: dyncam 0|1|toggle, dyncam_angle, dyncam_shake, dyncam_fov, dyncam_shotfov, dyncam_shoulder, dyncam_side, dyncam_log,
   dyncam_dump, dyncam_presets. The s3cam names work as well.
@@ -33,16 +34,34 @@ between them.
 Settings do not carry over from the DLL version by themselves: export a preset there (it is a file in
 %LOCALAPPDATA%\ReSkate\Dynamic Camera Presets) and import it here.
 
+Off the board
+-------------
+Off-board camera (OFF THE BOARD tab) is Dynamic by default: the camera keeps the view when you step off the board, walk, run, bail
+or land a hippy jump, and the right stick looks around. Board to foot and back is a smooth blend (Board / foot transition time).
+* Style: Orbit (behind and above, 2.8 m) or Shoulder (close, over one shoulder, like the Arkham games). A style fills the sliders,
+  which you can then change. The shoulder side is the riding one (Switch shoulder side).
+* Distance, Height, Look height, Horizontal offset and Field of view frame the shot; Follow smoothing and Turn smoothing set how
+  softly it moves. Level with the body keeps steps and stairs from bobbing the camera; Bobbing strength puts a walking bob back.
+* Recentre after: while you move and leave the right stick alone, the camera swings behind you (0 = never). Standing still never
+  recentres. R3 swings it behind you at once.
+* Match walking to the view: the game steers walking with a hidden camera of its own that the plugin cannot read, so it estimates
+  where that faces from how you walk and slowly turns the view toward it, so "forward" on the left stick is forward on the screen.
+* Bails are framed whole and further out (Bail distance).
+* Game gives the old behaviour: the game's own camera on foot, reached with an eased hand-back.
+
 Known differences from the DLL version
 --------------------------------------
 * The Native+ style is not included (only the Full style).
-* The camera cannot fade back to the game's camera when you step off the board: it is handed back at once.
+* With Off-board camera set to Game, the plugin cannot see the game's camera while it holds the view, so stepping off the board eases to where the game's camera is expected to be (learned while you are on foot; setting: Hand-back blend time) and then hands it back. Menus, pause and having no skater hand it back at once; switching off on foot eases out.
+* The mouse does not turn the off-board view (the plugin API reads it only with the right mouse button held and moves the cursor), and the walking-direction match needs a gamepad.
 * The game's field of view and camera are read just before the camera is taken; changing the game's FOV while riding applies
   at the next take.
-* The board's tilt for manuals comes from the deck's rotation, not from the board's physics bodies.
+* Manuals are found from the game's skate state (the state the game reports while you hold a manual), not from the board's tilt or the trick list. The board's tilt (the deck's rotation when the game gives it, else the angle between your feet) only places the close-up.
 * The camera casts at most about 60 world rays a tick (the plugin limit is 64); in a long jump a landing prediction can be
   cut short.
-* Camera logging (dyncam_log 1) writes files to the data folder (diag/) instead of the ReSkate log.
+* Whatever the cause, a sudden jump of the view (position, direction or field of view in a single frame) is eased over about a third of a second instead of shown, and the camera log counts them.
+* Camera logging (dyncam_log 1) writes the full detail to the data folder (diag/camera_log.txt); the event lines and a summary
+  a second also go to the ReSkate log.
 
 Credits and licence
 -------------------

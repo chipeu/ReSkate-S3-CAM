@@ -101,7 +101,10 @@ function mock.new(opts)
         state = {
             skater = mock.skater_default(),
             telemetry = mock.telemetry_default(),
-            board = { velocity = vector.create(0, 0, 6), spin = vector.create(0, 0, 0), place = { position = vector.create(0, 0.05, 0), rotation = { x = 0, y = 0, z = 0, w = 1 } } },
+            -- ReSkate 2.1.2: board.motion() gives the velocity only (the deck pose came after 2.1.2). A test that wants the pose adds
+            -- `place` / `deck` itself.
+            board = { velocity = vector.create(0, 0, 6) },
+            joints = {},         -- joint index -> world position (or { position, rotation }) the scripted skater has it at (skater.joint)
             goofy = false,
             level = { name = "TestLevel" },
             ground_y = 0,        -- the default raycast: a flat plane at this height
@@ -177,6 +180,27 @@ function mock.new(opts)
     function r.skater.goofy() return m.state.goofy end
     r.board = {}
     function r.board.motion() return m.state.board end
+
+    -- reskate.skater.joint (2.1.2): nil without a skater and on the FIRST call for a joint (asking starts the read), then the pose.
+    -- A test sets m.state.joints[index] = position (a vector) or a full {position, rotation} table. Names map to the indices.
+    local JOINT_INDEX = { root = 1, hips = 7, right_foot = 10, right_toe = 11, spine = 42, spine2 = 44, right_hand = 49, head = 103,
+        left_hand = 278, left_foot = 343, left_toe = 344 }
+    local asked = {}
+    m.joint_calls = 0
+    function r.skater.joint(joint)
+        local index = type(joint) == "string" and JOINT_INDEX[joint] or joint
+        assert(type(index) == "number", "reskate.skater.joint: not a joint")
+        m.joint_calls += 1
+        if not m.state.skater then return nil end
+        if not asked[index] then
+            asked[index] = true
+            return nil
+        end
+        local pose = m.state.joints[index]
+        if pose == nil then return nil end
+        if typeof(pose) == "vector" then pose = { position = pose } end
+        return { position = pose.position, rotation = pose.rotation or { x = 0, y = 0, z = 0, w = 1 }, scale = vector.create(1, 1, 1), parent = 0 }
+    end
 
     -- world: the plane at ground_y unless the test sets a raycast function. Counts calls (the game allows 64 a tick).
     r.world = {}
@@ -335,12 +359,40 @@ function mock.new(opts)
 
     -- input
     r.input = {}
+    -- As 2.1.2: the key is required text ("string expected" for nil), a key that is not one raises, 16 actions at most.
+    local MODIFIERS = { ctrl = true, shift = true, alt = true }
+    local NAMED_KEYS = { space = true, tab = true, enter = true, escape = true, backspace = true, up = true, down = true, left = true,
+        right = true, home = true, ["end"] = true, insert = true, delete = true, pageup = true, pagedown = true }
+    local function key_ok(key)
+        if #key < 1 or #key > 60 then return false end
+        local keys, pad = 0, false
+        local count = 0
+        for word in string.gmatch(string.lower(key), "[^+]+") do
+            count += 1
+            local fn = string.match(word, "^f(%d%d?)$")
+            if MODIFIERS[word] then
+                -- a modifier
+            elseif string.find(word, "^[0-9a-z]$") or NAMED_KEYS[word] or (fn and tonumber(fn) >= 1 and tonumber(fn) <= 12) then
+                keys += 1
+            elseif string.find(word, "^pad%.%a+$") then
+                keys += 1
+                pad = true
+            else
+                return false
+            end
+        end
+        if string.sub(key, 1, 1) == "+" or string.sub(key, -1) == "+" or string.find(key, "++", 1, true) then return false end
+        return count >= 1 and (keys == 1 or (pad and keys >= 1))
+    end
     function r.input.bind(action, key)
-        assert(type(action) == "string" and #action >= 1 and #action <= 48, "reskate.input.bind: the action is 1 to 48 characters")
+        assert(type(action) == "string", "reskate.input.bind: string expected for an action's name")
+        assert(type(key) == "string", "reskate.input.bind: string expected for a key")
+        assert(#action >= 1 and #action <= 48, "reskate.input.bind: the action is 1 to 48 characters")
+        assert(key_ok(key), "reskate.input.bind: \"" .. key .. "\" is not a key")
         local count = 0
         for _ in pairs(m.binds) do count += 1 end
-        assert(count < 16 or m.binds[action] ~= nil, "reskate.input.bind: a plugin has at most 16 actions")
-        m.binds[action] = key or false
+        assert(count < 16 or m.binds[action] ~= nil, "reskate.input.bind: at most 16 actions")
+        m.binds[action] = key
         return true
     end
 
@@ -521,6 +573,34 @@ function mock.install(opts)
         end
         return nil
     end
+    return m
+end
+
+-- ---------------------------------------------------------------------------------------------------------------------
+-- Added for the trick list (reskate.tricks.feed, the trick_notes event). Kept apart from the rest: it wraps mock.new /
+-- mock.install and changes nothing above.
+--   m.tricks_feeding                 -- true after reskate.tricks.feed(true)
+--   m.state.tricks_refuse = "text"   -- feed raises this (a plugin without the permission)
+--   m.trick_notes({ {entry="7", kind="n", text="Manual"}, ... })   -- fires trick_notes as the game does: { notes = list }
+local new_without_tricks = mock.new
+function mock.new(opts)
+    local m = new_without_tricks(opts)
+    m.tricks_feeding = false
+    m.tricks_feed_calls = 0
+    m.reskate.tricks = {
+        feed = function(on)
+            m.tricks_feed_calls += 1
+            if m.state.tricks_refuse then error(m.state.tricks_refuse) end
+            m.tricks_feeding = on and true or false
+        end,
+    }
+    return m
+end
+
+local install_without_tricks = mock.install
+function mock.install(opts)
+    local m = install_without_tricks(opts)
+    m.trick_notes = function(list) return mock.fire(m, "trick_notes", { notes = list }) end
     return m
 end
 

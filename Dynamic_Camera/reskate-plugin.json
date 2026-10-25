@@ -2,5 +2,5 @@
     "api": 1,
     "entry": "plugin/main.lua",
     "side": "client",
-    "permissions": ["camera", "skater.read", "events.physics", "world.raycast", "input", "menu", "ui.screen", "throwdowns", "storage", "files", "console"]
+    "permissions": ["camera", "skater.read", "events.physics", "events.tricks", "world.raycast", "input", "menu", "ui.screen", "throwdowns", "storage", "files", "console"]
 }

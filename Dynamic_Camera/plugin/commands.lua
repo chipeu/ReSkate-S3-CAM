@@ -62,7 +62,7 @@ function Commands.install(deps)
 		return false
 	end
 
-	register("dyncam", "Use Dynamic Camera while riding (the game's camera is used off the board and in menus): dyncam 0|1|toggle", function(args)
+	register("dyncam", "Use Dynamic Camera while riding (the game's camera is used off the board and in menus; Ctrl+Shift+D toggles it): dyncam 0|1|toggle", function(args)
 		local word = args[1] and string.lower(args[1])
 		if word == nil then
 			say("dyncam = " .. bool_text(store.enabled) .. " (" .. glue:status() .. ")")
@@ -171,7 +171,7 @@ function Commands.install(deps)
 		end
 	end)
 
-	register("dyncam_side", "Dynamic Camera shoulder side: switch (bind 'Switch shoulder side' on the Binds page), left or right: dyncam_side swap|left|right",
+	register("dyncam_side", "Dynamic Camera shoulder side: switch (Ctrl+Shift+S, or the 'switch shoulder side' action on the Binds page), left or right: dyncam_side swap|left|right",
 		function(args)
 			local word = args[1] and string.lower(args[1])
 			local sh = store.settings.shoulder

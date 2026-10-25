@@ -13,6 +13,11 @@
 -- file names are plain ASCII (the data folder only takes printable ASCII paths), so other characters are dropped.
 
 local Settings = require("settings")
+-- The off-board camera's settings. The module is optional at start (main.lua); without it the options simply have no such group.
+local has_off, Off = pcall(require, "offboard")
+if not has_off then
+	Off = nil
+end
 
 local M = {}
 
@@ -30,7 +35,9 @@ function M.new_options()
 		verbose = false, -- detailed logging (dyncam_log 1)
 		follow_game_height = true, -- R3 switches Low / High
 		take_blend_time = 0.5, -- s, crossfade from the game camera when the camera is taken
-		release_blend_time = 0.4, -- s, kept for the DLL's presets; the plugin releases at once
+		release_blend_time = 0.45, -- s, stepping off the board: the camera eases to the game's on-foot camera before it is handed back (0: at once)
+		offboard_mode = "dynamic", -- "dynamic": this camera keeps the view on foot; "game": the game's own camera (the eased hand-back)
+		offboard = Off and Off.defaults() or nil, -- the off-board camera's framing and feel (S3Cam.OffBoard.*)
 	}
 end
 
@@ -38,7 +45,7 @@ local function options_ok(o)
 	local function t(v)
 		return v - v == 0 and v >= 0 and v <= 5
 	end
-	return t(o.take_blend_time) and t(o.release_blend_time)
+	return t(o.take_blend_time) and t(o.release_blend_time) and (o.offboard_mode == "dynamic" or o.offboard_mode == "game")
 end
 
 -- group name -> validity of that group (the C++ group_ok). "camera" is the root (its only field is a bool).
@@ -62,6 +69,7 @@ local VALID = {
 	speed_shake = Settings.valid_speed_shake,
 	collision = Settings.valid_collision,
 	native_plus = Settings.valid_native_plus,
+	offboard = Off and Off.valid or function() return true end,
 }
 
 -- ---------------------------------------------------------------- the field table
@@ -140,6 +148,15 @@ add("S3Cam.Options.", "options", {
 	{ "ShotFov", "shot_fov", "b" }, { "Logging", "verbose", "b" }, { "FollowGameHeight", "follow_game_height", "b" },
 	{ "TakeBlendTime", "take_blend_time", "f" }, { "ReleaseBlendTime", "release_blend_time", "f" },
 })
+-- The off-board camera. S3Cam.OffBoard.Mode and .Style are text choices (below). Absent in older files: the defaults stay.
+if Off then
+	add("S3Cam.OffBoard.", "offboard", {
+		{ "Distance", "distance", "f" }, { "Height", "height", "f" }, { "LookHeight", "look_height", "f" }, { "Offset", "offset", "f" },
+		{ "Fov", "fov", "f" }, { "FollowTime", "follow_time", "f" }, { "TurnTime", "turn_time", "f" }, { "StickSpeed", "stick_speed", "f" },
+		{ "InvertY", "invert_y", "b" }, { "RecentreAfter", "recentre_after", "f" }, { "MatchWalking", "match_walking", "b" },
+		{ "Level", "level", "f" }, { "Bob", "bob", "f" }, { "BailDistance", "bail_distance", "f" }, { "TransitionTime", "transition_time", "f" },
+	})
+end
 M.fields = FIELDS
 
 -- Text choices (their names are part of the saved file; keep them stable).
@@ -168,6 +185,8 @@ end
 local function group_of(camera, options, name)
 	if name == "options" then
 		return options
+	elseif name == "offboard" then
+		return options.offboard
 	elseif name == "camera" then
 		return camera
 	end
@@ -226,7 +245,7 @@ local function load_fields(L, camera, options)
 	end
 end
 
-local function load_choices(L, camera)
+local function load_choices(L, camera, options)
 	local t = L.text("S3Cam.Preset")
 	if t then
 		local i = index_of(t, preset_names)
@@ -312,6 +331,24 @@ local function load_choices(L, camera)
 			L.refuse("S3Cam.FovOverride")
 		end
 	end
+	if Off and options and options.offboard then
+		t = L.text("S3Cam.OffBoard.Mode")
+		if t then
+			if t == "dynamic" or t == "game" then
+				options.offboard_mode = t
+			else
+				L.refuse("S3Cam.OffBoard.Mode")
+			end
+		end
+		t = L.text("S3Cam.OffBoard.Style")
+		if t then
+			if t == "orbit" or t == "shoulder" then
+				options.offboard.style = t
+			else
+				L.refuse("S3Cam.OffBoard.Style")
+			end
+		end
+	end
 end
 
 -- Brings the settings inside the ranges of the menu's sliders (clamp_to_menu_ranges; keep the menu in step).
@@ -348,12 +385,12 @@ end
 function M.load_values(source, camera, options)
 	local first = new_loader(source)
 	load_fields(first, camera, options)
-	load_choices(first, camera)
+	load_choices(first, camera, options)
 	local report = { refused = 0, first_refused = "", native_asked = first.native_asked }
 	if first.refused > 0 then
 		local second = new_loader(source)
 		load_fields(second, camera, options)
-		load_choices(second, camera)
+		load_choices(second, camera, options)
 		report.refused, report.first_refused = second.refused, second.first_refused
 	end
 	-- 1.0.2: Low and High have their own distance limits; a setup from before has one shared pair, which framed both.
@@ -400,12 +437,18 @@ end
 function M.from_values(values, base_camera, base_options)
 	local camera = base_camera or Settings.defaults()
 	local options = base_options or M.new_options()
+	if Off and type(options.offboard) ~= "table" then
+		options.offboard = Off.defaults()
+	end
 	local report = M.load_values(function(key)
 		return values[key]
 	end, camera, options)
 	M.drop_invalid_groups(camera)
 	if not Settings.valid(camera) then
 		camera = Settings.defaults()
+	end
+	if Off and not Off.valid(options.offboard) then
+		options.offboard = Off.defaults()
 	end
 	if not options_ok(options) then
 		options = M.new_options()
@@ -447,6 +490,10 @@ function M.collect_values(camera, options)
 	end
 	values["S3Cam.Distance.Mode"] = dm(camera.ride_distance)
 	values["S3Cam.DistanceHigh.Mode"] = dm(camera.ride_distance_high)
+	if Off and options.offboard then
+		values["S3Cam.OffBoard.Mode"] = options.offboard_mode
+		values["S3Cam.OffBoard.Style"] = options.offboard.style
+	end
 	return values
 end
 

@@ -140,6 +140,10 @@ local rest_fov_max_speed = 4.0
 local rest_fov_ease_time = 0.5
 local keep_in_time = 0.08
 local keep_ramp_normal_y = 0.77
+-- After a landing that shakes, the keep-in-frame offset and the landing look hold still for landing_hold_time, then let go over
+-- landing_fade_time (1.0.2 test 9: after a big air they unwound right at the touchdown and drowned the landing shake).
+-- landing_hold counts down from the sum; the hold is full while more than the fade is left.
+local landing_hold_time, landing_fade_time = 0.25, 0.4
 local follow_min_speed = 1.0
 local follow_slowest_time, follow_fastest_time = 0.45, 0.1
 local follow_slowest_turn, follow_fastest_turn = 90.0, 240.0
@@ -640,6 +644,7 @@ function Camera.new()
 	self.air_peak_y = 0.0
 	self.last_landing_fall = 0.0
 	self.last_landing_fraction = 0.0
+	self.landing_hold = 0.0
 	self.travel_heading = 0.0
 	self.travel_stage = 0.0
 	self.hf_w = 0.0
@@ -1028,10 +1033,23 @@ end
 
 -- ---------------------------------------------------------------- keep in frame
 
+-- 0..1, how much of the landing hold applies now: full while the hold lasts, then a smooth fade to 0.
+-- Full while more than the fade is left, with a quarter of a millisecond to spare so the last full step is the same in float and double.
+local function landing_held(self)
+	return self.landing_hold > landing_fade_time + 0.00025
+end
+
+local function landing_hold_weight(self)
+	local x = clamp01(self.landing_hold / landing_fade_time)
+	return x * x * (3.0 - 2.0 * x)
+end
+
 -- Keep the skater inside the vertical view while airborne (air_camera.keep_in_frame). `view_pitch` is the view's pitch BEFORE
 -- this offset. The first `held` points are held inside the hard limit; the rest only steer the view toward keeping them in too.
--- `weight` (0..1, eased by the caller) is how much of the guard applies. Returns the offset, radians.
-local function update_keep_in_frame(self, cam_pos, view_pitch, points, count, held, weight, snap)
+-- `weight` (0..1, eased by the caller) is how much of the guard applies. `hold` (0..1, the landing kick, 1.0.2 test 9) keeps the
+-- offset where it is: the soft goal is blended toward the offset itself by it; the hard limits still move it, so the skater stays
+-- framed, and as the hold eases out the offset eases on to the goal. Returns the offset, radians.
+local function update_keep_in_frame(self, cam_pos, view_pitch, points, count, held, weight, snap, hold)
 	local half_fov = 0.5 * clamp(fov_base_deg(self) + self.fov_extra, 1.0, 170.0) * DEG
 	local soft, hard = 0.7 * half_fov, 0.9 * half_fov
 	local w = (self.settings.air_camera.keep_in_frame and not snap) and clamp01(weight) or 0.0
@@ -1052,7 +1070,9 @@ local function update_keep_in_frame(self, cam_pos, view_pitch, points, count, he
 		-- The offset eases toward the weighted share of the one that brings every point inside the soft band, and is then held
 		-- at once inside the weighted hard limits (range_lo > range_hi: the points cannot all fit, aim between them).
 		local keep_off = self.keep_off
-		local wanted = ease_to(keep_off, w * (goal_up - goal_down), keep_response_time, fixed_step)
+		local soft_goal = w * (goal_up - goal_down)
+		local h = clamp01(hold or 0.0)
+		local wanted = ease_to(keep_off, soft_goal + (keep_off - soft_goal) * h, keep_response_time, fixed_step)
 		if range_lo <= range_hi then
 			wanted = clamp(wanted, w * range_lo, w * range_hi)
 		else
@@ -1948,7 +1968,15 @@ local function step_once(self, s, query, snap)
 		self.last_landing_fall = max(0.0, self.air_peak_y - pos.y)
 		self.last_landing_fraction = landing_fraction_of(self, self.last_landing_fall, horizontal_speed)
 		Shake.landing_impulse_fraction(self.shake, self.last_landing_fraction, cs.shake)
+		-- The keep-in-frame layer and the landing look hold still for the kick (1.0.2 test 9). Only after a landing that shakes, and
+		-- not on a ramp or a transition: there he climbs at up to 8 m/s past the view and the layer has to keep him framed.
+		if self.last_landing_fraction > 0.0 and not self.transition and normal.y >= keep_ramp_normal_y then
+			self.landing_hold = landing_hold_time + landing_fade_time
+		else
+			self.landing_hold = 0.0
+		end
 	end
+	if air then self.landing_hold = 0.0 end
 	-- ---- prepare 2: incline (after the landing response has read the previous normal)
 	self.incline_degrees = incline_of(s, normal)
 
@@ -1985,7 +2013,10 @@ local function step_once(self, s, query, snap)
 		-- The keep-in-frame weight: a big air, a ramp (the transition, last step's), and an air taken off a steep ramp.
 		local ramp_air = air and self.last_ground_normal.y < keep_ramp_normal_y
 		local keep_goal = max(room_goal, self.transition and 1.0 or 0.0, ramp_air and 1.0 or 0.0)
-		self.keep_w_stage, self.keep_w = ease2(self.keep_w_stage, self.keep_w, keep_goal, keep_goal > self.keep_w_stage and keep_in_time or release_time, dt)
+		-- (Held through the landing kick: only the release waits, 1.0.2 test 9.)
+		if not landing_held(self) or keep_goal > self.keep_w_stage then
+			self.keep_w_stage, self.keep_w = ease2(self.keep_w_stage, self.keep_w, keep_goal, keep_goal > self.keep_w_stage and keep_in_time or release_time, dt)
+		end
 	end
 	local rise_rad = self.rise_w * ac.rise_degrees * DEG
 	-- In the air, and while the air weight is still easing out after a landing (the collision's air rules).
@@ -2402,7 +2433,10 @@ local function step_once(self, s, query, snap)
 	-- b) slope look: on the ground the pitch follows the incline (+ uphill, so downhill looks down).
 	local slope_goal = (lk.slope_look and grounded) and lk.slope_look_strength * self.incline_degrees * DEG or 0.0
 	if not snap then
-		self.landing_w_stage, self.landing_w = ease2(self.landing_w_stage, self.landing_w, landing_goal, response_time(self), dt)
+		-- The landing look lets go only after the landing kick (1.0.2 test 9); a new landing is followed at once.
+		if not landing_held(self) or landing_goal > self.landing_w_stage then
+			self.landing_w_stage, self.landing_w = ease2(self.landing_w_stage, self.landing_w, landing_goal, response_time(self), dt)
+		end
 		self.look_pitch_stage, self.look_pitch = ease2(self.look_pitch_stage, self.look_pitch, slope_goal, response_time(self), dt)
 	end
 	local focused_base = self.focus_value >= 1.0 and look_base or (board_point + (look_base - board_point) * self.focus_value)
@@ -2526,7 +2560,7 @@ local function step_once(self, s, query, snap)
 	kp[3] = pos + keep_lead
 	kp[4] = pos + vcreate(0.0, big_air_head, 0.0) + keep_lead
 	local keep_w = self.keep_w * (1.0 - floor_w)
-	local keep_pitch = update_keep_in_frame(self, camera, tilt.position + self.last_shake_pitch, kp, 4, 3, keep_w, snap)
+	local keep_pitch = update_keep_in_frame(self, camera, tilt.position + self.last_shake_pitch, kp, 4, 3, keep_w, snap, landing_hold_weight(self))
 	out.pos = camera
 	out.yaw = pan.position
 	out.pitch = tilt.position + keep_pitch
@@ -2584,6 +2618,7 @@ local function step_once(self, s, query, snap)
 
 	-- ---- write (a non-finite step is dropped: the previous output stays)
 	self.was_air = air
+	self.landing_hold = max(0.0, self.landing_hold - dt)
 	self.last_pick_chase_blend = pick_blend
 	self.last_pick_landing_active = pick_landing
 	self.last_speed = speed
@@ -2699,6 +2734,7 @@ local function cut_to(self, s, query)
 	self.air_peak_y = 0.0
 	self.last_landing_fall = 0.0
 	self.last_landing_fraction = 0.0
+	self.landing_hold = 0.0
 	layers_reset(self.layers)
 	self.no_lag_timer = self.settings.pipeline.no_lag_after_reset
 	step_once(self, s, query, true)

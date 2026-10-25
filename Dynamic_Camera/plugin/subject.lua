@@ -26,7 +26,7 @@ local ZERO = S3.ZERO
 -- skate. physics state values (context +0x1414), measured in game.
 M.physics_state = {
 	ride = 100,
-	brief_after_air = 101,
+	brief_after_air = 101, -- measured in game: the state of a held manual (manual.lua); not an air state, not a landing
 	crouch = 103,
 	pop = 200,
 	air = 201,

@@ -1,5 +1,5 @@
 -- The DYNAMIC CAMERA page: Extension/UI/Overlay/skate_menu_camera.cpp on reskate.menu.page. A switch card on top and a row of
--- tabs (PRESETS, CAMERA, FOLLOW & MOVEMENT, TRICKS & CLOSE-UPS, AIR & LANDING, CAMERA EFFECTS, ADVANCED); each tab is a few cards
+-- tabs (PRESETS, CAMERA, FOLLOW & MOVEMENT, TRICKS & CLOSE-UPS, AIR & LANDING, CAMERA EFFECTS, OFF THE BOARD, ADVANCED); each tab is a few cards
 -- of toggles, sliders and dropdowns with the DLL's labels, ranges and formats. A change applies to the camera at once (the glue
 -- sees the new revision) and is saved to storage.
 --
@@ -11,20 +11,24 @@
 --  * No text field: the preset name is typed in a dialog (Manage presets...), which also lists, loads, renames, deletes and
 --    imports presets. There is no clipboard in the plugin API: share a preset as its file (Open preset folder) and import with the
 --    dialog's file button.
---  * No crossfade out: the camera is handed back at once, so there is no "Board dismount transition time".
+--  * Off the board: the OFF THE BOARD tab (off-board camera, style, framing, feel) is the plugin's own; "Board / foot transition time" is there, "Hand-back blend time" (ADVANCED) is for the Game option.
 --
 --   Menu.install{ store = store, glue = glue }  registers the page; Menu.on_dialog(e) handles the `throwdown_ui` event.
 --   Menu.build(ui) is the page's build function (exposed for the tests).
 
 local Settings = require("settings")
 local Presets = require("presets")
+local has_off, Off = pcall(require, "offboard")
+if not has_off then
+	Off = nil
+end
 
 local Menu = {}
 
 local clamp, max, min, floor = math.clamp, math.max, math.min, math.floor
 local Angle, Shoulder, DistMode, ManualMode = Settings.CameraAngle, Settings.ShoulderSide, Settings.DistanceMode, Settings.ManualDistanceMode
 
-Menu.TABS = { "PRESETS", "CAMERA", "FOLLOW & MOVEMENT", "TRICKS & CLOSE-UPS", "AIR & LANDING", "CAMERA EFFECTS", "ADVANCED" }
+Menu.TABS = { "PRESETS", "CAMERA", "FOLLOW & MOVEMENT", "TRICKS & CLOSE-UPS", "AIR & LANDING", "CAMERA EFFECTS", "OFF THE BOARD", "ADVANCED" }
 Menu.DIALOG_ID = "dyncam_presets"
 
 local deps
@@ -55,7 +59,7 @@ function Menu.build(ui)
 	local discard = false -- a preset load or a reset: this build's edits would undo it
 
 	local function mark(g)
-		if g == opts then
+		if g == opts or g == opts.offboard then
 			o_changed = true
 		else
 			s_changed = true
@@ -118,9 +122,9 @@ function Menu.build(ui)
 		state.feedback = nil
 	end
 	ui:card("DYNAMIC CAMERA")
-	ui:note("Settings for the riding camera: follow, tricks, jumps, landings and effects.")
+	ui:note("Settings for the camera: follow, tricks, jumps, landings and effects, and the view off the board.")
 	local on = ui:toggle("main_on", "Dynamic Camera", store.enabled,
-		"Enables the riding camera. The game's camera takes over on foot, in menus, and in Replay Editor.")
+		"Enables the camera. In menus and the Replay Editor the game's camera takes over. On foot, see the OFF THE BOARD tab.")
 	if on ~= store.enabled then
 		store:set_enabled(on)
 	end
@@ -482,6 +486,73 @@ function Menu.build(ui)
 		slider("af_deg", "Maximum big-air FOV increase", "Higher: the FOV is wider in a big air. Lower: it changes less.", fov, "air_fov_degrees", 0, 40, "+%.1f degrees")
 		slider("af_full", "Jump height for max FOV increase", "Higher: only very big jumps give the full FOV increase. Lower: smaller jumps do too.",
 			fov, "air_fov_full_height", 0.1, 50, "%.1f m")
+	elseif tab == 7 then
+		-- ---- OFF THE BOARD
+		local ob = opts.offboard
+		ui:card("OFF THE BOARD", "The camera while you walk, stand, run and bail")
+		if not ob or not Off then
+			ui:note("The off-board camera is not available in this install.")
+		else
+			local mode, mchanged = pick("ob_mode", "Off-board camera", { "Dynamic", "Game" }, opts.offboard_mode == "game" and 2 or 1, {
+				"This camera keeps the view on foot and in bails. Use the right stick to look around.",
+				"The game's own camera takes over when you step off the board, after a short ease.",
+			})
+			if mchanged then
+				opts.offboard_mode = mode == 2 and "game" or "dynamic"
+				o_changed = true
+			end
+			local style, tchanged = pick("ob_style", "Style", { "Orbit", "Shoulder" }, ob.style == "shoulder" and 2 or 1, {
+				"A view from behind and above you, a little further out. Fills the sliders below.",
+				"Close over one shoulder, like the Arkham games. Fills the sliders below; the shoulder side is the riding one (Switch shoulder side).",
+			})
+			if tchanged then
+				Off.apply_style(ob, style == 2 and "shoulder" or "orbit", glue.base_fov)
+				o_changed = true
+			end
+			ui:note("Look around with the right stick. R3 swings the camera behind you. The mouse is not used.")
+
+			ui:card("FRAMING")
+			slider("ob_dist", "Distance", "Higher: the camera sits further from you. Lower: closer.", ob, "distance", 1.0, 6.0, "%.1f m")
+			slider("ob_height", "Height", "How high the camera sits above the middle of your body.", ob, "height", -0.5, 1.5, "%.2f m")
+			slider("ob_look", "Look height", "Where the camera aims, above the middle of your body. Higher: you sit lower on the screen.",
+				ob, "look_height", -0.3, 1.0, "%.2f m")
+			slider("ob_offset", "Horizontal offset",
+				"Moves the camera to the side. Positive: to the right. Negative: to the left. Switch shoulder side flips it.", ob, "offset", -1.2, 1.2, "%.2f m")
+			do
+				-- 0 is the game's FOV, else 40 to 110; the slider jumps over the gap.
+				local shown = clamp(floor(ob.fov + 0.5), 0, 110)
+				local v = floor(ui:slider("ob_fov", "Field of view (0 = game's own)", shown, 0, 110, "%d degrees") + 0.5)
+				note("Higher: a wider view. Lower: a narrower, more zoomed-in view. 0 keeps the game's FOV.")
+				if v ~= shown then
+					if v > 0 and v < 40 then
+						v = v < 20 and 0 or 40
+					end
+					ob.fov = v
+					o_changed = true
+				end
+			end
+
+			ui:card("FEEL", "Everything eases; nothing snaps")
+			slider("ob_follow", "Follow smoothing", "Higher: the camera trails you more softly. Lower: it keeps closer to you.", ob, "follow_time", 0.02, 1.0, "%.2f s")
+			slider("ob_turn", "Turn smoothing", "Higher: the view starts and stops turning more gradually. 0: it follows the stick exactly.", ob, "turn_time", 0.0, 0.5, "%.2f s")
+			slider("ob_stick", "Stick speed", "How fast the right stick turns the view. The game's own is about 170.", ob, "stick_speed", 60, 360, "%.0f deg/s")
+			toggle("ob_invert", "Invert Y", "On: pushing the right stick up looks down.", ob, "invert_y")
+			slider("ob_recentre", "Recentre after (0 = never)",
+				"While you move and leave the right stick alone, the camera swings behind you after this long. Standing still never recentres.",
+				ob, "recentre_after", 0.0, 10.0, "%.1f s")
+			toggle("ob_match", "Match walking to the view",
+				"Slowly turns the view toward the direction the left stick walks 'forward', which the game decides with its own hidden camera.", ob, "match_walking")
+
+			ui:card("BODY")
+			slider("ob_level", "Level with the body",
+				"Higher: steps, stairs and crouches do not bob the camera. 0: it follows your body's height exactly.", ob, "level", 0.0, 1.0, "%.2f")
+			slider("ob_bob", "Bobbing strength", "A walking bob put back on purpose, stronger when you run. 0: none.", ob, "bob", 0.0, 1.0, "%.2f")
+			slider("ob_bail", "Bail distance", "How much further out the camera goes when you bail. 1: no change.", ob, "bail_distance", 1.0, 2.5, "%.2fx")
+
+			ui:card("BOARD TRANSITION")
+			slider("ob_trans", "Board / foot transition time",
+				"How long the view takes to change between the riding camera and this one, either way. 0: straight away.", ob, "transition_time", 0.0, 3.0, "%.2f s")
+		end
 	else
 		-- ---- ADVANCED
 		local col = draft.collision
@@ -498,7 +569,10 @@ function Menu.build(ui)
 		ui:card("BOARD TRANSITIONS")
 		slider("bt_take", "Board mount transition time",
 			"Higher: the switch to this camera takes longer when you get on the board. 0: it cuts at once.", opts, "take_blend_time", 0, 5, "%.2f s")
-		ui:note("When you get off the board the camera is handed back to the game at once: the plugin cannot see the game's camera while it holds the view.")
+		slider("bt_release", "Hand-back blend time",
+			"Higher: when you get off the board the camera takes longer to settle where the game's camera will be before it is handed back. 0: it hands back at once.",
+			opts, "release_blend_time", 0, 5, "%.2f s")
+		ui:note("The plugin cannot see the game's camera while it holds the view, so it eases to where it expects it to be, learned from the last time you were on foot.")
 
 		ui:card("LOGGING")
 		toggle("lg_on", "Camera logging",
