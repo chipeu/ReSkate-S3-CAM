@@ -1,0 +1,40 @@
+# Build outputs
+tools/obj/
+tools/*.exe
+tools/build.log
+tools/build_cmd.txt
+tools/trace/*.exe
+tools/trace/*.obj
+*.obj
+*.pdb
+# Generated: tools/trace/regen.ps1 writes them
+tools/trace/out/
+# Extracted from ReSkate's v2.1.2 tag (tools/README.md says how)
+tools/luau-src/
+# Packages and local-only files
+release/
+docs-ref/
+PORT_PLAN.md
+tools/req.lua
+tools/trace/obj/
+# Private, never committed: plans, handoffs, notes, logs and assistant files
+PLAN*.md
+*PLAN*.md
+HANDOFF*.md
+*handoff*
+*HANDOFF*
+NOTES*.md
+notes/
+docs/
+private/
+CLAUDE.md
+.claude/
+*.log
+logs/
+camera_log*.txt
+diag/
+ReSkate.log*
+# Local packages and scratch
+*.zip
+scratch/
+tmp/
