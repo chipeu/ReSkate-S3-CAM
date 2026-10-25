@@ -1,0 +1,7 @@
+{
+    "name": "Dynamic_Camera",
+    "version_number": "1.1.0",
+    "website_url": "https://github.com/chipeu/ReSkate-S3-CAM",
+    "description": "Dynamic Camera for ReSkate: a Skate 3 style riding camera that follows your movement, turns for tricks, moves in for manuals and grinds, rises in big airs and shakes on landings. Tunable in the menu, with presets.",
+    "dependencies": []
+}
