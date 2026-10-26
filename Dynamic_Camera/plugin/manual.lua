@@ -1,27 +1,37 @@
--- Manual detection from the game's physics state. While the skater holds a manual the game reports state 101 (a ReSkate source
--- calls it "brief after air", a guess from another project): measured in game it lasts 0.5 to 1.0 s with the board nose
--- up 10 to 16 degrees, was entered from 100 (rolling) and from 201 (landing straight into a manual), and ended back at 100.
+-- Manual detection from the game's trick list. The HUD names a manual the moment it starts (a "Manual" or "Nose Manual" note on a
+-- new entry) and sends a landing note for that entry when it ends, so those two notes are the manual's start and end. The physics
+-- state says nothing about manuals: state 101 is what the game shows for a Powerslide or a Revert, and during a real manual the
+-- state stays 100. The feet pitch was too noisy to end a manual with and is not used any more.
 --
--- A manual is on once the state has been 101 for ON_AFTER (a few ticks, so one stray tick of 101 does not make a close-up) and
--- off once it has been anything else for OFF_AFTER (so a one-tick flicker to another state does not end it). The trick list does
--- not start or end it any more: the HUD names a trick late (after the manual is over, or with the next trick), which made the
--- close-up come late, never, or only after a manual and its revert. Its notes are kept for the log only: every trick name with the
--- state and time it arrived at, so a log shows whether 101 really is the manual.
+-- Things about the list that this module has to live with (all seen in game logs):
+--  * Entry ids are not ordered numbers (they look like slot << 32 | counter), so notes are handled strictly in the order they
+--    arrive and an id is never compared with another.
+--  * The same note comes again and again: the music ticker re-sends the song or band under one fixed id about every 0.17 s, and the
+--    landing note of the last trick of a line repeats every few seconds. A name for an entry that already has that text is a
+--    repeat and is dropped; only the first landing note of an entry counts. An entry that has repeated 3 times is a ticker and is
+--    ignored from then on, whatever text it carries (the song changes under the same id).
+--  * Names that start with "ID_" (transition text) and location names are not tricks. The ID_ ones are dropped; a location name
+--    looks like a new trick, and ends a manual like any other new name would (it only arrives between lines of play).
+--
+-- ON  when a new entry is named with a name that contains "manual" while the skater rolls on the board (not in the air, not
+--     grinding). If it arrives in the air (a flip trick landing straight into a manual) it waits up to 0.5 s for the skater to roll.
+-- OFF when the first landing note of the manual's entry arrives, when a new entry is named with a non-manual trick (a Revert or a
+--     Powerslide included), when the skater leaves the ground, grinds or leaves the board, or after 15 s (a safety net).
 --
 --   local m = Manual.new()
---   m:on_notes(notes, now)                                          -- the trick_notes event's e.notes, now in seconds (log only)
+--   m:on_notes(notes, now)                                          -- the trick_notes event's e.notes, now in seconds
 --   local on = m:update(now, state, onboard, airborne, grinding, feet_pitch)   -- once a tick; feet_pitch is not used any more
 --   m:drain_log(fn)                                                 -- hands each pending log text to fn(text)
---   m.source ("physics state"), m.count (manuals since load), m.last_event (short text, for the log)
+--   m.source ("trick list"), m.count (manuals since load), m.last_event (short text, for the log)
 
 local M = {}
 
-M.state = 101 -- the physics state of a manual
-M.on_after = 0.06 -- s in the state before the manual is on
-M.off_after = 0.15 -- s out of the state before the manual is off
+M.wait_for_ground = 0.5 -- s a manual named in the air waits for the skater to roll
+M.max_time = 15.0 -- s, a manual never lasts longer than this
+M.ticker_repeats = 3 -- an entry re-sent with the same text this many times is a ticker (music), not a trick
 M.max_log = 24 -- trick log entries kept between two drains
 
--- A trick name that contains one of these (any case) is a manual (only used to label the log).
+-- A trick name that contains one of these (any case) is a manual.
 M.words = { "manual" }
 
 local Manual = {}
@@ -48,14 +58,16 @@ function M.is_manual_name(name)
 end
 
 function Manual:reset()
-	self.source = "physics state"
+	self.source = "trick list"
 	self.last_event = ""
 	self.on = false
-	self.in_since = nil -- when the state became 101 (and has stayed)
-	self.out_since = nil -- when it stopped being 101 while the manual was on
+	self.active = nil -- the entry key of the manual that is on
+	self.on_since = 0.0
+	self.pending = nil -- { key, until }: a manual named while the skater was not rolling
+	self.rolling = false -- from the last update: on the board, on the ground, not grinding
 	self.state = 0 -- the last state seen, for the log
 	self.now = 0.0
-	self.names = {} -- entry key -> its name, so a landing note can say what it belongs to
+	self.entries = {} -- entry key -> { text, repeats, landed }
 	self.log = {}
 end
 
@@ -67,20 +79,93 @@ function Manual:queue(text)
 	log[#log + 1] = text
 end
 
--- The trick list: log only. Nothing here changes whether a manual is on.
+function Manual:turn_off(why)
+	self.on = false
+	self.active = nil
+	self.pending = nil
+	self.last_event = "manual off (" .. why .. ")"
+end
+
+function Manual:turn_on(key, now, text)
+	if not self.on then
+		self.count += 1 -- a manual linked into another (manual, revert, manual) is one close-up
+		self.on_since = now
+	end
+	self.on = true
+	self.active = key
+	self.pending = nil
+	self.last_event = string.format("manual on (\"%s\" named, entry %s)", tostring(text), key)
+end
+
+function Manual:on_name(key, text, now)
+	if type(text) ~= "string" or text == "" then
+		return
+	end
+	local entry = self.entries[key]
+	if entry == nil then
+		entry = { text = nil, repeats = 0, landed = false }
+		self.entries[key] = entry
+	end
+	if entry.text == text then
+		entry.repeats += 1
+	end
+	if entry.repeats >= M.ticker_repeats then
+		return -- the music ticker (or anything else re-sent over and over)
+	end
+	if entry.text == text then
+		return -- a repeat of a name already handled
+	end
+	entry.text = text
+	entry.landed = false
+	self:queue(string.format("s3cam trick \"%s\" (entry %s) named at state %d, t=%.2f, manual %s", text, key, self.state, now,
+		self.on and "on" or "off"))
+	if string.sub(text, 1, 3) == "ID_" then
+		return -- transition text, not a trick
+	end
+	if M.is_manual_name(text) then
+		if self.rolling then
+			self:turn_on(key, now, text)
+		else
+			self.pending = { key = key, text = text, deadline = now + M.wait_for_ground }
+		end
+	else
+		-- A new trick that is not a manual: it ends one that is on and cancels one that is waiting.
+		self.pending = nil
+		if self.on then
+			self:turn_off(string.format("\"%s\" named", text))
+		end
+	end
+end
+
+function Manual:on_landing(key, now)
+	local entry = self.entries[key]
+	if entry == nil or entry.landed then
+		return -- unknown entry, or a repeated landing note
+	end
+	entry.landed = true
+	self:queue(string.format("s3cam trick landing note (entry %s: %s) at state %d, t=%.2f, manual %s", key, tostring(entry.text),
+		self.state, now, self.on and "on" or "off"))
+	-- In a manual, revert, manual line each manual gets its own entry and only the line's end writes a landing note, for
+	-- whichever of them: the first landing note of any manual ends the close-up.
+	if self.on and (self.active == key or M.is_manual_name(entry.text)) then
+		self:turn_off("its landing note")
+	elseif self.pending and self.pending.key == key then
+		self.pending = nil
+	end
+end
+
+-- The trick list: starts and ends manuals.
 function Manual:on_notes(notes, now)
 	if type(notes) ~= "table" then
 		return
 	end
+	now = now or self.now
 	for _, note in notes do
 		local key = tostring(note.entry)
 		if note.kind == "n" then
-			self.names[key] = note.text
-			self:queue(string.format("s3cam trick \"%s\" (entry %s) named at state %d, t=%.2f, manual %s", tostring(note.text), key, self.state,
-				now or self.now, self.on and "on" or "off"))
+			self:on_name(key, note.text, now)
 		elseif note.kind == "l" then
-			self:queue(string.format("s3cam trick landing note (entry %s: %s) at state %d, t=%.2f, manual %s", key, tostring(self.names[key] or "?"),
-				self.state, now or self.now, self.on and "on" or "off"))
+			self:on_landing(key, now)
 		end
 	end
 end
@@ -98,35 +183,29 @@ end
 
 function Manual:update(now, state, onboard, airborne, grinding, feet_pitch)
 	self.state, self.now = state, now
-	local in_state = state == M.state and onboard and not grinding and not airborne
-	if in_state then
-		self.out_since = nil
-		self.in_since = self.in_since or now
-		if not self.on and now - self.in_since >= M.on_after then
-			self.on = true
-			self.count += 1
-			self.last_event = string.format("manual on (state %d for %.2f s)", state, now - self.in_since)
+	local rolling = onboard and not airborne and not grinding
+	self.rolling = rolling
+	if self.on then
+		if not onboard then
+			self:turn_off("off the board")
+		elseif grinding then
+			self:turn_off("grinding")
+		elseif airborne then
+			self:turn_off("left the ground")
+		elseif now - self.on_since >= M.max_time then
+			self:turn_off("15 s limit")
 		end
 		return self.on
 	end
-	self.in_since = nil
-	if self.on then
-		if not onboard then
-			self.on = false
-			self.out_since = nil
-			self.last_event = "manual off (off the board)"
-			return false
+	local p = self.pending
+	if p then
+		if now > p.deadline then
+			self.pending = nil
+		elseif rolling then
+			self:turn_on(p.key, now, p.text)
 		end
-		self.out_since = self.out_since or now
-		if now - self.out_since >= M.off_after then
-			self.on = false
-			self.last_event = string.format("manual off (state %d for %.2f s)", state, now - self.out_since)
-			self.out_since = nil
-			return false
-		end
-		return true
 	end
-	return false
+	return self.on
 end
 
 return M

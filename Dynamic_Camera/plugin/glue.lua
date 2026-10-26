@@ -505,7 +505,7 @@ function Glue:observe(now)
 		end
 		snap.manual = self.manual
 		if det and self.store.options.verbose then
-			-- The trick list's names with the state they arrived at: the log shows whether state 101 is the manual.
+			-- The trick list's names with the state they arrived at, so a log shows what started and ended each manual.
 			det:drain_log(function(text) self:log_verbose(text) end)
 		end
 	end

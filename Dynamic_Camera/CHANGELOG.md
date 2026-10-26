@@ -1,5 +1,7 @@
 1.1.0
 -----
+Plugin test build 7
+* Manuals (and nose manuals) now come from the game's trick list as they start: the close-up begins when the manual is named and ends with its landing note, or when you leave the ground, grind, get off the board or start another trick. Reverts and powerslides no longer give the close-up (the game's skate state 101 is theirs, not the manual's). A manual named in the air, straight out of a flip trick, starts as soon as you roll. Repeated notes (the music ticker, landing notes that come again) are ignored.
 Plugin test build 6
 * No more snaps: every view the plugin is about to show passes a last check. If the camera's offset from you changes by more than 0.25 m in a frame, the view turns more than 8 degrees in a frame, or the field of view moves more than 2 degrees in a frame, the view eases from what is on screen to the new one over about a third of a second instead of jumping. Walls pushing the camera in, and teleports, are not smoothed. The camera log counts the smoothed jumps by cause and by which camera path made them ("N snaps smoothed" on the "off" line, one line for each in verbose logs).
 * Getting back on the board no longer snaps the view: the first frame after a remount used to lose the camera's up and down angle and turn 20 to 25 degrees at once.

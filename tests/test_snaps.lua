@@ -374,7 +374,7 @@ do
 	expect((g.snaps_total or 0) == 0, "three ollies with the real camera: the guard never had to step in (" .. tostring(g.snaps_total) .. ")")
 end
 
--- ================================================================ 7. manuals from state 101 with the real camera
+-- ================================================================ 7. manuals from the trick list with the real camera
 local function hop_then(state_after, seconds_after)
 	local m, app = setup()
 	local g = app.glue
@@ -388,34 +388,47 @@ local function hop_then(state_after, seconds_after)
 	return m, app, g, w
 end
 do
-	-- rolling into a manual, a one-tick flicker in the middle, then out of it
+	-- state 101 (a revert, a powerslide) is not a manual; a Manual named while rolling is, until its landing note
 	local m, app, g, w = hop_then()
 	w.run(1.0, 100, 7)
 	expect(g.snap.manual == false and g.shot ~= "close_manual", "rolling: no manual")
-	w.run(0.15, 101, 7)
-	expect(g.snap.manual == true and g.manuals == 1, "state 101 for 0.15 s: the manual is on")
-	w.run(0.5, 101, 7)
-	expect(string.find(g.shot, "manual", 1, true) ~= nil, "and the camera is in a manual shot (" .. g.shot .. ")")
+	w.run(1.0, 101, 7)
+	expect(g.snap.manual == false and g.manuals == 0, "state 101 for 1 s: no manual")
+	w.run(0.2, 100, 7)
+	for _ = 1, 5 do m.trick_notes({ { entry = "4295033426", kind = "n", text = "Behemoth" } }) end -- the song ticker is already running
+	m.trick_notes({ { entry = "12885001598", kind = "n", text = "Manual" } })
 	w.run(0.02, 100, 7)
-	w.run(0.5, 101, 7)
-	expect(g.snap.manual == true and g.manuals == 1 and string.find(g.shot, "manual", 1, true) ~= nil, "a one-tick flicker of 100 changes nothing")
+	expect(g.snap.manual == true and g.manuals == 1, "a Manual named: the manual is on at once")
+	w.run(0.5, 100, 7)
+	expect(string.find(g.shot, "manual", 1, true) ~= nil, "and the camera is in a manual shot (" .. g.shot .. ")")
+	-- the music ticker (already known) and a landing note for another entry change nothing
+	m.trick_notes({ { entry = "4295033426", kind = "n", text = "Behemoth" } })
+	w.run(0.1, 100, 7)
+	m.trick_notes({ { entry = "4295033426", kind = "n", text = "Behemoth" }, { entry = "99732", kind = "l", text = "x" } })
 	w.run(0.3, 100, 7)
-	expect(g.snap.manual == false, "100 for 0.3 s: the manual is over")
+	m.trick_notes({ { entry = "4295033426", kind = "n", text = "Behemoth" }, { entry = "4295033426", kind = "n", text = "Behemoth" } })
+	w.run(0.3, 100, 7)
+	expect(g.snap.manual == true and g.manuals == 1, "still on")
+	m.trick_notes({ { entry = "12885001598", kind = "l", text = "x" } })
+	w.run(0.02, 100, 7)
+	expect(g.snap.manual == false, "its landing note: the manual is over")
 	expect(app.errors == 0, "no errors")
 end
 do
-	-- landing straight into a manual (201 -> 101) against landing onto the ground (201 -> 100): the shake is the same, the close-up wins after the landing shot
+	-- landing straight into a manual (Manual named in the air) against landing onto the ground: the shake is the same, the close-up wins after the landing shot
 	local results = {}
-	for _, after in { 100, 101 } do
+	for _, manual in { false, true } do
 		local m, app, g, w = hop_then()
-		w.run(0.1, after, 7)
-		results[after] = { fall = g.landing_fall, fraction = g.landing_fraction, manual_early = g.snap.manual }
-		w.run(0.7, after, 7)
-		results[after].shot = g.shot
-		results[after].manual = g.snap.manual
+		if manual then m.trick_notes({ { entry = "8590034324", kind = "n", text = "Manual" } }) end
+		w.run(0.1, 100, 7)
+		results[manual] = { fall = g.landing_fall, fraction = g.landing_fraction, manual_early = g.snap.manual }
+		w.run(0.7, 100, 7)
+		results[manual].shot = g.shot
+		results[manual].manual = g.snap.manual
 	end
-	expect(results[101].manual_early == true and results[101].manual == true, "201 -> 101: the manual is on 0.1 s after the landing")
-	expect(results[100].manual == false, "201 -> 100: no manual")
+	results[101], results[100] = results[true], results[false]
+	expect(results[101].manual_early == true and results[101].manual == true, "a Manual named in the air: on 0.1 s after the landing")
+	expect(results[100].manual == false, "landing with no Manual named: no manual")
 	expect(string.find(results[101].shot, "manual", 1, true) ~= nil, "the close-up is on 0.8 s after the landing (" .. tostring(results[101].shot) .. ")")
 	expect(results[100].fall ~= nil and math.abs((results[101].fall or -1) - results[100].fall) < 1e-6
 		and math.abs((results[101].fraction or -1) - (results[100].fraction or -2)) < 1e-6, "the landing shake is the same either way")

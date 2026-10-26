@@ -64,7 +64,11 @@ end
 
 local RIGHT_FOOT, LEFT_FOOT = 10, 343
 
--- ================================================================ manual from the physics state (state 101), board pitch from the feet
+-- ================================================================ manual from the trick list, board pitch from the feet
+-- A trick-list note as the game sends it (entry ids are not ordered numbers).
+local function named(m, entry, text) m.trick_notes({ { entry = tostring(entry), kind = "n", text = text } }) end
+local function landed(m, entry) m.trick_notes({ { entry = tostring(entry), kind = "l", text = "ID_TRICK_LANDING_OK" } }) end
+
 -- A rider rolling along +Z at 6 m/s. `tilt` is the board's pitch in degrees, nose up positive, read off the feet: the front foot is
 -- the one further along the travel. `front` is the joint that is in front (the stance).
 local function rider(heading, front)
@@ -103,24 +107,30 @@ do
     expect(c ~= nil and math.abs(c.z - sc.z) < 0.05 and math.abs(c.x) < 0.05, "centre is between the feet along the travel")
     expect(c ~= nil and math.abs(c.y - (0.12 - 0.08)) < 0.01, "centre is 0.08 m below the feet's midpoint (y " .. tostring(c and c.y) .. ")")
 
-    sc.tilt = 12 -- the feet tilted with the state still 100 (a pop setup, pushing): not a manual
+    sc.tilt = 12 -- the feet tilted with no Manual named (a pop setup, pushing): not a manual
     drive(m, sc, make, 0.5)
     expect(g.board_pitch > 11 and g.board_pitch < 13, "feet tilted 12 deg nose up: pitch " .. string.format("%.2f", g.board_pitch))
-    expect(g.snap.manual == false, "nose up 12 deg in state 100: no manual (the state decides)")
+    expect(g.snap.manual == false, "nose up 12 deg, nothing named: no manual (the trick list decides)")
     sc.state = 101
     drive(m, sc, make, 0.5)
-    expect(g.snap.manual == true, "state 101 for 0.5 s with the nose up: manual on")
+    expect(g.snap.manual == false, "state 101 (a revert or powerslide) for 0.5 s with the nose up: no manual")
+    sc.state = 100
+    named(m, 11, "Manual")
+    drive(m, sc, make, 0.5)
+    expect(g.snap.manual == true, "Manual named with the nose up: manual on")
     expect(g.snap.board_valid and g.snap.board_position.z > sc.z - 0.3 and g.snap.board_position.z < sc.z + 0.3, "manual: centre between the feet")
     sc.tilt = 0
     drive(m, sc, make, 0.5)
-    expect(g.snap.manual == true, "level feet in state 101: still a manual")
-    sc.state = 100
+    expect(g.snap.manual == true, "level feet: still a manual (the feet do not end it)")
+    landed(m, 11)
     drive(m, sc, make, 0.5)
-    expect(g.snap.manual == false, "state 100 again: manual off")
-    sc.state, sc.tilt = 101, -12
+    expect(g.snap.manual == false, "its landing note: manual off")
+    sc.tilt = -12
+    named(m, 12, "Nose Manual")
     drive(m, sc, make, 0.5)
-    expect(g.board_pitch < -11 and g.snap.manual == true, "nose down 12 deg in state 101: manual on, negative pitch")
-    sc.state, sc.tilt = 100, 0
+    expect(g.board_pitch < -11 and g.snap.manual == true, "Nose Manual with the nose down 12 deg: manual on, negative pitch")
+    landed(m, 12)
+    sc.tilt = 0
     drive(m, sc, make, 0.5)
     expect(app.errors == 0, "no handler errors")
 
@@ -128,6 +138,7 @@ do
     local notes = 0
     for _, l in ipairs(m.logs) do if string.find(l[2], "board pitch", 1, true) then notes += 1 end end
     expect(notes == 1 and logged(m, "board pitch from the feet") ~= nil, "one note: board pitch from the feet")
+    expect(logged(m, "manual detection: trick list") ~= nil, "the once-a-run note says manual detection: trick list")
     local o = Settings.copy(app.store.options)
     o.release_blend_time = 0
     app.store:set_options(o)
@@ -147,7 +158,8 @@ for _, case in ipairs({ { "left foot in front", 0, LEFT_FOOT }, { "switch (facin
     local sc, make = rider(case[2], case[3])
     drive(m, sc, make, 0.8)
     expect(g.snap.manual == false and math.abs(g.board_pitch) < 0.5, name .. ": level, no manual")
-    sc.state, sc.tilt = 101, 12
+    sc.tilt = 12
+    named(m, 21, "Manual")
     drive(m, sc, make, 0.5)
     expect(g.snap.manual == true and g.board_pitch > 11, name .. ": nose up reads +12 (" .. string.format("%.2f", g.board_pitch) .. ")")
     sc.tilt = -12
@@ -190,7 +202,7 @@ do
     local sc, make = rider(0)
     local a = rad(-12) -- about X by -12 deg lifts the deck's +Z end: nose up
     local each = make()
-    sc.state = 101
+    named(m, 31, "Manual")
     go(m, 1.5, function(i)
         each(i, m)
         m.state.board.deck = { position = vc(0, 0.3, sc.z), rotation = { x = math.sin(a / 2), y = 0, z = 0, w = math.cos(a / 2) } }

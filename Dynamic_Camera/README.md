@@ -56,7 +56,7 @@ Known differences from the DLL version
 * The mouse does not turn the off-board view (the plugin API reads it only with the right mouse button held and moves the cursor), and the walking-direction match needs a gamepad.
 * The game's field of view and camera are read just before the camera is taken; changing the game's FOV while riding applies
   at the next take.
-* Manuals are found from the game's skate state (the state the game reports while you hold a manual), not from the board's tilt or the trick list. The board's tilt (the deck's rotation when the game gives it, else the angle between your feet) only places the close-up.
+* Manuals (also nose manuals) are found from the game's trick list: the close-up starts as the manual is named and ends with its landing note, or when you leave the ground, grind, get off the board or start another trick. Reverts and powerslides do not give it. The board's tilt (the deck's rotation when the game gives it, else the angle between your feet) only places the close-up.
 * The camera casts at most about 60 world rays a tick (the plugin limit is 64); in a long jump a landing prediction can be
   cut short.
 * Whatever the cause, a sudden jump of the view (position, direction or field of view in a single frame) is eased over about a third of a second instead of shown, and the camera log counts them.

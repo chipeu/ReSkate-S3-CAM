@@ -60,7 +60,7 @@ function App.steps(deps)
 		app.store, app.diag = store, diag
 	end
 
-	-- 2. The glue, and the manual detector it reads (the physics state tells it when a manual starts and ends).
+	-- 2. The glue, and the manual detector it reads (the trick list tells it when a manual starts and ends).
 	steps[#steps + 1] = function()
 		glue = Glue.new{ store = store, camera = camera, diag = diag }
 		app.glue = glue
@@ -106,11 +106,11 @@ function App.steps(deps)
 		reskate.on("level_loaded", guarded("level_loaded", function() glue.cam:cut() end))
 		reskate.on("unload", guarded("unload", function() glue:release("unload") end))
 		reskate.on("throwdown_ui", guarded("dialog", function(e) Menu.on_dialog(e) end))
-		-- The trick list's notes go to the manual detector for the log only (a manual is found from the physics state). Without the feed
-		-- (the game refuses, or the permission is missing) the log just has no trick names.
+		-- The trick list's notes start and end manuals (the HUD names a manual as it starts and sends a landing note when it ends).
+		-- Without the feed (the game refuses, or the permission is missing) no manual is ever found, and the log says so.
 		local fed, why = pcall(reskate.tricks.feed, true)
 		if not fed then
-			reskate.log("dyncam: the trick list could not be read (" .. tostring(why) .. "); trick names will be missing from the log", "warn")
+			reskate.log("dyncam: the trick list could not be read (" .. tostring(why) .. "); manuals will not be detected", "warn")
 		else
 			reskate.on("trick_notes", guarded("trick_notes", function(e)
 				app.manual:on_notes(e.notes, reskate.time.now() / 1000)
