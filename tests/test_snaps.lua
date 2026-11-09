@@ -27,6 +27,13 @@ local function setup(opts)
 	if opts.game_fov then m.state.game_camera.fov = opts.game_fov end
 	local app = require("app").start({ camera = opts.camera or camera })
 	m.fire("load")
+	if opts.camera then
+		-- The deliberately jumpy fake camera tests unrestricted guard behavior.
+		-- Fixed-mode body clamping is covered separately by test_fixed_chase.
+		local s=Settings.copy(app.store.settings)
+		s.ride_distance.mode,s.ride_distance_high.mode=Settings.DistanceMode.Speed,Settings.DistanceMode.Speed
+		app.store:set_settings(s)
+	end
 	if opts.guard == false then app.glue.snap_guard_on = false end
 	return m, app
 end

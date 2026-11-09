@@ -293,4 +293,99 @@ do -- bank
 	expect(Sh.default_bank().rotation[8].y == a.rotation[8].y, "the default bank is the seeded bank")
 end
 
+do -- the landing kick reads the shared looping bank at its running position (the way 1.0.2 did)
+	local s = Sh.settings()
+	-- A shaker with the speed rumble running for `warm` steps (so its loop position differs), at full weight.
+	local function warmed(warm, speed)
+		local shake = Sh.new()
+		for _ = 1, warm do Sh.update(shake, fixed_step, speed, 1.0, true, s) end
+		return shake
+	end
+	-- The reference: one update as 1.0.2 had it. The impulse and the rumble add into one amplitude, both read the one bank at one
+	-- running position, which moves at the one-shot frequency while the impulse lasts. (The only difference from it that is wanted is
+	-- that the impulse's share of the translation has nothing along the view axis, checked below.)
+	local function reference_update(r, dt, speed, distance)
+		local bank = Sh.default_bank()
+		r.weight = math.clamp(r.weight + dt * s.weight_rate, 0.0, 1.0)
+		local amplitude = s.amplitude_min
+		if s.amplitude_top_speed ~= 0.0 then
+			amplitude = s.amplitude_min + Sh.curve_sample(s.amplitude_curve, math.clamp(speed / s.amplitude_top_speed, 0.0, 1.0)) * (s.amplitude_max - s.amplitude_min)
+		end
+		amplitude = (r.impulse + amplitude) * r.weight
+		local frequency = s.frequency_min
+		if s.frequency_top_speed ~= 0.0 then
+			frequency = s.frequency_min + Sh.curve_sample(s.frequency_curve, math.clamp(speed / s.frequency_top_speed, 0.0, 1.0)) * (s.frequency_max - s.frequency_min)
+		end
+		if r.impulse > 0.0 then frequency = s.one_shot_frequency end
+		r.time = math.fmod(r.time + s.data_fps * frequency * dt, 256.0)
+		local whole = math.floor(r.time)
+		local fraction = r.time - whole
+		local left = whole % 256
+		local right = (left + 1) % 256
+		local fade = math.clamp((s.distance_zero - distance) / (s.distance_zero - s.distance_full), 0.0, 1.0)
+		local rl, rr = bank.rotation[left + 1], bank.rotation[right + 1]
+		local tl, tr = bank.translation[left + 1], bank.translation[right + 1]
+		local rot = rl + (rr - rl) * fraction
+		local tra = tl + (tr - tl) * fraction
+		local rot_gain = amplitude * fade * s.rotation_multiplier
+		local out = { pitch = rot.x * rot_gain, yaw = rot.y * rot_gain, roll = rot.z * rot_gain * s.dutch_multiplier,
+			translation = tra * (s.translation_multiplier * amplitude * fade) }
+		r.impulse = r.impulse * (1.0 - s.one_shot_decay)
+		if r.impulse < 0.005 then r.impulse = 0.0 end
+		return out
+	end
+	-- Landings at five different places in the rumble's loop: the rotation, the sideways and up translation and the loop position are
+	-- the reference's, step for step (so the kick is not restarted at a fixed place and does not fade in), and the kick does differ
+	-- from one place in the loop to another (it is the shared bank at its running position).
+	local first_pitch = {}
+	for index, warm in { 13, 47, 101, 170, 233 } do
+		local hit = warmed(warm, 12.0)
+		local ref = { time = 0.0, impulse = 0.0, weight = 0.0 }
+		for _ = 1, warm do reference_update(ref, fixed_step, 12.0, 1.0) end
+		ref.weight, ref.time = hit.weight, hit.time
+		Sh.landing_impulse_fraction(hit, 1.0, s)
+		ref.impulse = hit.impulse
+		local worst_rot, worst_xy, worst_time, peak_pitch = 0.0, 0.0, 0.0, 0.0
+		for i = 1, 120 do
+			local a = Sh.update(hit, fixed_step, 12.0, 1.0, true, s)
+			local b = reference_update(ref, fixed_step, 12.0, 1.0)
+			worst_rot = max(worst_rot, abs(a.pitch - b.pitch), abs(a.yaw - b.yaw), abs(a.roll - b.roll))
+			worst_xy = max(worst_xy, abs(a.translation.x - b.translation.x), abs(a.translation.y - b.translation.y))
+			worst_time = max(worst_time, abs(hit.time - ref.time))
+			peak_pitch = max(peak_pitch, abs(a.pitch))
+			if i == 1 then first_pitch[index] = a.pitch end
+		end
+		expect(worst_rot < 1e-5, "the landing kick's rotation is the shared bank at its running position, as in 1.0.2")
+		expect(worst_xy < 1e-5, "and so is its sideways and up translation")
+		expect(worst_time < 1e-3, "and the rumble and the kick share the one position (at the one-shot frequency while it lasts)")
+		expect(peak_pitch > 0.004, "(and it kicks)")
+	end
+	local differ = false
+	for i = 2, 5 do differ = differ or abs(first_pitch[i] - first_pitch[1]) > 1e-4 end
+	expect(differ, "the kick is not the same at every loop position: it takes the running one, with no fixed start")
+end
+
+do -- the impulse's share of the translation has nothing along the view axis (local Z); the rumble keeps its own
+	local s = Sh.settings()
+	s.amplitude_min, s.amplitude_max = 0.0, 0.0
+	for _, warm in { 5, 90, 200 } do
+		local shake = Sh.new()
+		for _ = 1, warm do Sh.update(shake, fixed_step, 12.0, 1.0, true, s) end
+		Sh.landing_impulse_fraction(shake, 1.0, s)
+		local px, py, pz = 0, 0, 0
+		for _ = 1, 120 do
+			local a = Sh.update(shake, fixed_step, 12.0, 1.0, true, s).translation
+			px, py, pz = max(px, abs(a.x)), max(py, abs(a.y)), max(pz, abs(a.z))
+		end
+		expect(pz == 0.0, "the kick adds nothing along the view axis")
+		expect(px > 0.005 and py > 0.005, "(and it still moves the camera sideways and up)")
+	end
+	local rumble = Sh.settings()
+	rumble.amplitude_min, rumble.amplitude_max = 1.0, 1.0
+	local shake = Sh.new()
+	local z = 0
+	for _ = 1, 120 do z = max(z, abs(Sh.update(shake, fixed_step, 5.0, 1.0, true, rumble).translation.z)) end
+	expect(z > 0.0, "the speed rumble is unchanged along the view axis")
+end
+
 T.done()

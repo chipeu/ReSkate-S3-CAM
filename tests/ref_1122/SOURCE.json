@@ -1,0 +1,5 @@
+{
+  "archive": "release\\Dynamic_Camera-1.1.22-ReSkate-2.1.4-2.zip",
+  "sha256": "422da8e685f121c2dc5cd641d4ee56f086db11e8eae27807ac9ef50d0d8cd0e2",
+  "modules": "All plugin Lua files extracted byte-for-byte from release ZIP"
+}

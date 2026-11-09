@@ -13,6 +13,7 @@
 --   local d = Diag.new()
 --   d:begin_run(); d:push(Diag.sample_of(t, state, manual, frame, snapshot)); d:note("line"); d:tick(now); d:end_run(reason)
 --   Diag.fault(prev, now) -> text or ""      Diag.Recorder.new():push(sample) -> lines
+--   d:landing_frame(Diag.landing_sample_of(t, state, frame, snapshot, root_y), begin) -> the landing dump (camera_log.txt only)
 
 local M = {}
 
@@ -26,6 +27,11 @@ M.log_bytes = 900000 -- and at most this much text: ReSkate writes a file of 1 M
 M.log_burst = 30 -- lines a second sent on to ReSkate.log (it takes 50 from the whole plugin)
 M.log_path = "Mods\\.reskate_plugin_data\\Dynamic_Camera\\diag\\camera_log.txt"
 M.log_flush = 3.0 -- s between writes of the running log
+-- The landing dump (see Diag:landing_frame): a landing that fell at least this far is written out frame by frame.
+M.landing_min_fall = 0.4 -- m
+M.landing_pre = 20 -- frames before the touchdown
+M.landing_post = 40 -- frames after it
+M.landing_dumps = 40 -- dumps in one run
 
 -- What counts as a fault. The gates' own limits where there is one, with room for the vert swing.
 M.pitch_rate_limit = 90.0 -- deg/s of view pitch
@@ -161,6 +167,38 @@ function M.fault(prev, now)
 	return ""
 end
 
+-- ---------------------------------------------------------------- the landing dump
+-- One frame of a landing: where the skater was as the camera was given him (`snapshot`: the root as carried between physics steps,
+-- and the velocity it was handed), the raw root height of the last physics step, and what the camera did with it. `into` is a
+-- table to fill (the ring reuses its slots), or nil.
+function M.landing_sample_of(t, state, frame, s, raw_root_y, into)
+	local d = frame.debug or {}
+	local look_dir = -frame.back
+	local out = into or {}
+	out.t = t
+	out.state = state or 0
+	out.root = s.position
+	out.raw_y = raw_root_y
+	out.velocity = s.velocity
+	out.camera = frame.pos
+	out.pitch = math.asin(math.clamp(look_dir.y, -1, 1)) / RAD
+	out.fov = frame.fov_deg
+	out.impulse = num(d.impulse)
+	out.shake_pitch = num(d.shake_pitch) / RAD
+	out.rattle_pitch = num(d.rattle_pitch) / RAD
+	out.dip = num(d.landing_dip)
+	return out
+end
+
+-- One frame as a log line. `index` counts frames from the touchdown (negative before it), the way the DLL's dump is read.
+function M.landing_line(index, s)
+	return string.format(
+		"s3cam landing f=%+d t=%.3f state %d | root %s raw_y %.3f vel %s | cam %s cam-root %+.3f | pitch %.2f fov %.2f | "
+			.. "shake impulse %.3f pitch %+.3f rattle %+.3f | dip %.3f",
+		index, s.t, s.state, v3(s.root), s.raw_y, v3(s.velocity), v3(s.camera), s.camera.y - s.root.y, s.pitch, s.fov, s.impulse,
+		s.shake_pitch, s.rattle_pitch or 0.0, s.dip)
+end
+
 -- ---------------------------------------------------------------- the ring and the dump state of one run
 local Recorder = {}
 Recorder.__index = Recorder
@@ -209,7 +247,16 @@ Diag.__index = Diag
 
 function M.new()
 	return setmetatable({ rec = Recorder.new(), dump = nil, dump_count = 0, log = {}, log_bytes = 0, log_dirty = false, log_at = 0.0,
-		written = 0, path_told = false, mirror_second = -1, mirror_count = 0, mirror_left_out = 0 }, Diag)
+		written = 0, path_told = false, mirror_second = -1, mirror_count = 0, mirror_left_out = 0, land = M.new_landing_state() }, Diag)
+end
+
+-- The landing dump's ring of the frames before a touchdown, and how many of the frames after one are still to be written.
+function M.new_landing_state()
+	local ring = {}
+	for i = 1, M.landing_pre do
+		ring[i] = {}
+	end
+	return { ring = ring, next = 0, count = 0, left = 0, index = 0, dumps = 0 }
 end
 
 local function write(path, text)
@@ -248,6 +295,7 @@ end
 
 function Diag:begin_run()
 	self.rec = Recorder.new()
+	self.land = M.new_landing_state()
 	self.dump = nil
 	self:tell_path()
 end
@@ -314,6 +362,44 @@ function Diag:note(line, logged)
 	if not logged then
 		self:mirror(line)
 	end
+end
+
+-- A line for camera_log.txt only: the per-frame lines of a landing would be more than ReSkate.log takes.
+function Diag:file_note(line)
+	self:note(line, true)
+end
+
+-- The landing dump, once for every frame while verbose logging is on. `sample` is the frame (Diag.landing_sample_of); `begin` is nil, or,
+-- on the first frame after a touchdown, { fall, fraction } of the landing. A landing that fell at least landing_min_fall is written to
+-- camera_log.txt as landing_pre frames before the touchdown, the touchdown frame (f=0) and landing_post after it, one line each, so a
+-- test can be read frame by frame against another one (the DLL's dump of the same landing). At most landing_dumps in a run.
+function Diag:landing_frame(sample, begin)
+	local land = self.land
+	if land.left > 0 then
+		land.index += 1
+		land.left -= 1
+		self:file_note(M.landing_line(land.index, sample))
+	end
+	if begin and begin.fall >= M.landing_min_fall and land.dumps < M.landing_dumps and land.left == 0 then
+		land.dumps += 1
+		local before = land.count
+		self:file_note(string.format("s3cam landing dump #%d: fell %.2f m (shake %.0f%%) at t=%.3f (%d frames before the touchdown, %d after)",
+			land.dumps, begin.fall, (begin.fraction or 0) * 100, sample.t, before, M.landing_post))
+		local n = M.landing_pre
+		for i = before, 1, -1 do
+			self:file_note(M.landing_line(-i, land.ring[(land.next + n - i) % n + 1]))
+		end
+		self:file_note(M.landing_line(0, sample))
+		land.index = 0
+		land.left = M.landing_post
+	end
+	-- This frame goes into the ring last, so the frames before the next touchdown are the ones before it.
+	local slot = land.ring[land.next + 1]
+	for k, v in sample do
+		slot[k] = v
+	end
+	land.next = (land.next + 1) % M.landing_pre
+	land.count = math.min(land.count + 1, M.landing_pre)
 end
 
 function Diag:write_log()

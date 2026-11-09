@@ -20,7 +20,7 @@ local EVENTS = {
     "load", "unload", "tick", "level_loaded", "level_unloading", "trick_started", "trick_landed", "line_broken", "trick_notes",
     "skater_state", "bail", "board_landed", "body_hit", "bail_end", "launch", "physics_step", "draw", "player_joined", "player_left",
     "touch", "touch_end", "message", "chat", "poll_answer", "poll_closed", "throwdown", "throwdown_ui", "action", "camera_cycle",
-    "screen_closed", "track_changed",
+    "screen_closed", "track_changed", "menu_changed",
 }
 
 local function deep_copy(v)
@@ -374,7 +374,7 @@ function mock.new(opts)
                 -- a modifier
             elseif string.find(word, "^[0-9a-z]$") or NAMED_KEYS[word] or (fn and tonumber(fn) >= 1 and tonumber(fn) <= 12) then
                 keys += 1
-            elseif string.find(word, "^pad%.%a+$") then
+            elseif string.find(word, "^pad%.%a+$") or word == "pad.l3" or word == "pad.r3" then
                 keys += 1
                 pad = true
             else
@@ -398,6 +398,19 @@ function mock.new(opts)
 
     -- overlay
     r.ui = {}
+    -- Custom-screen contract. Historical camera tests have no focused UI
+    -- session; ui_host_126 enables one explicitly for interaction tests.
+    m.screens, m.keys, m.focused = {}, {}, false
+    function r.ui.screen(title, build, options)
+        assert(not m.screens[title] and type(build) == "function", "unique screen builder")
+        m.screens[title] = { build = build, options = options }
+    end
+    function r.ui.open(title) assert(m.screens[title], "registered screen"); m.open_screen = title end
+    function r.ui.close() m.open_screen = nil end
+    function r.input.allowed() return m.focused == true and m.open_screen == nil end
+    function r.input.focus() return { focused=m.focused == true, interface_open=m.open_screen~=nil, gameplay=true } end
+    function r.input.key(key) return m.keys[key] == true end
+    function r.input.cursor() return nil end
     function r.ui.toast(message, level)
         m.toasts[#m.toasts + 1] = { tostring(message), level or "info" }
         return true
@@ -405,6 +418,14 @@ function mock.new(opts)
 
     -- menu: page / panel record their build function; build_page runs them with a recording ui
     r.menu = {}
+    if opts.menu_state then
+        m.state.menu_state={known=true,pause=false,reskate=false,replay_editor=false}
+        m.menu_state_reads=0
+        function r.menu.state()
+            m.menu_state_reads+=1
+            return deep_copy(m.state.menu_state)
+        end
+    end
     function r.menu.page(title, build)
         assert(type(title) == "string" and #title >= 1 and #title <= 24, "reskate.menu.page: the title is 1 to 24 characters")
         assert(m.page_title == nil, "reskate.menu.page: a plugin has one page")

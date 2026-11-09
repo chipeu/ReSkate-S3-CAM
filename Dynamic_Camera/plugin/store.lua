@@ -9,7 +9,7 @@
 --   st:swap_side(side)                         0 swaps, +1 right, -1 left (switches the shoulder mode to Manual)
 --   st:toggle_height()                         Low <-> High (only while options.follow_game_height)
 --   st:set_enabled(bool)
---   st:reset()                                 defaults
+--   st:reset()                                 the built-in Default
 -- st.revision grows with every settings / options change: the glue applies the new settings when it sees it.
 
 local Settings = require("settings")
@@ -46,6 +46,13 @@ function Store:load()
 			reskate.log(string.format("dyncam: %d saved value(s) were out of range or of the wrong type and keep their defaults (first: %s).",
 				report.refused, report.first_refused), "warn")
 		end
+	else
+		-- Nothing saved yet (a fresh install): start from the built-in Default, the tuned baseline.
+		self.settings, self.options = Presets.builtin_values(1)
+	end
+	local other = safe(reskate.storage.get, "offboard_other")
+	if type(other) == "table" and (other.style == "orbit" or other.style == "shoulder") then
+		self.offboard_other = other
 	end
 	local enabled = safe(reskate.storage.get, "enabled")
 	if type(enabled) == "boolean" then
@@ -60,6 +67,22 @@ end
 
 function Store:save()
 	pcall(reskate.storage.set, "settings", Presets.collect_values(self.settings, self.options))
+	if self.offboard_other then
+		pcall(reskate.storage.set, "offboard_other", self.offboard_other)
+	end
+end
+
+-- Off the board: Orbit <-> Shoulder, each keeping its own framing (the one not in use is kept under "offboard_other").
+function Store:switch_offboard_style(base_fov)
+	local ok, Off = pcall(require, "offboard")
+	local ob = self.options.offboard
+	if not ok or type(ob) ~= "table" then
+		return nil
+	end
+	self.offboard_other = Off.switch_style(ob, base_fov, self.offboard_other)
+	self.revision += 1
+	self:save()
+	return ob.style
 end
 
 function Store:save_flags()
@@ -113,9 +136,9 @@ function Store:toggle_height()
 	return self:set_settings(s)
 end
 
+-- Back to the built-in Default (the baseline), not the bare code defaults.
 function Store:reset()
-	self.settings = Settings.defaults()
-	self.options = Presets.new_options()
+	self.settings, self.options = Presets.builtin_values(1)
 	self.revision += 1
 	self:save()
 end

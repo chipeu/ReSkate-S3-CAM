@@ -41,6 +41,12 @@ local PITCH_RATIO = 110.0 / 170.0 -- the game turns up and down slower than side
 local PITCH_MIN, PITCH_MAX = -35.0 * RAD, 55.0 * RAD -- orbit elevation of the camera above its pivot
 local PITCH_REST = 10.0 * RAD -- where a recentre leaves the camera's elevation
 local PITCH_BACK_RATE = 60.0 * RAD -- an elevation outside the limits is eased back at this rate
+-- After stepping off the board the camera keeps the riding camera's angle (a Low camera sits below and looks up). It then
+-- levels out on its own, smoothly: the pull fades in over LEVEL_EASE_IN, slows as it nears the rest angle and stops once
+-- there, or as soon as the player tilts the view with the right stick.
+local LEVEL_EASE_IN = 0.4 -- s
+local LEVEL_KP = 2.5 -- 1/s
+local LEVEL_RATE = 40.0 * RAD -- the cap
 local MOUSE_RAD_PER_COUNT = 0.1 * RAD
 local RECENTRE_MIN_SPEED = 1.0 -- m/s: standing still never recentres
 local RECENTRE_RATE = 90.0 * RAD -- the cap
@@ -122,6 +128,32 @@ function Off.apply_style(t, style, base_fov)
 	t.style = style
 end
 
+-- The values a style owns: switching Orbit <-> Shoulder (double R3, the bind, the menu) keeps each style's own.
+Off.FRAMING = { "distance", "height", "look_height", "offset", "fov", "turn_time", "recentre_after" }
+
+-- Switches t to the other style. `other` is that style's values as last left (a table with .style), or nil for the style's
+-- defaults. Returns the values t had, to keep for switching back. The camera eases to the new framing (Off:update).
+function Off.switch_style(t, base_fov, other)
+	local was = { style = t.style }
+	for _, k in Off.FRAMING do
+		was[k] = t[k]
+	end
+	local to = t.style == "shoulder" and "orbit" or "shoulder"
+	if type(other) == "table" and other.style == to then
+		for _, k in Off.FRAMING do
+			if other[k] ~= nil then
+				t[k] = other[k]
+			end
+		end
+		t.style = to
+		if Off.valid(t) then
+			return was
+		end
+	end
+	Off.apply_style(t, to, base_fov)
+	return was
+end
+
 local function num(v, lo, hi)
 	return type(v) == "number" and v - v == 0 and v >= lo and v <= hi
 end
@@ -179,6 +211,7 @@ function Off:reset_state()
 	self.w_yaw, self.w_el = 0.0, 0.0
 	self.idle_for = 0.0
 	self.rc_gain, self.rc_request = 0.0, false
+	self.level_pending, self.level_gain = false, 0.0
 	self.al_gain = 0.0
 	self.hidden, self.conf = 0.0, 0.0
 	self.l_held, self.l_ref = 0.0, 0.0
@@ -245,6 +278,7 @@ function Off:start(from, body)
 	self.from_pos, self.from_fwd, self.from_up = pos, fwd, S3.normalized(up, UP)
 	self.blend_time = s.transition_time
 	self.need_r0 = true
+	self.level_pending, self.level_gain = true, 0.0
 	self.started = true
 	self.out_pos, self.out_fwd, self.out_up, self.out_fov = pos, fwd, self.from_up, self.fov
 end
@@ -359,6 +393,20 @@ function Off:update(dt, input, body, query)
 		elev += clamp((PITCH_REST - elev) * 2.0, -40.0 * RAD, 40.0 * RAD) * self.rc_gain * scale * dt
 		if self.rc_request and abs(gap) < 2.0 * RAD then
 			self.rc_request = false
+		end
+	end
+
+	-- ---- level out after stepping off (see LEVEL_EASE_IN)
+	if self.level_pending then
+		if abs(sy) > STICK_IDLE or mdy ~= 0 then
+			self.level_pending = false -- the player has the angle
+		else
+			self.level_gain = min(1.0, self.level_gain + dt / LEVEL_EASE_IN)
+			local g = self.level_gain * self.level_gain * (3.0 - 2.0 * self.level_gain)
+			elev += clamp((PITCH_REST - elev) * LEVEL_KP, -LEVEL_RATE, LEVEL_RATE) * g * dt
+			if abs(PITCH_REST - elev) < 0.5 * RAD then
+				self.level_pending = false
+			end
 		end
 	end
 

@@ -1,16 +1,18 @@
 -- Dynamic Camera for ReSkate: the Skate 3 riding camera as a plugin. Entry file; the work is in app.lua.
 --
--- ReSkate gives the entry file and every later call 50 ms of WALL-CLOCK time, and `require` reads the .lua file from disk and compiles
+-- Older ReSkate hosts stop a call past50ms; 2.1.4-3+ warns there and stops past1000ms.
+-- `require` reads the .lua file from disk and compiles
 -- it inside our handler. Compiling all the modules in one go took 28 ms with the files cached and over 200 ms from a cold disk.
--- And while the game loads a level the disk and the CPU are busy, so even one module (a few ms normally) can take over 50 ms and
--- the game stops the plugin ("the tick handler ran longer than 50 ms"). So loading is slow on purpose:
+-- During level loads even one module can exceed50ms. Older hosts halt there; newer hosts
+-- still lose a frame while it runs. Keep staged loading for responsiveness:
 --  * It does not begin until the game has settled: 30 ticks in a row under 40 ms, and a skater in the world (or 20 s gone, for the
 --    main menu, which has no skater but needs the plugin's page). If the game never settles it begins after a minute anyway.
 --  * One module, or one step of App.steps(), a tick.
 --  * After one that took over 15 ms, 10 ticks of rest before the next.
 -- An optional module that is missing is reported and skipped; a missing required one stops the start.
-local modules = { "s3math", "tracker", "rig", "shots", "graph", "trajectory", "air", "shake", "subject", "rider", "offboard",
-	"settings", "camera", "store", "presets", "snapguard", "glue", "diag", "manual", "menu", "commands", "app" }
+local modules = { "s3math", "tracker", "rig", "shots", "graph", "trajectory", "air", "shake", "subject", "rider", "timing", "bodyframe", "offboard",
+	"settings", "crouch", "camera", "builtin_default", "store", "presets", "snapguard", "host_menu", "glue", "diag", "manual", "menu", "commands",
+	"ui_theme", "ui_model", "menu_input", "version_news", "release_notes", "ui_motion", "ui_icons", "ui_layout", "ui_view", "custom_ui", "app" }
 local optional = { offboard = true }
 
 local STEADY_TICKS = 30 -- ticks in a row under STEADY_MS before loading begins

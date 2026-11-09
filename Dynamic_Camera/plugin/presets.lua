@@ -34,6 +34,8 @@ function M.new_options()
 		shot_fov = true, -- the camera drives the FOV; off: the game's own
 		verbose = false, -- detailed logging (dyncam_log 1)
 		follow_game_height = true, -- R3 switches Low / High
+		stable_timing = true, -- camera-only experimental timestamp/recovery path
+		camera_sway = false, -- optional continuous offboard bail-style recovery
 		take_blend_time = 0.5, -- s, crossfade from the game camera when the camera is taken
 		release_blend_time = 0.45, -- s, stepping off the board: the camera eases to the game's on-foot camera before it is handed back (0: at once)
 		offboard_mode = "dynamic", -- "dynamic": this camera keeps the view on foot; "game": the game's own camera (the eased hand-back)
@@ -119,6 +121,9 @@ add("S3Cam.Shoulder.", "shoulder", { { "Offset", "offset", "f" }, { "SwitchTime"
 add("S3Cam.Follow.", "follow", {
 	{ "Strength", "strength", "f" }, { "Dynamic", "dynamic", "b" }, { "DynamicSpeed", "dynamic_speed", "f" },
 	{ "DynamicBoost", "dynamic_boost", "f" }, { "Horizontal", "horizontal", "f" },
+	{ "CrouchEnabled", "crouch_enabled", "b" }, { "CrouchAmount", "crouch_amount", "f" },
+	{ "CrouchMode", "crouch_mode", "f" }, { "TrickPop", "trick_pop", "b" },
+	{ "PopAmount", "pop_amount", "f" }, { "PopMode", "pop_mode", "f" }, { "JointDamping", "joint_damping", "f" },
 })
 add("S3Cam.Fov.", "fov", {
 	{ "ShotLens", "shot_fov", "b" }, { "SpeedFov", "speed_fov", "b" }, { "SpeedFovDegrees", "speed_fov_degrees", "f" },
@@ -146,6 +151,8 @@ add("S3Cam.NativePlus.", "native_plus", {
 })
 add("S3Cam.Options.", "options", {
 	{ "ShotFov", "shot_fov", "b" }, { "Logging", "verbose", "b" }, { "FollowGameHeight", "follow_game_height", "b" },
+	{ "StableTiming", "stable_timing", "b" },
+	{ "CameraSway", "camera_sway", "b" },
 	{ "TakeBlendTime", "take_blend_time", "f" }, { "ReleaseBlendTime", "release_blend_time", "f" },
 })
 -- The off-board camera. S3Cam.OffBoard.Mode and .Style are text choices (below). Absent in older files: the defaults stay.
@@ -168,6 +175,8 @@ local stance_names = { "regular", "goofy" }
 local trick_side_names = { "auto", "left", "right" } -- side 0, -1, +1
 local manual_mode_names = { "fixed", "speed" }
 local distance_mode_names = { "speed", "fixed" }
+local camera_style_names = { "classic", "joint_lock" }
+local joint_target_names = { "head", "chest", "feet", "knee", "hips", "skateboard" }
 local RIDE_FIELDS = { "Mode", "Slow", "Fast", "Fixed" }
 
 local function index_of(text, names)
@@ -323,6 +332,24 @@ local function load_choices(L, camera, options)
 			L.refuse("S3Cam.TrickYaw.Side")
 		end
 	end
+	t = L.text("S3Cam.Follow.CameraStyle")
+	if t then
+		local i = index_of(t, camera_style_names)
+		if i >= 0 then
+			camera.follow.camera_style = camera_style_names[i + 1]
+		else
+			L.refuse("S3Cam.Follow.CameraStyle")
+		end
+	end
+	t = L.text("S3Cam.Follow.JointTarget")
+	if t then
+		local i = index_of(t, joint_target_names)
+		if i >= 0 then
+			camera.follow.joint_target = joint_target_names[i + 1]
+		else
+			L.refuse("S3Cam.Follow.JointTarget")
+		end
+	end
 	local fo = L.fetch("S3Cam.FovOverride")
 	if fo ~= nil then
 		if number_ok(fo) and (fo == 0 or (fo >= 30 and fo <= 120)) then
@@ -351,7 +378,8 @@ local function load_choices(L, camera, options)
 	end
 end
 
--- Brings the settings inside the ranges of the menu's sliders (clamp_to_menu_ranges; keep the menu in step).
+-- Optional menu edit limits for explicit callers. Preset loading uses camera safety
+-- validators instead and must not call this helper, which can retune valid old values.
 function M.clamp_to_menu_ranges(camera)
 	local function into(t, k, lo, hi)
 		local v = t[k]
@@ -380,7 +408,7 @@ function M.clamp_to_menu_ranges(camera)
 	end
 end
 
--- Applies every value `source(key)` has over `camera` and `options`, then clamps to the menu's ranges. A field refused only
+-- Applies every value `source(key)` has over `camera` and `options`, using the camera's safety validators. A field refused only
 -- because it needs a partner later in the table gets a second pass. Returns { refused, first_refused, native_asked }.
 function M.load_values(source, camera, options)
 	local first = new_loader(source)
@@ -397,7 +425,8 @@ function M.load_values(source, camera, options)
 	if first.fetch("S3Cam.DistanceHigh.Min") == nil and first.fetch("S3Cam.DistanceHigh.Max") == nil then
 		camera.distance_high = Settings.copy(camera.distance)
 	end
-	M.clamp_to_menu_ranges(camera)
+	-- Presets can safely use a wider range than the menu offers for new edits. Keep
+	-- accepted values verbatim; opening the menu must not retune an older preset.
 	local function saved(prefix)
 		for _, field in RIDE_FIELDS do
 			if first.fetch(prefix .. field) ~= nil then
@@ -476,6 +505,8 @@ function M.collect_values(camera, options)
 	values["S3Cam.FovOverride"] = tidy(camera.fov_override_deg)
 	local sm = camera.shoulder.mode
 	values["S3Cam.Shoulder.Mode"] = shoulder_names[sm == Settings.ShoulderSide.Manual and 2 or (sm == Settings.ShoulderSide.Auto and 3 or 1)]
+	values["S3Cam.Follow.CameraStyle"] = camera_style_names[camera.follow.camera_style == "joint_lock" and 2 or 1]
+	values["S3Cam.Follow.JointTarget"] = joint_target_names[index_of(camera.follow.joint_target, joint_target_names) + 1] or "head"
 	values["S3Cam.Shoulder.Side"] = side_names[camera.shoulder.side == 1 and 2 or 1]
 	values["S3Cam.Shoulder.Stance"] = stance_names[camera.shoulder.goofy and 2 or 1]
 	local ts = camera.trick_yaw.side
@@ -561,23 +592,26 @@ function M.unique_name(name, taken)
 end
 
 -- ---------------------------------------------------------------- built-ins (code, not files)
-M.builtin_count = 2
-local BUILTIN_NAMES = { "Skate 3", "Close & low" }
+-- One built-in: "Default", the tuned baseline (builtin_default.lua). A fresh install and "Reset to defaults" load it too, so
+-- everyone starts from the same play. It sets the options (off-board camera, logging...) as well as the camera.
+M.builtin_count = 1
+local BUILTIN_NAMES = { "Default" }
 function M.builtin_name(i)
 	return BUILTIN_NAMES[i] or ""
 end
 
--- The settings a built-in sets (everything else at the code defaults).
-function M.builtin_settings(i)
-	local s = Settings.defaults()
-	if i == 2 then -- Close & low. TUNE
-		s.angle = Settings.CameraAngle.Low
-		s.ride_distance.slow = 1.53 -- 0.85x the Low chase distances (its old distance scale)
-		s.ride_distance.fixed = 1.53
-		s.ride_distance.fast = 2.125
-		s.framing.height_degrees = -3.0
+-- The camera settings and the options a built-in sets (keys it leaves out keep the code defaults).
+function M.builtin_values(i)
+	if i ~= 1 then
+		return Settings.defaults(), M.new_options()
 	end
-	return s
+	local camera, options = M.from_values(require("builtin_default"))
+	return camera, options
+end
+
+function M.builtin_settings(i)
+	local camera = M.builtin_values(i)
+	return camera
 end
 
 function M.find_builtin(name)
@@ -717,14 +751,15 @@ function M.list()
 	return cache
 end
 
--- Applies a preset to the store (store.lua): settings and options (a built-in puts the options back to their defaults).
+-- Applies a preset to the store (store.lua): settings and options (a built-in sets both).
 function M.load(store, name)
 	local i = M.find_builtin(name)
 	if i then
-		if not store:set_settings(M.builtin_settings(i)) then
+		local camera, options = M.builtin_values(i)
+		if not store:set_settings(camera) then
 			return result(false, "That preset is not valid.")
 		end
-		store:set_options(M.new_options())
+		store:set_options(options)
 		return result(true, "Loaded '" .. BUILTIN_NAMES[i] .. "'", BUILTIN_NAMES[i])
 	end
 	local stem = M.sanitize_name(name)

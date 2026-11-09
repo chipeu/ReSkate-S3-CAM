@@ -91,5 +91,45 @@ do
 	expect(logged_with(m, "dyncam: after") == 1, "and logging goes on")
 end
 
+-- 5. The landing dump: 20 frames before the touchdown, the touchdown and 40 after, only in camera_log.txt, and only for a real fall.
+do
+    local m = mock.install()
+    local d = Diag.new()
+    d:begin_run()
+    local vc = vector.create
+    local function frame(i)
+        local t = i / 60
+        local f = { pos = vc(0, 1.5 + i * 0.001, -2), back = vc(0, 0.3, 0.95), up = vc(0, 1, 0), fov_deg = 70,
+            debug = { impulse = 2.0, shake_pitch = 0.01, landing_dip = 0.03 } }
+        local s = { position = vc(0, 1.0, 0), velocity = vc(0, -3, 6) }
+        return Diag.landing_sample_of(t, i < 100 and 201 or 100, f, s, 0.98, {})
+    end
+    for i = 1, 99 do d:landing_frame(frame(i), nil) end
+    d:landing_frame(frame(100), { fall = 0.2, fraction = 0.1 }) -- too small a fall: no dump
+    for i = 101, 130 do d:landing_frame(frame(i), nil) end
+    expect(#d.log == 0, "a fall under 0.4 m writes nothing")
+    for i = 131, 199 do d:landing_frame(frame(i), nil) end
+    d:landing_frame(frame(200), { fall = 3.9, fraction = 1.0 })
+    for i = 201, 260 do d:landing_frame(frame(i), nil) end
+    expect(#d.log == 1 + 20 + 1 + 40, "a header, 20 frames before, the touchdown and 40 after (" .. #d.log .. ")")
+    expect(string.find(d.log[1], "landing dump #1: fell 3.90 m (shake 100%)", 1, true) ~= nil, "the header says the fall and the shake")
+    expect(string.find(d.log[2], "f=-20 ", 1, true) ~= nil and string.find(d.log[21], "f=-1 ", 1, true) ~= nil
+        and string.find(d.log[22], "f=+0 ", 1, true) ~= nil and string.find(d.log[62], "f=+40 ", 1, true) ~= nil, "frames are counted from the touchdown")
+    expect(string.find(d.log[22], "t=3.333", 1, true) ~= nil and string.find(d.log[2], "t=3.000", 1, true) ~= nil, "the frames are the right ones")
+    expect(string.find(d.log[22], "cam-root +0.700", 1, true) ~= nil and string.find(d.log[22], "| dip 0.030", 1, true) ~= nil
+        and string.find(d.log[22], "shake impulse 2.000", 1, true) ~= nil, "a line carries the camera height over the root and the dip")
+    expect(logged_with(m, "landing f=") == 0 and logged_with(m, "landing dump") == 0, "none of it goes to ReSkate.log")
+    d:tick(10)
+    expect(string.find(m.files["diag/camera_log.txt"] or "", "landing f=+40", 1, true) ~= nil, "it is in camera_log.txt")
+    for i = 1, Diag.landing_dumps + 5 do
+        for k = 1, 3 do d:landing_frame(frame(300 + k), nil) end
+        d:landing_frame(frame(304), { fall = 1.0, fraction = 0.3 })
+        for k = 1, 41 do d:landing_frame(frame(305 + k), nil) end
+    end
+    local dumps = 0
+    for _, l in d.log do if string.find(l, "landing dump #", 1, true) then dumps += 1 end end
+    expect(dumps <= Diag.landing_dumps, "at most landing_dumps in a run (" .. dumps .. ")")
+end
+
 T.done()
 if T.failures > 0 then error("test_diag failed") end

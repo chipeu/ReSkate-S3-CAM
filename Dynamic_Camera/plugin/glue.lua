@@ -30,8 +30,15 @@ local Settings = require("settings")
 local S3 = require("s3math")
 local Subject = require("subject")
 local Rider = require("rider")
+local Timing = require("timing")
+local BodyFrame = require("bodyframe")
+local ViewBlend=require("view_blend")
+local HostMenu=require("host_menu")
+local Crouch = require("crouch")
 local SnapGuard = require("snapguard")
 local DiagModule = require("diag")
+local CollisionEscape = require("collision_escape")
+local JointLock = require("jointlock")
 -- Optional at start (main.lua): without it the camera is handed back on foot, as in the "game" mode.
 local has_off, Off = pcall(require, "offboard")
 if not has_off then
@@ -48,8 +55,21 @@ local ZERO = vcreate(0, 0, 0)
 
 -- ---------------------------------------------------------------- constants (s3cam.cpp)
 local RAY_CAP = 60 -- of the 64 a tick the API allows; the rest is slack
+local ROOT_CLOCK_SEPARATION = 0.004 -- m the two root-clock models must differ by before a frame counts as evidence
+local ROOT_CLOCK_MARGIN = 2 -- net votes needed to change the verdict, so one noisy frame cannot flip it
+local ROOT_CLOCK_VOTES = 12 -- evidence kept; bounds how long a change of clock takes to be believed
+local TOUCHDOWN_RECOVERY = 0.20 -- s of position easing at contact, for a body animation discontinuity
+local TOUCHDOWN_WATCH = 0.15 -- s after contact in which a smaller one-frame eye step counts as a jump
+local GLIDE_SPEED = 6.0 -- m/s of final-safety travel towards a clear core eye, instead of a one-frame cut
+local HARD_FLOOR_MARGIN = 0.18 -- m: below this the eye is really in the floor and is corrected at once
+local FLOOR_ATTACK = 1.6 -- m/s the comfort band above that margin eases in
+local FLOOR_STEP = 0.03 -- m the surface under the eye must rise in one frame to count as a step, not a slope
+local FLOOR_HOLD = 0.20 -- s the offset is kept after the last contact, so a run of curbs reads as one lift
+local FLOOR_RELEASE = 0.30 -- s, critically damped return
+local AUTO_COLLISION_RADIUS=Settings.collision().radius
 local MAX_STEPS_PER_TICK = 4 -- fixed 1/60 s camera steps one tick may ask for (about 12 rays each)
 local MAX_DT = MAX_STEPS_PER_TICK / 60
+local R3_DOUBLE_CLICK = 0.35 -- s between two R3 clicks on foot that switch Orbit / Shoulder
 local GROUND_RAY_ABOVE, GROUND_RAY_BELOW = 0.1, 10.0
 local START_HIT_SKIP, START_HIT_RESTART = 0.02, 0.03
 local FALLING_CHORD_LIFT = 0.25
@@ -88,6 +108,7 @@ local ONFOOT_MAX_DISTANCE = 15.0 -- m; a game camera further than this from the 
 local FALLBACK_BACK, FALLBACK_UP, FALLBACK_LOOK = 2.6, 1.5, 1.0 -- m, when nothing was learned or captured
 -- The off-board camera follows the body: hips, spine and head joints of skater_skeleton.h (32 joints are shared by all plugins).
 local HIPS_JOINT, SPINE_JOINT, HEAD_JOINT = 7, 44, 103
+local RIGHT_KNEE_JOINT, LEFT_KNEE_JOINT = 9, 342
 local CENTRE_HIPS_WEIGHT = 0.6 -- the centre is 0.6 hips + 0.4 spine
 local HIPS_TO_CENTRE = 0.18 -- m above the hips, when only they are readable
 local FALLBACK_CENTRE_UP = 0.9 -- m above the skater's position, when no joint is readable
@@ -108,8 +129,11 @@ function Glue.new(deps)
 	self.cam = deps.camera.new()
 	self.applied_revision = -1
 	self.snap = Subject.new_snapshot()
-	self.extras = { base_fov_deg = 0.0 }
+	self.extras = { base_fov_deg = 0.0, pop_seed = {valid=false} }
 	self.rider = Rider.new()
+	self.timing = Timing.new()
+	self.body_frame=BodyFrame.new()
+	self.render_delta = ZERO
 	self.running = false
 	self.started = 0.0
 	self.last_pose = 0.0
@@ -121,14 +145,29 @@ function Glue.new(deps)
 	self.base_fov = 0.0
 	-- Stepping off the board: the camera eases to where the game's own on-foot camera will be before it is handed back.
 	self.handback = nil -- nil, or { started, duration, from = { pos, forward, up, fov }, fov_to } while easing
-	self.last_shown = { pos = nil, forward = nil, up = nil, fov = nil } -- what camera.set was given last (the ease starts there)
+	self.sway_presented = {}
+	self.last_shown = { pos = nil, forward = nil, up = nil, fov = nil } -- base off-board pose; sway_presented starts a smooth remount
 	-- The snap guard (snapguard.lua) sits in show(), in front of every camera.set. snap_guard_on = false lets a test see the paths alone.
 	self.guard = SnapGuard.new()
+	self.collision_escape = CollisionEscape.new()
+	self.joint_lock = JointLock.new()
+	self.joint_baseline = nil
+	self.joint_delta = 0.0
+	self.joint_switch_offset = 0.0
+	self.joint_missing_time = 0.0
+	self.joint_missing_root = nil
+	self.joint_style = "classic"
+	self.joint_target = nil
+	self.collision_escape_at = 0.0
+	self.rail_recent_until = 0.0
+	self.rail_context = false
 	self.snap_guard_on = true
 	self.snaps = { position = 0, turn = 0, fov = 0 } -- jumps smoothed since the plugin loaded, by what made them ...
 	self.snaps_by_path = {} -- ... and by which path was drawing
 	self.snaps_total = 0
 	self.path_hint, self.path_hint_until = nil, 0.0 -- the name of a transition for the counts (board->foot ...), while it lasts
+	self.impact = 0.0 -- the landing bounce's drop in the pose about to be shown (the guard judges the pose without it)
+	self.rattle = nil -- the landing rattle's rotation in the pose about to be shown (pitch, yaw, roll; the guard judges the pose without it)
 	self.pulled = false -- the camera slid in against a wall this tick (the guard lets that through)
 	self.released_at = nil -- when the camera was last given back (a short release lets the retake start from our last pose)
 	self.game_pose_ok = false -- the game's camera as read looks like a real game camera (plausible fov, near the skater)
@@ -181,6 +220,8 @@ function Glue.new(deps)
 	self.report_at = 0.0
 	self.errors, self.error_logged_at = 0, -100.0
 	self.pad_r3 = false
+	self.pad_l3 = false
+	self.r3_at = -100.0 -- the last single R3 click on foot
 	self.menu_open = false
 	-- per-flight logging (watch_frame)
 	self.shot = ""
@@ -188,11 +229,35 @@ function Glue.new(deps)
 	self.landing_pending, self.landed_report_at = false, 0.0
 	self.flight = { fov_min = 0.0, fov_max = 0.0, turn = 0.0, pull = 0.0, prev_back = nil, prev_fov = 0.0 }
 	self.predicted = nil
+	self.landing_dump, self.land_sample = nil, nil -- the landing dump: the touchdown to start it with, the frame being recorded
 	local g = self
 	self.query = function(from, to, want_normal)
 		return g:ground_query(from, to, want_normal)
 	end
+	-- Adaptive orbit probes use only headroom beyond the legacy collision work.
+	-- The existing final presentation guard still has the SDK's remaining slack.
+	self.extras.query_remaining = function()
+		return max(0, RAY_CAP-8-g.rays_tick)
+	end
+	self.extras.final_query = function(from,to,reserve)
+		if g.rays_tick>=64-(reserve or 0) then return nil,false end
+		local errors=g.ray_errors
+		local hit=g:cast(from,to,true)
+		return hit,g.ray_errors==errors
+	end
 	return self
+end
+
+function Glue:reset_joint_lock()
+	JointLock.reset(self.joint_lock,self.skater_position.y)
+	self.joint_baseline=nil
+	self.joint_delta=0.0
+	self.joint_switch_offset=0.0
+	self.joint_missing_time=0.0
+	self.joint_missing_root=nil
+	self.joint_valid=false
+	self.joint_style="classic"
+	self.joint_target=nil
 end
 
 local function now_s()
@@ -205,6 +270,15 @@ function Glue:log_verbose(text)
 	end
 end
 
+-- Off the board: Orbit <-> Shoulder (double R3, the bind). The camera eases to the other framing.
+function Glue:switch_offboard_style(why)
+	local style = self.store:switch_offboard_style(self.base_fov)
+	if style then
+		self:note(string.format("off-board view: %s (%s)", style == "shoulder" and "Shoulder" or "Orbit", why))
+	end
+	return style
+end
+
 function Glue:note(text, level)
 	reskate.log("dyncam: " .. text, level)
 	if self.diag and self.store.options.verbose then
@@ -212,9 +286,134 @@ function Glue:note(text, level)
 	end
 end
 
+-- Compact diagnostic counters only. No frame strings/history dumps or mirrored
+-- file writes in the render path. Format at most one short SDK log line/sec.
+local function angle_delta(a,b)
+ return (a-b+180)%360-180
+end
+function Glue:trace_camera_frame(now, original, before_guard, after_guard, final, cause, correction, shown_forward, shown_fov, shown_up)
+ if self.source~="ride" or self.blend<1 or not self.snap.onboard then
+  self.camera_trace=nil
+  return
+ end
+ local tr=self.camera_trace
+ if not tr then
+  tr={next_at=now+1,frames=0,handoffs=0,turns=0,peak_dt=0,peak_correction=0,peak_relative=0,peak_pitch=0,peak_yaw=0,peak_rays=0}
+  self.camera_trace=tr
+ end
+ local d=self.frame and self.frame.debug or {}
+ local relative=final-self.skater_position
+ local forward=shown_forward or vcreate(0,0,1)
+ local core_forward=self.frame and self.frame.back and -self.frame.back or forward
+ local pitch=math.asin(math.clamp(forward.y,-1,1))*180/math.pi
+ local core_pitch=math.asin(math.clamp(core_forward.y,-1,1))*180/math.pi
+ local yaw=math.atan2(forward.x,forward.z)*180/math.pi
+ local core_yaw=math.atan2(core_forward.x,core_forward.z)*180/math.pi
+ local yaw_offset=angle_delta(yaw,core_yaw)
+ local effects=((d.shake_pitch or 0)+(d.rattle_pitch or 0))*180/math.pi
+ local continuous=tr.at and now>tr.at and now-tr.at<0.1 and not d.reset
+ if continuous then
+  local step=vmagnitude(relative-tr.relative)
+  if step>tr.peak_relative then
+   tr.peak_relative=step;tr.peak_at=now;tr.peak_state=self.snap.physics_state or 0
+   tr.peak_ref=d.framing_root_delta or 0;tr.peak_flags=self.display_flags or 0
+   tr.peak_gap=d.motion_recovery_gap or 0
+   tr.peak_lift,tr.peak_lift_reason=self.floor_lift_need or 0,self.floor_lift_reason or 0
+   tr.peak_core=vmagnitude((original-self.skater_position)-(tr.core or (original-self.skater_position)))
+   tr.peak_align=vmagnitude((before_guard-original)-(tr.align or (before_guard-original)))
+   tr.peak_guard=vmagnitude((after_guard-before_guard)-(tr.guard or (after_guard-before_guard)))
+   tr.peak_safety=vmagnitude((final-after_guard)-(tr.safety or (final-after_guard)))
+  end
+  local pitch_step=math.abs(pitch-tr.pitch)
+  if pitch_step>tr.peak_pitch then
+   tr.peak_pitch=pitch_step;tr.pitch_at=now;tr.pitch_state=self.snap.physics_state or 0
+   tr.pitch_core=core_pitch-(tr.core_pitch or core_pitch)
+   tr.pitch_correction=(pitch-core_pitch)-(tr.pitch_offset or (pitch-core_pitch))
+   tr.pitch_effects=effects-(tr.effects or effects)
+  end
+  local yaw_step=math.abs(angle_delta(yaw,tr.yaw))
+  if yaw_step>tr.peak_yaw or not tr.yaw_at then
+   tr.peak_yaw=yaw_step;tr.yaw_at=now;tr.yaw_state=self.snap.physics_state or 0
+   tr.yaw_core=angle_delta(core_yaw,tr.core_yaw or core_yaw)
+   tr.yaw_correction=angle_delta(yaw_offset,tr.yaw_offset or yaw_offset)
+   tr.yaw_flags=self.display_flags or 0
+   tr.yaw_error=((d.motion_trick_target or 0)-(d.motion_trick_value or 0))*180/math.pi
+   local centre=self.skater_position+vcreate(0,self.frame_bounds and self.frame_bounds.centre or 0.1,0)-final
+   local up=shown_up or UP
+   local right=S3.normalized(vcross(forward,up),vcreate(-1,0,0))
+   local depth=vdot(centre,forward)
+   local scale=max(0.01,depth*math.tan(math.rad((shown_fov or 70)*0.5)))
+   tr.body_x,tr.body_y,tr.body_depth=clamp(vdot(centre,right)/scale,-99,99),clamp(vdot(centre,up)/scale,-99,99),depth
+  end
+  if tr.follow~=d.motion_pop_follow or tr.target~=(d.terrain_target or 0) then tr.handoffs+=1 end
+  if tr.turn~=(d.motion_trick_target or 0) then tr.turns+=1 end
+ end
+ -- Joint noise relative to the root (measurement only): classic riding already read both joints this tick for
+ -- read_frame_bounds (cached by sample_joint); other styles pay for these two reads. Nil-safe, never steers.
+ do
+  local okj,head,hips=pcall(function() return self:sample_joint(HEAD_JOINT),self:sample_joint(HIPS_JOINT) end)
+  if not okj then head,hips=nil,nil end
+  local hips_off,head_off=hips and hips-self.skater_position or nil,head and head-self.skater_position or nil
+  if not hips_off then tr.hips_missing=(tr.hips_missing or 0)+1 end
+  if continuous then
+   if hips_off and tr.hips_off then tr.peak_hips=max(tr.peak_hips or 0,vmagnitude(hips_off-tr.hips_off)) end
+   if head_off and tr.head_off then tr.peak_head=max(tr.peak_head or 0,vmagnitude(head_off-tr.head_off)) end
+  end
+  tr.hips_off,tr.head_off=hips_off,head_off
+ end
+ tr.at,tr.relative,tr.pitch,tr.yaw=now,relative,pitch,yaw
+ tr.core_pitch,tr.pitch_offset,tr.effects=core_pitch,pitch-core_pitch,effects
+ tr.core_yaw,tr.yaw_offset=core_yaw,yaw_offset
+ tr.core,tr.align,tr.guard,tr.safety=original-self.skater_position,before_guard-original,after_guard-before_guard,final-after_guard
+ tr.follow,tr.target,tr.turn=d.motion_pop_follow,d.terrain_target or 0,d.motion_trick_target or 0
+ tr.peak_side=max(tr.peak_side or 0,math.abs(d.ramp_side or 0))
+ tr.peak_orbit=max(tr.peak_orbit or 0,self.cam and self.cam.adaptive_orbit and math.abs(self.cam.adaptive_orbit.yaw or 0) or 0)
+ tr.frames+=1
+ tr.peak_dt=max(tr.peak_dt,(self.render_dt or 0)*1000)
+ tr.peak_correction=max(tr.peak_correction,correction or 0)
+ tr.peak_rays=max(tr.peak_rays,self.rays_tick or 0);tr.capped=tr.capped or self.capped_this_tick==true
+ if (correction or 0)>0.1 or (d.motion_recovery_gap or 0)>0.1 then tr.recover_since=tr.recover_since or now else tr.recover_since=nil end
+ if now<tr.next_at then return end
+ tr.next_at=now+1
+ -- One SDK line, no frame strings, history ring, extra rays or disk writes.
+ reskate.log(string.format("dyncam: motion128 t=%.2f n=%d state=%d dtMax=%.1fms corrMax=%.3f relMax=%.3f pitchMax=%.2f yawMax=%.2f peak=%.3f/%d/%x stages=%.3f/%.3f/%.3f/%.3f pPeak=%.3f/%d/%.2f/%.2f/%.2f yPeak=%.3f/%d/%.2f/%.2f/%x/%.1f body=%.2f/%.2f/%.2f rec=%.2f/%.2f handoffs=%d lift=%.2f/%d w=%.2f reason=%s refDY=%.2f rays=%d capped=%s workMax=%.2fms drawMax=%.2fms clk=%s side=%.1f orb=%.1f jnt=%.3f/%.3f/%d",
+  now,tr.frames,self.snap.physics_state or 0,tr.peak_dt,tr.peak_correction,tr.peak_relative,tr.peak_pitch,tr.peak_yaw,
+  tr.peak_at or now,tr.peak_state or self.snap.physics_state or 0,tr.peak_flags or 0,
+  tr.peak_core or 0,tr.peak_align or 0,tr.peak_guard or 0,tr.peak_safety or 0,
+  tr.pitch_at or now,tr.pitch_state or self.snap.physics_state or 0,tr.pitch_core or 0,tr.pitch_correction or 0,tr.pitch_effects or 0,
+  tr.yaw_at or now,tr.yaw_state or self.snap.physics_state or 0,tr.yaw_core or 0,tr.yaw_correction or 0,tr.yaw_flags or 0,tr.yaw_error or 0,
+  tr.body_x or 0,tr.body_y or 0,tr.body_depth or 0,tr.peak_gap or 0,tr.recover_since and now-tr.recover_since or 0,
+  tr.handoffs,tr.peak_lift or 0,tr.peak_lift_reason or 0,d.terrain_weight or 0,d.terrain_reason or "none",tr.peak_ref or 0,tr.peak_rays,tostring(tr.capped==true),self.tick_cost_max or 0,self.draw_cost_max or 0,self.root_render_sampled and "R" or "S",math.deg(tr.peak_side or 0),math.deg(tr.peak_orbit or 0),tr.peak_hips or 0,tr.peak_head or 0,tr.hips_missing or 0),"info")
+ self.tick_cost_max,self.draw_cost_max=0,0
+ tr.peak_side,tr.peak_orbit=0,0
+ tr.peak_hips,tr.peak_head,tr.hips_missing=0,0,0
+ tr.frames,tr.handoffs,tr.turns,tr.peak_dt,tr.peak_correction,tr.peak_relative,tr.peak_pitch,tr.peak_yaw,tr.peak_rays=0,0,0,0,0,0,0,0,0
+ tr.peak_at,tr.peak_state,tr.peak_core,tr.peak_align,tr.peak_guard,tr.peak_safety=nil,nil,nil,nil,nil,nil
+ tr.pitch_at,tr.pitch_state,tr.pitch_core,tr.pitch_correction,tr.pitch_effects=nil,nil,nil,nil,nil
+ tr.yaw_at,tr.yaw_state,tr.yaw_core,tr.yaw_correction,tr.yaw_flags=nil,nil,nil,nil,nil
+ tr.peak_ref,tr.peak_flags,tr.peak_gap,tr.capped,tr.peak_lift,tr.peak_lift_reason=nil,nil,nil,nil,nil,nil
+end
+
+-- Small clearance violations may have a clear lift at the recovering eye.
+-- Centre travel plus five width/headroom probes; leave one ray for
+-- the canonical floor fallback. No cached world floor authorises a move.
+local LIFT_AXES={ZERO,vcreate(1,0,0),vcreate(-1,0,0),vcreate(0,0,1),vcreate(0,0,-1)}
+function Glue:clearance_lift(from,pos,height,radius)
+ if self.rays_tick+#LIFT_AXES+1>63 then return nil,2 end
+ local raised=vcreate(pos.x,height,pos.z)
+ if self:cast(from,raised,true) then return nil,1 end
+ local cap=UP*radius
+ for _,axis in LIFT_AXES do
+  local offset=axis*radius
+  if self:cast(from+offset,raised+offset+cap,true) then return nil,1 end
+ end
+ return raised,0
+end
+
 -- ---------------------------------------------------------------- rays
-function Glue:cast(from, to)
-	if self.rays_tick >= RAY_CAP then
+function Glue:cast(from, to, final)
+	local limit=final and 64 or RAY_CAP
+	if self.rays_tick >= limit then
 		self.capped_this_tick = true
 		return nil
 	end
@@ -298,11 +497,17 @@ end
 
 -- ---------------------------------------------------------------- physics_step
 function Glue:on_physics_step(e)
+	self.physics_sequence=(self.physics_sequence or 0)+1
+	if type(e.at)=="number" and e.at-e.at==0 and e.at>0 then self.step_at=e.at/1000 end
 	if e.seconds and e.seconds > 0 then
 		self.step_seconds = e.seconds
 	end
 	local v = e.velocity
 	if v and v[1] and v[2] and v[3] then
+		if type(e.seconds)=="number" and e.seconds>0 and e.seconds<=0.1 then
+			local previous=self.step_velocity and self.step_velocity.y or v[2]
+			self.physics_height=(self.physics_height or 0)+0.5*(previous+v[2])*e.seconds
+		end
 		self.step_velocity = vcreate(v[1], v[2], v[3])
 	end
 	if e.ragdoll ~= nil then
@@ -313,9 +518,28 @@ function Glue:on_physics_step(e)
 end
 
 -- ---------------------------------------------------------------- observe (s3cam_observe)
+local function finite_number(n)
+	return type(n) == "number" and n - n == 0
+end
+
+local function quaternion_components(q)
+	if type(q) ~= "table" then return nil end
+	-- ReSkate 2.1.3 returns {x, y, z, w} at indices 1..4. Keep named-field poses accepted too.
+	local qx, qy, qz, qw
+	if q[1] ~= nil then
+		qx, qy, qz, qw = q[1], q[2], q[3], q[4]
+	else
+		qx, qy, qz, qw = q.x, q.y, q.z, q.w
+	end
+	if not (finite_number(qx) and finite_number(qy) and finite_number(qz) and finite_number(qw)) then return nil end
+	local norm = qx * qx + qy * qy + qz * qz + qw * qw
+	if not finite_number(norm) or norm < 1e-8 then return nil end
+	return qx, qy, qz, qw
+end
+
 local function rotate(q, v)
 	-- v rotated by the quaternion {x, y, z, w}
-	local qx, qy, qz, qw = q.x, q.y, q.z, q.w
+	local qx, qy, qz, qw = quaternion_components(q)
 	local tx = 2 * (qy * v.z - qz * v.y)
 	local ty = 2 * (qz * v.x - qx * v.z)
 	local tz = 2 * (qx * v.y - qy * v.x)
@@ -328,7 +552,7 @@ Glue.rotate = rotate
 function Glue:deck_pitch(motion, forward)
 	local pose = motion and (motion.deck or motion.place)
 	local q = pose and pose.rotation
-	if not q or q.x == nil then
+	if quaternion_components(q) == nil then
 		return nil
 	end
 	local flat = S3.normalized(vcreate(forward.x, 0, forward.z), vcreate(0, 0, 1))
@@ -361,10 +585,7 @@ end
 -- The joints are read every tick on the board (asking keeps a joint read for 2 s; nil is normal on the first call).
 -- Returns pitch (degrees), centre, or nil when a foot is unreadable or the spacing is not that of two feet on a board.
 function Glue:feet_pose(velocity, forward)
-	local ok_r, right = pcall(reskate.skater.joint, RIGHT_FOOT_JOINT)
-	local ok_l, left = pcall(reskate.skater.joint, LEFT_FOOT_JOINT)
-	local a = ok_r and right and right.position
-	local b = ok_l and left and left.position
+	local a,b=self:sample_joint(RIGHT_FOOT_JOINT),self:sample_joint(LEFT_FOOT_JOINT)
 	if not a or not b or not finite3(a) or not finite3(b) then
 		return nil
 	end
@@ -424,6 +645,35 @@ function Glue:observe(now)
 	end
 	obs.ragdoll = ragdoll
 	local position = s.position
+	-- Marker returns are discontinuities, not movement for the anchor/transition trackers.
+	-- The API's pending flag also catches returns shorter than the camera's distance cutoff.
+	local pending = t.teleport_pending == true
+	local old = self.observed_position
+	local elapsed = self.observed_at and now - self.observed_at or 0.0
+	local distance = old and vmagnitude(position - old) or 0.0
+	local allowance = max(vmagnitude(velocity), self.observed_speed or 0.0) * max(elapsed, 1 / 60) * 2.0 + 0.75
+	-- A dismount changes the root's source to the on-foot body. A small source offset
+	-- must retain its normal transition, including a hippy jump.
+	local root_switch = state == OFFBOARD_STATE and self.state ~= OFFBOARD_STATE
+	local moved = old ~= nil and distance > allowance and (not root_switch or distance > 5.0)
+	local returned = old ~= nil and (moved or (self.teleport_pending and not pending))
+	self.teleport_pending = pending
+	self.observed_position, self.observed_at, self.observed_speed = position, now, vmagnitude(velocity)
+	if returned then
+		self.return_cut = true
+		self.collision_escape:reset()
+		self.eye_base_last=nil
+		Rider.reset(self.rider)
+		if self.manual_detector then self.manual_detector:reset() end
+		velocity = (motion and motion.velocity) or ZERO
+		self.step_velocity, self.obs_velocity = velocity, velocity
+		self.last_step_at = now
+		self.physics_root, self.root_changed_at = nil, now
+		self.ground_normal, self.ground_normal_raw = UP, UP
+		self.hippy = false
+		if self.running and distance >= 8.0 then self.return_black_at = now end
+		self:log_verbose(string.format("s3cam return cut: %.2f m (pending %s)", distance, tostring(pending)))
+	end
 	local h = s.heading
 	local forward = vcreate(math.sin(h), 0, math.cos(h))
 	local snap = self.snap
@@ -431,7 +681,12 @@ function Glue:observe(now)
 	snap.position = position
 	snap.forward = forward
 	-- On the board the camera follows the rider, not the board (see rider.lua).
-	snap.velocity = Rider.update(self.rider, now, position, velocity, onboard, self.step_seconds)
+	snap.velocity = Rider.update(self.rider, now, position, velocity, onboard, self.step_seconds,
+		self.store.options.stable_timing and self.physics_sequence or nil)
+	local follow=self.store.settings.follow
+	local neutral_vertical=follow.camera_style~="joint_lock" and (not follow.crouch_enabled or not follow.trick_pop)
+	snap.physical_velocity = neutral_vertical and (self.step_velocity or (motion and motion.velocity)) and velocity or nil
+	snap.physical_height = self.physics_height
 	snap.physics_state = state
 	snap.onboard = onboard
 	snap.manual = false
@@ -446,9 +701,19 @@ function Glue:observe(now)
 	if not ground and steep then
 		ground = self:cast(position + vcreate(0, GROUND_RAY_ABOVE, 0), position - vcreate(0, GROUND_RAY_BELOW, 0))
 	end
+	snap.ground_valid = ground ~= nil
+	if ground then snap.ground_height = ground.y end
 	if ground then
 		snap.ground_clearance = along_slope and vmagnitude(position - ground) or position.y - ground.y
 		local n = self:try_normal_at(ground)
+		if along_slope then
+			-- Project the measured plane under the root: a normal-ray hit is horizontally displaced.
+			if n and n.y >= 0.5 then
+				snap.ground_height = ground.y - (n.x * (position.x - ground.x) + n.z * (position.z - ground.z)) / n.y
+			else
+				snap.ground_valid = false -- a fresh hit with no usable plane cannot calibrate crouch height
+			end
+		end
 		if n then
 			self.ground_normal_raw = n
 			local gap = clamp(now - self.ground_normal_at, 0.0, 0.25)
@@ -462,10 +727,12 @@ function Glue:observe(now)
 
 	-- The board's real centre: manuals and grinds aim at it.
 	snap.board_valid = false
+	self.raw_board_position=nil
 	local place = motion and (motion.place or motion.deck)
 	if place and place.position and finite3(place.position) and vmagnitude(place.position - position) < 2.5 then
 		snap.board_valid = true
 		snap.board_position = place.position
+		self.raw_board_position=place.position
 	end
 
 	-- Board pitch against the ground: manual detection. The deck's rotation when the game gives it, else the feet.
@@ -480,6 +747,7 @@ function Glue:observe(now)
 				if not snap.board_valid and finite3(centre) and vmagnitude(centre - position) < 2.5 then
 					snap.board_valid = true
 					snap.board_position = centre
+					self.raw_board_position=centre
 				end
 			end
 		end
@@ -494,9 +762,15 @@ function Glue:observe(now)
 		if prev ~= nil and Subject.is_air_state(prev) and not Subject.is_air_state(state) then
 			self.landed_at = now
 		end
+		local score
+		if reskate.score and type(reskate.score.current)=="function" then
+			local ok,value=pcall(reskate.score.current)
+			if ok and type(value)=="table" then score=value end
+		end
 		local det = self.manual_detector
 		local on = det ~= nil and det:update(now, state, onboard, Subject.is_air_state(state), Subject.is_grind_state(state),
-			self.board_pitch_ok and self.board_pitch or nil)
+			self.board_pitch_ok and self.board_pitch or nil,
+			(source=="deck" and snap.ground_valid and self.ground_normal_raw.y>0.95) and vmagnitude(snap.velocity) or nil, score, self.manual_pad)
 		if on ~= self.manual then
 			self.manual = on
 			if on then self.manuals += 1 end
@@ -554,13 +828,73 @@ function Glue:observe(now)
 	if position ~= self.physics_root then
 		self.physics_root = position
 		self.root_changed_at = now
+	end
+	if self.store.options.stable_timing then
+		local timed_velocity=snap.physical_velocity and vcreate(snap.velocity.x,snap.physical_velocity.y,snap.velocity.z) or snap.velocity
+		local p,delta=Timing.update(self.timing,now,position,timed_velocity,self.step_seconds,self.step_at,
+			Subject.is_air_state(state),returned)
+		-- Which clock moves this root? A root sampled at render time already sits
+		-- where the body is drawn, so a second physics-age lead would beat against
+		-- the frame rate. At about 60 FPS a frame with no physics step is rare, so
+		-- also compare each observed move with both clock models. The verdict
+		-- persists until contrary evidence; a vertical launch has no XZ to measure.
+		if returned then self.root_render_sampled,self.root_render_sample,self.root_clock_votes=false,nil,0 end
+		local previous_root=self.root_render_sample
+		if previous_root then
+			local move=position-previous_root
+			local steps=(self.physics_sequence or 0)-(self.root_render_sequence or 0)
+			local frame=self.root_render_at and now-self.root_render_at or 0
+			local step_time=self.step_seconds or 1/60
+			local votes=self.root_clock_votes or 0
+			if vmagnitude(timed_velocity)>=1 and frame>0 and frame<0.1 then
+				local moved=vdot(move,move)>1e-8
+				if steps==0 then votes+=moved and 3 or -3
+				else
+					-- The two models must predict measurably different moves.
+					local rendered_error=vmagnitude(move-timed_velocity*frame)
+					local stepped_error=vmagnitude(move-timed_velocity*(steps*step_time))
+					local separation=vmagnitude(timed_velocity)*abs(frame-steps*step_time)
+					if separation>ROOT_CLOCK_SEPARATION and abs(rendered_error-stepped_error)>separation*0.5 then
+						votes+=rendered_error<stepped_error and 1 or -1
+					end
+				end
+				votes=clamp(votes,-ROOT_CLOCK_VOTES,ROOT_CLOCK_VOTES)
+				if votes>=ROOT_CLOCK_MARGIN then self.root_render_sampled=true elseif votes<=-ROOT_CLOCK_MARGIN then self.root_render_sampled=false end
+				self.root_clock_votes=votes
+			end
+		end
+		self.root_render_sample,self.root_render_sequence,self.root_render_at=position,self.physics_sequence,now
+		if self.root_render_sampled and snap.onboard
+			and self.store.settings.follow.camera_style~="joint_lock" then
+			p,delta=position,ZERO
+		end
+		snap.position,self.render_delta=p,delta
+		if snap.physical_height then snap.physical_height+=timed_velocity.y*self.timing.age end
+		if Subject.is_air_state(state) then
+			local gravity=vcreate(0,EXTRAPOLATION_GRAVITY*self.timing.age,0)
+			snap.velocity-=gravity
+			if snap.physical_velocity then snap.physical_velocity-=gravity end
+		end
+		if snap.board_valid then snap.board_position+=delta end
+		if snap.ground_valid and self.ground_normal_raw.y>=0.5 then
+			local n=self.ground_normal_raw
+			snap.ground_height-=(n.x*delta.x+n.z*delta.z)/n.y
+		end
 	else
+		Timing.reset(self.timing)
+	self.root_render_sampled,self.root_render_sample,self.root_render_sequence,self.root_render_at,self.root_clock_votes=false,nil,nil,nil,0
+		self.render_delta=ZERO
 		local ahead = clamp(now - self.root_changed_at, 0.0, MAX_EXTRAPOLATION)
-		local p = position + snap.velocity * ahead
+		local timed_velocity=snap.physical_velocity and vcreate(snap.velocity.x,snap.physical_velocity.y,snap.velocity.z) or snap.velocity
+		local p = position + timed_velocity * ahead
 		if Subject.is_air_state(state) then
 			p = vcreate(p.x, p.y - 0.5 * EXTRAPOLATION_GRAVITY * ahead * ahead, p.z)
 		end
 		snap.position = p
+		if snap.ground_valid and self.ground_normal_raw.y >= 0.5 then
+			local delta, n = p - position, self.ground_normal_raw
+			snap.ground_height -= (n.x * delta.x + n.z * delta.z) / n.y
+		end
 	end
 
 	if state ~= self.state then
@@ -613,12 +947,72 @@ local function joint_position(index)
 	return nil
 end
 
+-- One native request per joint per render tick, shared by body/framing/lock.
+-- false records a nil result too; retry on the next tick, never stale across it.
+function Glue:sample_joint(index)
+ local samples=self.joint_samples
+ if not samples then return joint_position(index) end
+ local point=samples[index]
+ if point==nil then point=joint_position(index) or false;samples[index]=point end
+ return point or nil
+end
+
+-- Two cached bone reads; root-relative heights never steer yaw or copy bone rotation.
+-- Nil first reads/budget contention ease back to the existing body-size estimate.
+function Glue:read_frame_bounds(dt)
+ local root=self.skater_position
+ local head,hips=self:sample_joint(HEAD_JOINT),self:sample_joint(HIPS_JOINT)
+ if head and vmagnitude(head-root)>BODY_MAX_DISTANCE then head=nil end
+ if hips and vmagnitude(hips-root)>BODY_MAX_DISTANCE then hips=nil end
+ local measured=head~=nil or hips~=nil
+ local top=head and clamp(head.y-root.y,-0.2,1.8) or 0.8
+ local hip=hips and clamp(hips.y-root.y,-0.5,0.5) or 0
+ top=max(top,hip+0.25)
+ local b=self.frame_bounds or {top=0.8,centre=0.1,bottom=-0.95}
+ local a=1-math.exp(-clamp(dt,0,0.1)/0.12)
+ b.measured=measured
+ b.top+=(top-b.top)*a
+ b.centre+=((top+hip)*0.5-b.centre)*a
+ -- Keep the sampled head's lateral displacement through a tuck/spin. Only
+ -- its position frames the view; joint rotation never supplies camera yaw.
+ b.head=head and vcreate(head.x-root.x,b.top,head.z-root.z) or vcreate(0,b.top,0)
+ self.frame_bounds=b
+ return b
+end
+
+-- Joint Lock asks only for its selected bones. ReSkate's first joint read may
+-- be nil, so this is repeated every shown tick and never uses stale poses.
+function Glue:joint_points(target)
+	local root=self.skater_position
+	local points={root=root}
+	if target=="head" then
+		points.head=self:sample_joint(HEAD_JOINT)
+	elseif target=="chest" then
+		points.chest=self:sample_joint(SPINE_JOINT)
+	elseif target=="hips" then
+		points.hips=self:sample_joint(HIPS_JOINT)
+		points.spine=self:sample_joint(SPINE_JOINT)
+	elseif target=="feet" then
+		points.right_foot=self:sample_joint(RIGHT_FOOT_JOINT)
+		points.left_foot=self:sample_joint(LEFT_FOOT_JOINT)
+	elseif target=="knee" then
+		points.right_knee=self:sample_joint(RIGHT_KNEE_JOINT)
+		points.left_knee=self:sample_joint(LEFT_KNEE_JOINT)
+	elseif target=="skateboard" and self.snap.board_valid then
+		points.skateboard=self.snap.board_position
+	end
+	for name,point in points do
+		if name~="root" and point and vmagnitude(point-root)>BODY_MAX_DISTANCE then points[name]=nil end
+	end
+	return points
+end
+
 -- The body for the off-board camera, once a tick (the joints are asked for every tick: a joint is only read for 2 s after the last
 -- ask, and the first answer is nil). The centre is 0.6 hips + 0.4 spine; in a bail the hips come from telemetry.body when it is given.
 -- Without joints it is the skater's position 0.9 m up. Fills self.body in place.
 function Glue:read_body()
 	local b = self.body
-	local hips, spine, head = joint_position(HIPS_JOINT), joint_position(SPINE_JOINT), joint_position(HEAD_JOINT)
+	local hips, spine, head = self:sample_joint(HIPS_JOINT), self:sample_joint(SPINE_JOINT), self:sample_joint(HEAD_JOINT)
 	local pos = self.skater_position
 	local ragdoll = self.obs.ragdoll == true
 	if ragdoll and self.tele_body and finite3(self.tele_body) then
@@ -642,6 +1036,10 @@ function Glue:read_body()
 	b.centre = centre
 	b.hips = hips or (centre - UP * HIPS_TO_CENTRE)
 	b.head = head or (centre + UP * 0.5)
+	if self.store.options.stable_timing then
+		local delta=self.render_delta
+		b.centre+=delta; b.hips+=delta; b.head+=delta
+	end
 	b.velocity = self.obs_velocity
 	b.heading = self.skater_heading
 	b.ragdoll = self.obs.ragdoll == true
@@ -675,6 +1073,23 @@ function Glue:apply_settings()
 		if applied.trajectory and applied.trajectory.step < plugin_trajectory_step then applied.trajectory.step = plugin_trajectory_step end
 		if not self.cam:set_settings(applied) then
 			reskate.log("dyncam: settings rejected (out of range); the previous ones stay.", "warn")
+		else
+			-- Capture what the camera actually received, including changes made while
+			-- riding. A saved profile read after a session cannot establish the
+			-- effective Pop or crouch state at the time of a reported event.
+			local effective = self.cam.settings or applied
+			local f = effective.follow
+			if self.last_collision_pop~=nil and self.last_collision_pop~=f.trick_pop then
+				self.collision_escape:reset()
+				self.eye_base_last=nil
+			end
+			self.last_collision_pop=f.trick_pop
+			local low, high = effective.ride_distance, effective.ride_distance_high
+			self:log_verbose(string.format("s3cam effective rev %d style %s | pop %s %.0f%% mode %s | crouch %s %.0f%% mode %s | distance low %s %.2f high %s %.2f | grind %.2f",
+				store.revision, tostring(f.camera_style), f.trick_pop and "on" or "off", f.pop_amount * 100,
+				f.pop_mode == 1 and "pitch" or "height", f.crouch_enabled and "on" or "off", f.crouch_amount * 100,
+				f.crouch_mode == 1 and "pitch" or "height", low.mode == Settings.DistanceMode.Fixed and "fixed" or "speed", low.fixed,
+				high.mode == Settings.DistanceMode.Fixed and "fixed" or "speed", high.fixed, effective.framing.grind_distance))
 		end
 	end
 end
@@ -811,12 +1226,23 @@ end
 -- so it starts afresh and its view is crossfaded from the shown pose over the Board / foot transition time (the take's own crossfade),
 -- not cut.
 function Glue:begin_ride_from_shown(now)
-	local ls = self.last_shown
+	self.pop_output_air,self.pop_flight_fov=false,nil
+	self.guard_terrain_weight=nil
+	self.floor_contact=false
+	self.clearance_release=nil
+	self.floor_step,self.floor_under_y=0,nil
+	self.collision_escape:reset()
+	self.eye_base_last=nil
+	self.sway_applied=false
+	-- Finish with the ordinary mount blend from the real view, then discard
+	-- the optional continuous recovery. Its velocity never reaches riding.
+	local ls = self.sway_mode and self.sway_presented or self.last_shown
 	if not (ls.pos and ls.forward and ls.up) then
 		-- Nothing was shown yet: nothing to blend from. The riding camera starts where it is (the snap guard has nothing to compare to).
 		self.game_pose, self.game_fov, self.blend_time = nil, nil, nil
 		self.source, self.blend, self.last_pose = "ride", 1.0, now
 		self.cam:cut()
+		self:reset_joint_lock()
 		self.guard:cut()
 		return
 	end
@@ -828,12 +1254,15 @@ function Glue:begin_ride_from_shown(now)
 	self.blend = 0.0
 	self.last_pose = now
 	self.cam:cut()
+	self:reset_joint_lock()
 end
 
 -- ---------------------------------------------------------------- the off-board camera
 -- Starts it from `from` (the pose on screen now, or the game's camera at a take): it begins exactly there and eases into its
 -- framing, so a dismount, a landing or a take on foot shows no jump.
 function Glue:begin_foot(now, from)
+	self.collision_escape:reset()
+	self.eye_base_last=nil
 	local fp = self.from_pose
 	if from and from.pos and from.forward and from.up then
 		fp.pos, fp.forward, fp.up, fp.fov = from.pos, from.forward, from.up, from.fov
@@ -867,6 +1296,44 @@ function Glue:side_sign()
 	return 1.0
 end
 
+-- A player may already have assigned L3 to the optional action. Both routes see
+-- that same press; make it one shoulder swap instead of immediately swapping back.
+-- New hosts notify before the next camera tick. Startup still polls the state:
+-- menu_changed intentionally does not emit an initial snapshot.
+function Glue:on_menu_changed(state)
+	self.menu_open=HostMenu.covered(state)
+	if self.menu_open and self.running then self:release("a host menu is open") end
+end
+
+function Glue:swap_shoulder(source)
+	local now = now_s()
+	if not self.store.enabled or HostMenu.blocked() then return end
+	if self.shoulder_press_at and self.shoulder_press_source ~= source and now - self.shoulder_press_at < 0.06 then return end
+	self.shoulder_press_at, self.shoulder_press_source = now, source
+	self.store:swap_side(0)
+	self:log_verbose("s3cam shoulder switched: " .. source)
+end
+
+function Glue:press_r3(source)
+	local now, store = now_s(), self.store
+	if not store.enabled or HostMenu.blocked() then return end
+	if self.view_press_at and self.view_press_source ~= source and now - self.view_press_at < 0.06 then return end
+	self.view_press_at, self.view_press_source = now, source
+	if self.running and self.source == "foot" then
+		if now - self.r3_at <= R3_DOUBLE_CLICK then
+			self.r3_at = -100
+			self:switch_offboard_style("R3 double click")
+		else
+			self.r3_at = now
+			self.off:recentre_now()
+			self:log_verbose("s3cam R3: off-board camera swings behind")
+		end
+	elseif store.options.follow_game_height and (self.snap.onboard or not self.snap.valid) then
+		store:toggle_height()
+		self:note("R3: Low / High switched")
+	end
+end
+
 -- Picks who draws the view this tick and starts the hand-over when that changes.
 function Glue:choose_source(now)
 	local want = self.obs.foot and "foot" or "ride"
@@ -885,7 +1352,7 @@ end
 -- One off-board camera update. Returns pos, forward, up, fov or nil.
 function Glue:foot_pose(now, pad_ok, pad)
 	local st = self.stats
-	local dt = clamp(now - self.last_pose, 0.0, MAX_DT)
+	local dt = clamp(self.render_dt>0 and self.render_dt or now-self.last_pose, 0.0, MAX_DT)
 	self.last_pose = now
 	st.frames += 1
 	self.total_frames += 1
@@ -946,12 +1413,66 @@ end
 -- One camera update. Returns pos, forward, up, fov (fov nil: leave the camera's own) or nil when there is no pose to show.
 function Glue:pose(now)
 	local st = self.stats
-	local dt = clamp(now - self.last_pose, 0.0, MAX_DT)
+	local dt = clamp(self.render_dt>0 and self.render_dt or now-self.last_pose, 0.0, MAX_DT)
 	self.last_pose = now
 	st.frames += 1
 	self.total_frames += 1
 	self:apply_settings()
 	self.extras.base_fov_deg = self.base_fov
+	self.extras.body_tracking=self.store.options.stable_timing==true
+	self.collision_pre_ran=false
+	local state=self.snap.physics_state
+	local rail_down=Subject.is_grind_state(state)
+		and ((self.cam.rail_grade or 0)>5*math.pi/180 or self.snap.velocity.y < -0.15)
+	if rail_down then self.rail_recent_until=now+0.20 end
+	self.rail_context=rail_down or (state==701 and now<self.rail_recent_until)
+	local collision=self.store.settings.collision
+	local cut_pending=self.cam.reset_requested or not self.cam.initialized
+	if cut_pending then
+		self.collision_escape:reset()
+		self.eye_base_last=nil
+	end
+	if not cut_pending and self.store.settings.follow.camera_style~="classic"
+		and self.collision_prediction_enabled~=false and self.source=="ride" and self.snap.onboard and self.blend>=1
+		and collision.enabled and collision.automatic then
+		self.extras.collision_pre=function(base,pivot,full,velocity,step_dt)
+			self.collision_pre_ran=true
+			local prior=self.eye_base_last
+			if prior and vmagnitude(base-prior)>max(2.0,vmagnitude(velocity)*step_dt*3+0.5) then
+				self.collision_escape:reset()
+				prior=nil
+			end
+			local eye_velocity=prior and step_dt>0 and (base-prior)/step_dt or nil
+			if not Subject.is_air_state(state) then eye_velocity=velocity end
+			self.eye_base_last=base
+			local previous=self.frame and self.frame.debug and self.frame.debug.collision_pull or 0
+			local esc=self.collision_escape
+			local room=max(0,min(10,50-self.rays_tick)) -- leave core and final validation rays
+			return esc:step(base,pivot,full,previous,now,step_dt,
+				function(from,to) return self:cast(from,to) end,room,
+				self.rail_context or not Subject.is_air_state(state) or abs(velocity.y)<=3.0,
+				velocity,self.rail_context,not self.store.settings.follow.trick_pop and eye_velocity or nil,
+				collision.automatic and AUTO_COLLISION_RADIUS or collision.radius)
+		end
+	else
+		self.extras.collision_pre=nil
+		self.collision_escape:reset()
+		self.eye_base_last=nil
+	end
+	local seed,shown=self.extras.pop_seed,self.last_shown
+	seed.valid=shown.source=="ride" and shown.pos~=nil and shown.root~=nil
+	if seed.valid then
+		seed.world_position=shown.pos
+		seed.position=shown.pos+(self.store.options.stable_timing and self.render_delta or ZERO)
+		seed.root=shown.root
+		seed.guard_subject_y=shown.guard_subject_y
+		seed.board_y=shown.board_y
+		seed.physics_height=shown.physics_height
+		seed.forward,seed.fov=shown.forward,shown.fov
+		seed.reach=vmagnitude(vcreate(shown.pos.x-shown.root.x,0,shown.pos.z-shown.root.z))
+	end
+	self.extras.frame_bounds=self.store.settings.follow.camera_style=="classic"
+		and self:read_frame_bounds(dt) or nil
 	local clock = os.clock()
 	local ok, frame = pcall(self.cam.update, self.cam, dt, self.snap, self.query, self.extras)
 	local ms = (os.clock() - clock) * 1000.0
@@ -969,6 +1490,8 @@ function Glue:pose(now)
 	end
 	local d = frame.debug or {}
 	self.pulled = (d.collision_pull or 0.0) > 0.001
+	self.impact = d.impact_y or 0.0 -- the landing bounce's drop in this frame: the snap guard leaves it alone
+	self.rattle = vector.create(d.rattle_pitch or 0.0, d.rattle_yaw or 0.0, d.rattle_roll or 0.0) -- the same for the landing rattle
 	st.steps += d.steps or 0
 	if d.held then
 		st.held += 1
@@ -993,6 +1516,8 @@ function Glue:pose(now)
 	local mix = gp and S3.sine_blend(self.blend) or 1.0
 	local right, up, back, pos = frame.right, frame.up, frame.back, frame.pos
 	if mix < 1.0 then
+		self.impact = 0.0 -- blending in from the game's camera: the pose is not the bounce's own
+		self.rattle = nil
 		-- The view direction (back) is blended first and the frame is built round it. Blending right and up and rebuilding the back
 		-- from them threw the pitch away whenever the start pose had one with an upright "up" (the off-board camera's frame is like
 		-- that): the first riding frame after a remount turned 22 to 26 degrees at once.
@@ -1007,7 +1532,11 @@ function Glue:pose(now)
 		return nil
 	end
 	local fov
-	if opts.shot_fov or self.store.settings.fov_override_deg > 0 then
+	local rd=self.store.settings.angle==Settings.CameraAngle.High and self.store.settings.ride_distance_high or self.store.settings.ride_distance
+	local fixed_chase=rd.mode==Settings.DistanceMode.Fixed and self.snap.physics_state>=100 and self.snap.physics_state<200
+		and not self.snap.manual and not self.snap.bailing
+	if opts.shot_fov or self.store.settings.fov_override_deg > 0 or fixed_chase
+		or (not self.store.settings.follow.trick_pop and self.snap.onboard) then
 		local base = self.base_fov
 		fov = base > 0 and base + (frame.fov_deg - base) * mix or frame.fov_deg
 		fov = clamp(fov, PLAUSIBLE_FOV_MIN, PLAUSIBLE_FOV_MAX)
@@ -1016,6 +1545,32 @@ function Glue:pose(now)
 		-- Blending in from the off-board camera: its FOV eases to this camera's (or the game's own) instead of jumping.
 		local target = fov or (self.base_fov > 0 and self.base_fov or frame.fov_deg)
 		fov = clamp(self.game_fov + (target - self.game_fov) * mix, PLAUSIBLE_FOV_MIN, PLAUSIBLE_FOV_MAX)
+	end
+	-- Pop Off owns one real lens throughout flight. A nil airborne FOV would
+	-- hand it back to the native lens between ground/air camera writes.
+	local cfg=self.store.settings
+	if not cfg.follow.trick_pop and self.snap.onboard then
+		local edited=false
+		if self.pop_lens_revision~=self.store.revision then
+			local old=self.pop_lens_settings
+			if old then
+				edited=old.override~=cfg.fov_override_deg or old.shot~=opts.shot_fov
+				for k,v in cfg.fov do if old[k]~=v then edited=true end end
+			end
+			local saved={override=cfg.fov_override_deg,shot=opts.shot_fov}
+			for k,v in cfg.fov do saved[k]=v end
+			self.pop_lens_settings,self.pop_lens_revision=saved,self.store.revision
+		end
+		local air=Subject.is_air_state(self.snap.physics_state)
+		if air then
+			if edited then self.pop_flight_fov=fov
+			elseif not self.pop_output_air or not self.pop_flight_fov then self.pop_flight_fov=self.last_shown.fov or fov end
+			fov=self.pop_flight_fov or fov
+		else self.pop_flight_fov=nil end
+		self.pop_output_air=air
+	else
+		self.pop_output_air,self.pop_flight_fov=false,nil
+		self.guard_terrain_weight=nil
 	end
 	if self.blend >= 1.0 then
 		self.blend_time, self.game_fov = nil, nil
@@ -1031,14 +1586,307 @@ end
 -- Every pose goes through here on its way to the screen (the riding camera, the off-board one, the hand-back). The snap guard looks
 -- at it first: a jump from the last pose, whatever path made it, is eased instead of shown. `path` names who is drawing.
 function Glue:show(pos, forward, up, fov, path)
+	local display_flags=0
+	self.floor_lift_need,self.floor_lift_reason=0,0
+	-- Only the riding camera's own pose carries the bounce's drop; it is used up by this pose.
+	local own = path == nil or path == "riding" or path == "retake"
+	local impact = own and self.impact or 0.0
+	local rattle = own and self.rattle or nil
+	self.impact = 0.0
+	self.rattle = nil
+	-- Anticipate a nearby obstruction along the moving eye, or use the core
+	-- arm pull when contact has already shortened it. Final rays stay reserved.
+	local escape=self.collision_escape
+	local esc_debug=self.frame and self.frame.debug
+	local esc_settings=self.store.settings
+	local esc_now=now_s()
+	if self.collision_pre_ran then
+		-- The core has already consumed this frame's latched offset.
+	elseif self.store.settings.follow.camera_style~="classic"
+		and self.collision_prediction_enabled~=false and own and self.source=="ride" and self.snap.onboard and self.blend>=1
+		and esc_settings.collision.enabled and esc_settings.collision.automatic
+		and not (esc_debug and esc_debug.reset)
+		and esc_debug
+		and esc_debug.collision_pivot and self.rays_tick<=61 then
+		local dt=math.clamp(esc_now-self.collision_escape_at,0,0.1)
+		pos=escape:step(pos,esc_debug.collision_pivot,esc_debug.collision_full or 0,
+			esc_debug.collision_pull or 0,esc_now,dt,
+			function(from,to) return self:cast(from,to,self.rays_tick>=60) end,62-self.rays_tick,
+				self.rail_context or not Subject.is_air_state(self.snap.physics_state) or abs(self.snap.velocity.y)<=3.0,
+				self.snap.velocity,self.rail_context,nil,
+				esc_settings.collision.automatic and AUTO_COLLISION_RADIUS or esc_settings.collision.radius)
+	else
+		escape:reset()
+	end
+	self.collision_escape_at=esc_now
+	self.collision_pre_ran=false
+	local original=pos
+	local original_forward,original_up=forward,up
+	local s=self.store.settings
+	local joint_mode=own and self.source=="ride" and self.snap.onboard and s.follow.camera_style=="joint_lock"
+	if joint_mode then impact,rattle=0.0,nil end
+	local origin=self.source=="foot" and self.body.centre-self.render_delta or self.skater_position
+	if self.store.options.stable_timing and path~="handback" then
+		local d=own and self.frame and self.frame.debug or {}
+		local lead=self.source=="foot" or self.blend>=1
+		local delta=lead and self.render_delta or ZERO
+		if self.source=="ride" and Subject.is_air_state(self.snap.physics_state) then
+			local vertical=self.frame and self.frame.debug and self.frame.debug.pop_vertical_weight
+			if vertical==nil then vertical=self.cam.pop_vertical_weight or self.cam.pop_w or 1 end
+			delta=vcreate(delta.x,delta.y*vertical,delta.z)
+		elseif self.source=="ride" and not joint_mode and not self.snap.manual
+			and self.snap.physics_state>=100 and self.snap.physics_state<200 then
+			-- The render-time root delta includes crouch animation. When the
+			-- camera's grounded framing owns that body motion, applying the same
+			-- delta after the core adds it back to the displayed eye.
+			local raw_y=self.store.options.stable_timing and self.skater_position.y or self.snap.position.y
+			local crouch=self.cam.crouch
+			if crouch and Crouch.sample(crouch,self.snap,raw_y)~=nil then
+				delta=vcreate(delta.x,delta.y*(1-math.clamp(crouch.weight or 0,0,1)),delta.z)
+			end
+		end
+		if joint_mode then delta=vcreate(delta.x,0,delta.z) end
+		local candidate,f,u=BodyFrame.update(self.body_frame,now_s(),origin,pos,forward,up,delta,
+			self.source,self.pulled or self.guard.smoothing or impact~=0 or (d.shake_pitch or 0)~=0 or d.reset==true)
+		local blocked=vmagnitude(candidate-pos)>1e-5 and self:cast(pos,candidate)~=nil
+		if blocked then display_flags=bit32.bor(display_flags,1024) end
+		if not blocked and not self.capped_this_tick then pos,forward,up=candidate,f,u
+		end
+	else BodyFrame.reset(self.body_frame) end
+	-- Fixed chase is a body-relative radius, independent of push lag or board rotation.
+	local common_ramp=not joint_mode and self.source=="ride" and (self.cam.ramp_render_follow or 0)>0.001
+	local continuous_aim=self.store.options.stable_timing and own and self.source=="ride" and self.snap.onboard
+		and not joint_mode and not self.snap.manual and not self.snap.bailing and self.blend>=1
+	local rd=s.angle==Settings.CameraAngle.High and s.ride_distance_high or s.ride_distance
+	local ordinary=self.source=="ride" and self.snap.onboard and not self.snap.bailing and not self.snap.manual
+		and self.snap.physics_state>=100 and self.snap.physics_state<200
+	if ordinary and self.blend>=1 and rd.mode==Settings.DistanceMode.Fixed and not self.pulled
+		and self.collision_escape.offset==0 and not common_ramp and (joint_mode or s.follow.trick_pop) then
+		local lift=self.frame and self.frame.debug and self.frame.debug.crouch_compensation or 0
+		local anchor=origin+vcreate(0,s.points.anchor_height-s.points.board_drop+lift,0)
+		local off=pos-anchor
+		-- The core already eases Low/High distance changes; retain that trajectory.
+		local radius=self.frame and self.frame.debug and (self.frame.debug.render_distance or self.frame.debug.distance) or rd.fixed
+		local candidate=anchor+S3.normalized(off,-self.snap.forward)*radius
+		local hit=vmagnitude(candidate-pos)>1e-5 and self:cast(pos,candidate) or nil
+		if not hit and not self.capped_this_tick then
+			forward,up=BodyFrame.reposition(anchor,pos,candidate,forward,up)
+			pos=candidate
+		end
+	end
+	-- Joint Lock owns only vertical translation. Its first live sample establishes
+	-- the existing eye height, then absolute joint Y changes move that eye with
+	-- bounded damping. Horizontal chase and view axes remain the camera's own.
+	if joint_mode then
+		local target=s.follow.joint_target or "head"
+		local target_changed=self.joint_style=="joint_lock" and self.joint_target~=target
+		if self.joint_style~="joint_lock" then
+			self.joint_lock=JointLock.new()
+			self.joint_baseline=nil
+			self.joint_delta=0.0
+			self.joint_switch_offset=0.0
+			self.joint_missing_time=0.0
+			self.joint_missing_root=nil
+			self.joint_valid=false
+		end
+		self.joint_style,self.joint_target="joint_lock",target
+		local points=self:joint_points(target)
+		local root_y=self.skater_position.y
+		local sample=JointLock.update(self.joint_lock,self.render_dt,s.follow,root_y,points)
+		local tau=max(0.02,0.0045*clamp(s.follow.joint_damping or 50,0,100))
+		local step_dt=clamp(self.render_dt,0,0.1)
+		if sample.valid then
+			if not self.joint_valid and self.joint_missing_time>0
+				and self.joint_missing_time<=0.12 and self.joint_missing_root
+				and abs(root_y-self.joint_missing_root)<0.05 then
+				-- A short nil burst with a stationary root is a read gap, not a
+				-- new body motion. Re-seed the filter from the returned live joint
+				-- so repeated gaps cannot accumulate its fallback lag.
+				JointLock.reset(self.joint_lock,root_y)
+				sample=JointLock.update(self.joint_lock,self.render_dt,s.follow,root_y,points)
+			end
+			self.joint_missing_time=0.0
+			self.joint_missing_root=nil
+			if self.joint_baseline==nil then
+				self.joint_baseline=sample.offset
+			end
+			local natural_delta=clamp(sample.offset-self.joint_baseline,-1.5,1.5)
+			if target_changed or not self.joint_valid then
+				self.joint_switch_offset=self.joint_delta-natural_delta
+			end
+			self.joint_switch_offset+=clamp(-self.joint_switch_offset,-1.5*step_dt,1.5*step_dt)
+			self.joint_delta=clamp(natural_delta+self.joint_switch_offset,-1.5,1.5)
+		else
+			if self.joint_valid then self.joint_missing_root=root_y;self.joint_missing_time=0.0 end
+			self.joint_missing_time+=step_dt
+			-- Missing joints may keep a briefly trusted module sample. Never
+			-- mutate the neutral calibration from that held value: repeated nil
+			-- reads would ratchet the camera away from its chosen eye height.
+			self.joint_delta*=math.exp(-step_dt/tau)
+			self.joint_switch_offset=0.0
+		end
+		self.joint_valid=sample.valid
+		pos+=vcreate(0,self.joint_delta,0)
+	elseif self.joint_style~="classic" then
+		self.joint_style,self.joint_target="classic",nil
+		self.joint_lock=JointLock.new()
+		self.joint_baseline=nil
+		self.joint_delta=0.0
+		self.joint_switch_offset=0.0
+		self.joint_missing_time=0.0
+		self.joint_missing_root=nil
+		self.joint_valid=false
+	end
+	-- The optional effect is the original persistent bail-recovery motion, not
+	-- an added banking offset. Give the toggle ownership of that state.
+	local foot=self.source=="foot" and not self.snap.onboard and path~="handback"
+	local sway=foot and self.store.options.camera_sway==true
+	if self.sway_mode~=sway then
+		self.guard:cut()
+		self.sway_mode=sway
+	end
+	self.sway_foot=foot
+	self.sway_applied=sway
+	self.guard.continuous=sway
+	self.guard.rotation_passthrough=(foot and not sway) or common_ramp or continuous_aim
+	-- A recovery whose rotation is not owned here must end on position and time. Its
+	-- view feedback never matches the guard's input, so it could otherwise run for seconds.
+	self.guard.finite_recovery=self.guard.rotation_passthrough and not sway
+	self.guard.restart_finishing=not foot
+	self.guard.finish_rate=(not foot) and 0.10 or nil
+	self.guard.finish_settled=not foot
+	self.guard.fov_passthrough=foot
+	local base_pos,base_forward,base_up=pos,forward,up
+	local aim_point
+	if continuous_aim then
+		local flat=S3.normalized(vcreate(base_forward.x,0,base_forward.z),vcreate(0,0,1))
+		local subject=vcreate(origin.x,0,origin.z)
+		local span=max(vdot(subject-vcreate(base_pos.x,0,base_pos.z),flat),0.5)
+		local wanted=vcreate(base_pos.x,0,base_pos.z)+flat*span
+		if self.snap_guard_on then
+			self.aim_reference=self.aim_reference or SnapGuard.new()
+			local reference=self.aim_reference
+			reference.stable=true;reference.rotation_passthrough=true
+			if self.frame and self.frame.debug and self.frame.debug.reset then reference:cut() end
+			-- Guard only discontinuities in authored aim, relative to the rider.
+			-- Normal steering and all physical root travel pass straight through.
+			aim_point=reference:filter(now_s(),wanted,vcreate(0,0,1),UP,nil,subject,false)
+		else aim_point=wanted;self.aim_reference=nil end
+	else self.aim_reference=nil end
+	local guarded_ramp_aim=false
+	local trace_cause=nil
+	local guard_subject=self.store.options.stable_timing and self.skater_position or self.snap.position
+	if self.source=="ride" and self.snap.onboard and not joint_mode then
+		local d=self.frame and self.frame.debug or {}
+		if Subject.is_air_state(self.snap.physics_state) and not s.follow.trick_pop and self.cam.pop_flight then
+			local flight=self.cam.pop_flight
+			local virtual_y=flight.height-((flight.guard_eye_y or flight.eye_y)-(flight.virtual_root_y or flight.root_y))
+			local weight=d.terrain_weight or 0
+			local prior=self.guard_terrain_weight or weight
+			local path=self.cam.vertical_path
+			local physical_y=guard_subject.y
+			if path then
+				physical_y=path.root_y+(path.recovery or 0)+(self.snap.physical_height and path.origin and self.snap.physical_height-path.origin+(path.bias or 0) or path.travel)
+				if self.store.options.stable_timing then physical_y-=self.render_delta.y end
+			end
+			local shift=vcreate(0,(physical_y-virtual_y)*(weight-prior),0)
+			if self.guard.have and vmagnitude(shift)>1e-6 then
+				self.guard.o_rel-=shift;self.guard.w_rel-=shift
+				if self.guard.from_rel then self.guard.from_rel-=shift end
+			end
+			self.guard_terrain_weight=weight
+			guard_subject=vcreate(guard_subject.x,virtual_y+(physical_y-virtual_y)*weight,guard_subject.z)
+		elseif self.snap.board_valid and (Subject.is_grind_state(self.snap.physics_state)
+			or self.snap.manual or self.snap.physics_state==701) then
+			-- Grind and manual shots are anchored to the board. The rider can
+			-- compress or lean above it without moving the rail itself.
+			local crouch=self.cam.crouch
+			guard_subject=vcreate(guard_subject.x,
+				self.snap.board_position.y+((crouch and crouch.board_baseline) or s.points.board_drop),guard_subject.z)
+		else
+			local raw_y=self.store.options.stable_timing and self.skater_position.y or self.snap.position.y
+			local crouch=self.cam.crouch
+			local lift=crouch and Crouch.sample(crouch,self.snap,raw_y)
+			if lift then
+				-- This is the guard's coordinate frame, not the camera's mixed
+				-- body/board anchor. It must neutralize the whole body animation.
+				guard_subject+=vcreate(0,lift,0)
+			end
+		end
+	end
+	local datum_changed=false
 	if self.snap_guard_on then
+		local stable=self.store.options.stable_timing==true or sway
+		if self.guard.stable~=stable then self.guard:cut(); self.guard.stable=stable end
+		if self.source=="ride" and self.snap.onboard and not joint_mode and not s.follow.trick_pop
+			and self.last_shown.source=="ride" and self.guard.have
+			and Subject.is_air_state(self.snap.physics_state) ~= (self.last_shown.air==true) then
+			-- Pop Off changes its vertical reference at takeoff and touchdown.
+			-- Translate the guard's stored relative poses into that new frame so
+			-- the previously shown world pose remains the start of the handoff.
+			-- Rebase only the coordinate-frame change. Physical rider travel
+			-- already belongs to the new frame; subtracting it here made every
+			-- fast takeoff/landing look like a camera snap requiring catch-up.
+			local movement=self.last_shown.root and (origin-self.last_shown.root) or ZERO
+			-- Only the datum changes here. Vertical travel is what the previous
+			-- datum itself was doing: nothing while Pop Off held it, the whole fall
+			-- once it followed the rider. Treating a following datum as held froze
+			-- the eye for one frame at every fast touchdown.
+			local elapsed=self.last_shown.at and clamp(now_s()-self.last_shown.at,0,0.1) or 0
+			movement=vcreate(movement.x,(self.guard_subject_vy or 0)*elapsed,movement.z)
+			local shift=guard_subject-self.guard.subject-movement
+			datum_changed=true
+			self.guard.o_rel-=shift
+			self.guard.w_rel-=shift
+			if self.guard.from_rel then self.guard.from_rel-=shift end
+			self.guard.subject=guard_subject
+			-- The rendered root can differ from the integrated flight path at contact, so it
+			-- may jump by a body length within a few frames. Absorb that on touchdown, for that root clock only.
+			if self.last_shown.air==true and self.root_render_sampled and self.guard.stable and continuous_aim then self.guard:begin_recovery(now_s(),TOUCHDOWN_RECOVERY) end
+			if self.last_shown.air==true and self.guard.stable and continuous_aim then self.guard.watch_until=now_s()+TOUCHDOWN_WATCH end
+		end
 		local now = now_s()
 		local name = path or "riding"
 		if self.path_hint and now <= self.path_hint_until and name ~= "handback" then
 			name = self.path_hint
 		end
 		local cause, amount
-		pos, forward, up, fov, cause, amount = self.guard:filter(now, pos, forward, up, fov, self.snap.position, self.pulled)
+		local subject=guard_subject
+		local hard_pull=self.pulled
+		if self.soft_pull_guard_enabled~=false and hard_pull
+			and (common_ramp or (self.store.options.stable_timing and self.cam.body_ground_active==true) or (s.follow.camera_style~="classic" and (not s.follow.trick_pop or self.rail_context))) and self.guard.have
+			and self.source=="ride" and self.frame and self.frame.debug
+			and self.frame.debug.collision_pivot and self.rays_tick<=60 then
+			-- A soft core pull may shorten the arm even while the previous shown
+			-- eye and its sightline remain clear. Let the guard ease that change;
+			-- only a blocked previous eye needs immediate collision priority.
+			local prior=self.last_shown
+			local actual=prior.source=="ride" and prior.pos and prior.at and now_s()-prior.at>=0 and now_s()-prior.at<0.1
+				and prior.root and vmagnitude(origin-prior.root)<2 and not (self.frame.debug.reset)
+			-- Collision ownership uses the displayed eye, not an eye translated
+			-- by Pop Off's changing virtual reference.
+			local previous_eye=actual and prior.pos or subject+self.guard.o_rel
+			local pivot=self.frame.debug.collision_pivot
+			local sight_blocked=self:cast(pivot,previous_eye,true)~=nil
+			-- Occlusion alone is not penetration: a low ledge can block the
+			-- sightline while the eye can travel smoothly above it. A genuinely
+			-- blocked eye path still retracts immediately; final floor/sweeps run.
+			hard_pull=self:cast(pos,previous_eye,true)~=nil
+			if sight_blocked then display_flags=bit32.bor(display_flags,4096) end
+		end
+		if hard_pull then display_flags=bit32.bor(display_flags,1) end
+		pos, forward, up, fov, cause, amount = self.guard:filter(now, pos, forward, up, fov, subject, hard_pull, impact, rattle)
+		if common_ramp and Subject.is_air_state(self.snap.physics_state) and vmagnitude(pos-base_pos)>1e-5 then
+			local horizontal=continuous_aim and BodyFrame.horizontal(origin,base_pos,pos,base_forward,aim_point) or nil
+			if self.frame_bounds and (self.cam.vert_frame_w or 0)>0.05 then
+				forward,up=BodyFrame.reframe(origin,base_pos,pos,base_forward,base_up,self.frame_bounds,fov or self.base_fov,horizontal)
+			else forward,up=BodyFrame.reposition(origin,base_pos,pos,base_forward,base_up,true) end
+			guarded_ramp_aim=true
+		end
+		if continuous_aim then
+			forward,up=BodyFrame.with_horizontal(forward,up,BodyFrame.horizontal(origin,base_pos,pos,base_forward,aim_point))
+		end
+		trace_cause=cause
 		if cause then
 			self.snaps[cause] += 1
 			self.snaps_total += 1
@@ -1046,21 +1894,286 @@ function Glue:show(pos, forward, up, fov, path)
 			self:log_verbose(string.format("s3cam snap smoothed: %s %.2f %s in %s", cause, amount, cause == "position" and "m" or "deg", name))
 		end
 	end
+	if sway and vmagnitude(pos-base_pos)>1e-5 then
+		-- A lagged orbit can sweep somewhere other than the collision-tested target.
+		local hit=self:cast(base_pos,pos)
+		if hit or self.capped_this_tick then
+			pos=base_pos
+			if not self.clearance_release or restored then self.guard.o_rel=pos-guard_subject end
+			self.guard.o_fwd,self.guard.o_up=forward,up
+			self.guard.move_velocity=ZERO
+		end
+	end
+	-- Off means a level offboard horizon; bail recovery must not create implicit roll.
+	if foot and not sway then
+		local right=S3.normalized(vcross(forward,UP),vcreate(-1,0,0))
+		local level=vcross(right,forward)
+		up=level
+	end
+
+	-- Core collision runs before render alignment, Fixed-radius correction and
+	-- snap recovery. Validate their final position using the reserved ray slots.
+	local after_guard=pos
+	local clearance_base=pos
+	local recovery_base_forward=guarded_ramp_aim and forward or original_forward
+	if self.source=="ride" and self.snap.onboard and s.collision.enabled then
+		local corrected=false
+		local floor_contact=false
+		local release_corrected=false
+		local restored=false
+		local prior=self.last_shown
+		local continuous=prior.source=="ride" and prior.pos and prior.root and prior.at
+			and now_s()-prior.at>=0 and now_s()-prior.at<0.1
+			and vmagnitude(origin-prior.root)<2 and path~="retake"
+			and not (self.frame and self.frame.debug and self.frame.debug.reset)
+		local from=continuous and prior.pos or original
+		local clearance=s.collision.automatic and 0.3 or s.collision.ground_clearance
+		local radius=s.collision.automatic and AUTO_COLLISION_RADIUS or s.collision.radius
+		local glided,forced_lift=false,false
+		if vmagnitude(pos-original)>1e-5 then
+			-- Validate actual displayed travel. A hit is not yet a verdict: the raw
+			-- candidate can sit under a surface the finished, lifted eye clears.
+			local hit=self:cast(from,pos,true)
+			if hit or self.rays_tick>=64 then
+				display_flags=bit32.bor(display_flags,4)
+				local resolved=false
+				if continuous_aim and continuous and hit and self.rays_tick<64 then
+					local top=min(pos.y+990,max(from.y,pos.y,origin.y)+max(clearance,0.05)+0.05)
+					local surface=self:cast(vcreate(pos.x,top,pos.z),vcreate(pos.x,pos.y-clearance-0.05,pos.z),true)
+					if surface and surface.y+clearance>pos.y and surface.y<=max(from.y,original.y)+1e-4 then
+						local lifted=self:clearance_lift(from,pos,surface.y+clearance,radius)
+						if lifted then pos=lifted;resolved=true;forced_lift=true end
+					end
+				end
+				if not resolved and continuous_aim and continuous and hit and self.rays_tick<62 then
+					-- The core eye is collision-tested. When it can be reached in the
+					-- clear, travel there quickly instead of cutting in one frame.
+					local start=from+(origin-prior.root)
+					local gap=original-start
+					local distance=vmagnitude(gap)
+					local elapsed=clamp(now_s()-prior.at,0,0.1)
+					if distance>0.05 and not self:cast(start,original,true) then
+						local candidate=start+gap*(min(distance,GLIDE_SPEED*elapsed)/distance)
+						if not self:cast(from,candidate,true) then
+							pos=candidate;resolved=true;glided=true;corrected=true
+							display_flags=bit32.bor(display_flags,32768)
+						end
+					end
+				end
+				if not resolved then
+					pos,forward,up=original,original_forward,original_up;restored=true
+					corrected=true
+				end
+			end
+		end
+		local function core_floor_fallback(floor)
+			if vmagnitude(pos-original)>1e-5 and self.rays_tick<64 then
+				local core_top=min(original.y+990,max(original.y,origin.y)+max(clearance,0.05)+0.05)
+				local core_floor=self:cast(vcreate(original.x,core_top,original.z),vcreate(original.x,original.y-clearance-0.05,original.z),true)
+				if not core_floor or core_floor.y+clearance<=original.y+1e-4 then
+					display_flags=bit32.bor(display_flags,16)
+					pos,forward,up=original,original_forward,original_up;restored=true
+				else
+					local raised=vcreate(original.x,max(original.y,core_floor.y+clearance),original.z)
+					forward,up=BodyFrame.reposition(origin,original,raised,original_forward,original_up,not joint_mode and (not s.follow.trick_pop or common_ramp) and (Subject.is_air_state(self.snap.physics_state) or common_ramp))
+					pos=raised
+				end
+			else
+				local raised=vcreate(pos.x,floor.y+clearance,pos.z)
+				forward,up=BodyFrame.reposition(origin,pos,raised,forward,up,not joint_mode and (not s.follow.trick_pop or common_ramp) and (Subject.is_air_state(self.snap.physics_state) or common_ramp))
+				pos=raised
+			end
+			corrected=true
+		end
+		-- Probe the floor under the shown eye, not the skater's ground height.
+		-- Starting above the current rider catches a genuinely buried core eye.
+		-- A surface above both the eyes and rider is overhead, not a floor.
+		-- No old world floor cache is trusted, including on an upper landing.
+		local comfort,hard,contact_floor=0,0,nil
+		local composed=continuous_aim and not restored and not glided
+		if self.rays_tick<64 then
+			local top=min(pos.y+990,max(pos.y,original.y,origin.y)+max(clearance,0.05)+0.05)
+			local floor=self:cast(vcreate(pos.x,top,pos.z),vcreate(pos.x,pos.y-clearance-0.05,pos.z),true)
+			local below_eye=floor and floor.y<=max(pos.y,original.y)+1e-4
+			local below_rider=floor and floor.y<=origin.y-0.05
+			local support=floor and (below_eye or below_rider)
+			if composed then
+				local bottom=pos.y-clearance-0.05
+				local under=support and floor.y or bottom
+				if support then
+					contact_floor=floor
+					-- Authored landing drop may use the comfort band; penetration may not.
+					comfort=max(0,floor.y+clearance-clearance_base.y-max(impact,0))
+					hard=max(0,floor.y+min(clearance,HARD_FLOOR_MARGIN)-clearance_base.y)
+					if forced_lift then hard=max(hard,pos.y-clearance_base.y) end
+					if floor.y+clearance>pos.y then
+						display_flags=bit32.bor(display_flags,8)
+						self.floor_lift_need=floor.y+clearance-pos.y
+					end
+					-- Only a step in the surface under the eye eases in. An eye coming
+					-- down onto a floor keeps its full clearance immediately.
+					local rose=continuous and self.floor_under_y and floor.y-self.floor_under_y or 0
+					if rose>FLOOR_STEP then self.floor_step=min(comfort,(self.floor_step or 0)+rose) end
+				end
+				local step_dt=prior.at and clamp(now_s()-prior.at,0,0.1) or 0
+				self.floor_step=max(0,min(comfort,(self.floor_step or 0))-FLOOR_ATTACK*step_dt)
+				self.floor_under_y=under
+			elseif support and floor.y+clearance>pos.y then
+				floor_contact=false
+				display_flags=bit32.bor(display_flags,8)
+				if ordinary and not joint_mode and floor.y-self.snap.ground_height<0.35 then
+					-- Local floor clearance owns Y only. Restoring the unaligned core
+					-- eye here reintroduced physics-age lead in X/Z whenever a small
+					-- ramp needed clearance, then removed it again on the next frame.
+					local raised=vcreate(pos.x,floor.y+clearance,pos.z)
+					forward,up=BodyFrame.reposition(origin,pos,raised,forward,up,
+						not joint_mode and (ordinary or ((not s.follow.trick_pop or common_ramp)
+						and (Subject.is_air_state(self.snap.physics_state) or common_ramp))))
+					pos=raised
+					corrected=true
+				else core_floor_fallback(floor) end
+			end
+		end
+		-- One scalar owns the non-effect floor offset. Real penetration is corrected
+		-- at once; the comfort band above it eases in, holds and releases, so a
+		-- trailing eye crossing a curb or lip does not bounce. Authored impact and
+		-- rattle are not part of this value.
+		local release=self.clearance_release
+		if composed then
+			if comfort>0 or hard>0 or release then
+				release=release or {value=0,velocity=0,at=now_s(),hold=0}
+				local dt=clamp(now_s()-release.at,0,0.1)
+				release.at=now_s()
+				if comfort>=release.value-1e-4 and comfort>0 then release.hold=FLOOR_HOLD
+				else release.hold=max(0,(release.hold or 0)-dt) end
+				local wanted=max(hard,comfort-(self.floor_step or 0))
+				if wanted>=release.value then
+					release.value,release.velocity=wanted,0
+				elseif release.hold<=0 then
+					local omega=2/FLOOR_RELEASE
+					local error=release.value-wanted
+					local c=release.velocity+omega*error;local decay=math.exp(-omega*dt)
+					release.value=max(hard,wanted+(error+c*dt)*decay)
+					release.velocity=(release.velocity-omega*c*dt)*decay
+				else release.velocity=0 end
+				local height=clearance_base.y+release.value
+				if height>pos.y+1e-5 then
+					-- An untouched core eye is already collision-tested; only a
+					-- recovering eye needs its raised path proven.
+					local lifted,reason
+					if vmagnitude(pos-original)<=1e-5 then lifted=vcreate(pos.x,height,pos.z)
+					elseif contact_floor and pos.y<contact_floor.y-1e-4 then reason=1 -- under that surface: not a lift
+					else lifted,reason=self:clearance_lift(from,pos,height,radius) end
+					self.floor_lift_reason=reason or 0
+					if lifted then
+						pos=lifted;corrected=true;release_corrected=true
+						floor_contact=comfort>0
+					elseif hard>0 and contact_floor then
+						release=nil
+						if reason==2 then
+							display_flags=bit32.bor(display_flags,16)
+							pos,forward,up=original,original_forward,original_up;restored=true;corrected=true
+						else core_floor_fallback(contact_floor) end
+					else release.value,release.velocity=0,0 end
+				else floor_contact=comfort>0 and pos.y-(contact_floor and contact_floor.y or pos.y)-clearance<=0.04 end
+				self.clearance_release=release and release.value>1e-4 and release or nil
+			end
+		else self.clearance_release=nil;self.floor_step=0;self.floor_under_y=nil end
+		if corrected and self.guard.have then
+			if not self.clearance_release or restored or glided then self.guard.o_rel=pos-guard_subject end
+			self.guard.o_fwd,self.guard.o_up=forward,up
+			if not floor_contact and not release_corrected then self.guard.move_velocity=ZERO end
+		end
+		self.floor_contact=floor_contact and not restored
+		if self.floor_contact and self.guard.have then
+			local velocity=self.guard.move_velocity or ZERO
+			local dt=prior.at and now_s()-prior.at or 0
+			local subject_speed=dt>0 and dt<0.1 and prior.guard_subject_y and (guard_subject.y-prior.guard_subject_y)/dt or 0
+			-- Project only inward WORLD velocity. Tangential recovery remains live.
+			self.guard.move_velocity=vcreate(velocity.x,max(velocity.y,-subject_speed),velocity.z)
+		end
+		if continuous_aim and not restored and vmagnitude(pos-base_pos)>1e-5 then
+			local horizontal=BodyFrame.horizontal(origin,base_pos,pos,base_forward,aim_point)
+			if floor_contact or release_corrected or glided or (common_ramp and Subject.is_air_state(self.snap.physics_state)) then
+				if self.frame_bounds and (self.cam.vert_frame_w or 0)>0.05 then
+					forward,up=BodyFrame.reframe(origin,base_pos,pos,base_forward,base_up,self.frame_bounds,fov or self.base_fov,horizontal)
+				else forward,up=BodyFrame.reposition(origin,base_pos,pos,base_forward,base_up,true) end
+			end
+			forward,up=BodyFrame.with_horizontal(forward,up,horizontal)
+		end
+	end
+	local ground_frame=ordinary and not joint_mode and self.cam.body_ground_active==true
+	self.view_blend=self.view_blend or ViewBlend.new()
+	local eligible=self.source=="ride" and self.snap.onboard and not joint_mode and self.blend>=1
+	local cut=not eligible or (self.frame and self.frame.debug and self.frame.debug.reset==true)
+	-- Safety corrections exist outside the ramp owner too (takeoff, landing,
+	-- and flat collision release). Keep one pitch owner across those boundaries.
+	-- Only post-core pitch recovers: authored core motion, yaw and roll remain live.
+	local stable_view=self.store.options.stable_timing and not self.snap.manual and not self.snap.bailing
+	forward,up=ViewBlend.update(self.view_blend,now_s(),forward,up,eligible and (common_ramp or ground_frame or stable_view),cut,
+		(Subject.is_air_state(self.snap.physics_state) or ground_frame or stable_view) and (stable_view and original_forward or recovery_base_forward) or nil,
+		stable_view and not (common_ramp or ground_frame))
+	if eligible and (continuous_aim or common_ramp or self.view_blend.recovering) then
+		up=ViewBlend.preserve_roll(forward,original_forward,original_up)
+	end
+	if continuous_aim and self.guard.have then self.guard.o_fwd,self.guard.o_up=forward,up end
+	self.body_correction=vmagnitude(pos-original)
+	if self.guard.smoothing then display_flags=bit32.bor(display_flags,2) end
+	if self.aim_reference and self.aim_reference.smoothing then display_flags=bit32.bor(display_flags,16384) end
+	if self.capped_this_tick then display_flags=bit32.bor(display_flags,32) end
+	if cut then display_flags=bit32.bor(display_flags,64) end
+	if common_ramp then display_flags=bit32.bor(display_flags,128) end
+	if joint_mode then display_flags=bit32.bor(display_flags,256) end
+	if self.snap.manual then display_flags=bit32.bor(display_flags,512) end
+	if self.cam.adaptive_orbit and self.cam.adaptive_orbit.constrained then display_flags=bit32.bor(display_flags,8192) end
+	if Subject.is_air_state(self.snap.physics_state) then display_flags=bit32.bor(display_flags,2048) end
+	self.display_flags=display_flags
+	self:trace_camera_frame(now_s(),original,base_pos,after_guard,pos,trace_cause,self.body_correction,forward,fov,up)
 	local ok, shown, why = pcall(reskate.camera.set, pos, forward, up, fov)
 	if not ok then
 		self.errors += 1
 		return false, tostring(shown)
 	end
 	if shown then
+		local actual=self.sway_presented
+		actual.pos,actual.forward,actual.up,actual.fov=pos,forward,up,fov
 		local ls = self.last_shown
-		ls.pos, ls.forward, ls.up, ls.fov = pos, forward, up, fov
+		ls.root,ls.source=self.skater_position,self.source
+		-- Speed of the guard's own vertical datum, for the next air/ground rebase.
+		local subject_dt=ls.at and now_s()-ls.at or 0
+		if datum_changed or not ls.guard_subject_y or subject_dt<=0 or subject_dt>=0.1 then self.guard_subject_vy=0
+		else self.guard_subject_vy=clamp((guard_subject.y-ls.guard_subject_y)/subject_dt,-40,40) end
+		ls.at=now_s()
+		ls.guard_subject_y=guard_subject.y
+		ls.board_y=self.snap.board_valid and self.snap.board_position.y or nil
+		ls.physics_height=self.snap.physical_height
+		ls.air=Subject.is_air_state(self.snap.physics_state)
+		if foot then
+			ls.pos,ls.forward,ls.up,ls.fov=base_pos,base_forward,base_up,fov
+		else ls.pos,ls.forward,ls.up,ls.fov=pos,forward,up,fov end
 	end
 	return shown, why
 end
 
 function Glue:begin_run(now)
+	self.aim_reference=nil
+	self.view_blend=nil
+	self.frame_bounds=nil
+	self.pop_output_air,self.pop_flight_fov=false,nil
+	self.guard_terrain_weight=nil
+	self.floor_contact=false
+	self.clearance_release=nil
+	self.floor_step,self.floor_under_y=0,nil
+	self.collision_escape:reset()
+	self.eye_base_last=nil
+	self.rail_recent_until,self.rail_context=0.0,false
+	self.collision_escape_at=now
+	BodyFrame.reset(self.body_frame)
 	self.running = true
 	self.started = now
+	self.timing_report_at=now+1
+	self.timing_last_at,self.timing_steps,self.timing_frames=now,self.physics_sequence or 0,self.render_sequence or 0
+	self.render_min,self.render_max=nil,nil
 	self.last_pose = now
 	self.blend = 0.0
 	self.report_at = now + 1
@@ -1079,6 +2192,7 @@ function Glue:begin_run(now)
 		end
 	end
 	self.cam:cut()
+	self:reset_joint_lock()
 	self.guard:cut()
 	-- A retake soon after a release (a menu, a pause) while the game's camera does not look like a game camera (a zoomed screen, far
 	-- away): carry on from the pose we showed last, as a remount does, instead of blending from something odd.
@@ -1130,7 +2244,23 @@ function Glue:snaps_text()
 end
 
 function Glue:release(reason)
+	self.aim_reference=nil
+	self.collision_escape:reset()
+	self.eye_base_last=nil
+	self.guard_terrain_weight=nil
+	self.floor_contact=false
+	self.clearance_release=nil
+	self.rail_recent_until,self.rail_context=0.0,false
+	self:reset_joint_lock()
+	BodyFrame.reset(self.body_frame)
+	Timing.reset(self.timing)
+	self.root_render_sampled,self.root_render_sample,self.root_render_sequence,self.root_render_at,self.root_clock_votes=false,nil,nil,nil,0
+	self.render_delta=ZERO
 	self.handback = nil
+	self.return_black_at = nil
+	self.return_cut = false
+	self.observed_position, self.observed_at, self.observed_speed = nil, nil, nil
+	self.teleport_pending = false
 	self.guard:cut()
 	self.released_at = now_s()
 	if self.running then
@@ -1144,7 +2274,9 @@ function Glue:release(reason)
 			self.total_frames > 0 and self.total_update_ms / self.total_frames or 0.0, self.landings, self.manuals,
 			self.manuals == 1 and "" or "s", self:snaps_text()))
 		if self.diag then
-			self.diag:end_run(reason)
+			-- Release also runs inside host ticks; do not flush files here.
+			self.diag.dump=nil
+			self.diag.log_dirty=false
 		end
 	end
 	pcall(reskate.camera.release)
@@ -1153,26 +2285,80 @@ function Glue:release(reason)
 end
 
 -- Take / release / run, once a tick.
+function Glue:recenter_return(now)
+	self.pop_output_air,self.pop_flight_fov=false,nil
+	self.guard_terrain_weight=nil
+	self.floor_contact=false
+	self.clearance_release=nil
+	self.floor_step,self.floor_under_y=0,nil
+	self.collision_escape:reset()
+	self.eye_base_last=nil
+	self.rail_recent_until,self.rail_context=0.0,false
+	BodyFrame.reset(self.body_frame)
+	self.sway_applied=false
+	self.impact,self.rattle=0,nil
+	self.return_cut = false
+	self.cam:cut()
+	self:reset_joint_lock()
+	self.guard:cut()
+	self.game_pose, self.game_fov, self.blend_time = nil, nil, nil
+	self.blend = 1.0
+	self.handback = nil
+	self.path_hint, self.path_hint_until = nil, 0.0
+	self.r3_at = -100.0
+	if self.source == "foot" and self.off then
+		self:begin_foot(now, nil)
+		self.off:start(nil, self.body)
+		self.off.blend_time = 0.0
+	end
+	-- Allow the cut update to run even when both observations share the same clock tick.
+	self.last_pose = now - 1 / 60
+end
+
+-- The native fade is not exposed to plugins. Cover a long discontinuity before drawing
+-- the newly centred pose, then fade the black overlay away; never hold gameplay input.
+function Glue:draw_return(d)
+	local start = self.return_black_at
+	if not start or not self.running or not self.store.enabled or self.menu_open then return end
+	local age = now_s() - start
+	if age >= 0.30 then self.return_black_at = nil; return end
+	local alpha = clamp(1.0 - max(0.0, age - 0.05) / 0.25, 0.0, 1.0)
+	d:rect(ZERO, d:size(), { colour = math.floor(alpha * 255 + 0.5), fill = true })
+end
+
 function Glue:tick(dt_ms)
+	if not self.joint_samples then self.joint_samples={} else table.clear(self.joint_samples) end
 	local now = now_s()
+	self.render_dt=type(dt_ms)=="number" and dt_ms>0 and dt_ms/1000 or 0
+	self.render_sequence=(self.render_sequence or 0)+1
+	if self.running and self.render_dt>0 then
+		self.render_min=math.min(self.render_min or self.render_dt,self.render_dt)
+		self.render_max=math.max(self.render_max or self.render_dt,self.render_dt)
+	end
 	self.rays_tick = 0
 	self.capped_this_tick = false
 	local store = self.store
 
 	-- The pad: R3 switches Low / High on the board (the DLL follows the game's camera height option; the plugin reads the stick click
-	-- itself), and on foot it swings the off-board camera behind the skater. The sticks steer the off-board camera.
+	-- itself), and on foot it swings the off-board camera behind the skater; a double click on foot switches Orbit / Shoulder (the
+	-- first click's swing behind does no harm). The sticks steer the off-board camera.
 	local pad_ok, pad = pcall(reskate.input.gamepad)
 	local r3 = pad_ok and pad ~= nil and pad.buttons ~= nil and pad.buttons.right_stick == true
-	if r3 and not self.pad_r3 and store.enabled and not self.menu_open then
-		if self.running and self.source == "foot" then
-			self.off:recentre_now()
-			self:log_verbose("s3cam R3: off-board camera swings behind")
-		elseif store.options.follow_game_height and (self.snap.onboard or not self.snap.valid) then
-			store:toggle_height()
-			self:note("R3: Low / High switched")
-		end
+	local l3 = pad_ok and pad ~= nil and pad.buttons ~= nil and pad.buttons.left_stick == true
+	self.menu_open=HostMenu.blocked()
+	local input_menu = self.menu_open or self.custom_ui_open==true
+	if l3 and not self.pad_l3 and store.enabled and not input_menu then
+		self:swap_shoulder("L3")
+	end
+	self.pad_l3 = l3
+	if r3 and not self.pad_r3 and store.enabled and not input_menu then
+		self:press_r3("pad")
 	end
 	self.pad_r3 = r3
+	-- Our screen owns input just as a native menu does. Keep raw click latches
+	-- above so held sticks cannot fire on close, but stop offboard steering.
+	if input_menu then pad_ok,pad=false,nil end
+	self.manual_pad=pad_ok and not input_menu and pad or nil
 
 	-- Switched off: a riding camera is handed back at once; the off-board one eases out like a step off the board.
 	local enabled = store.enabled
@@ -1189,8 +2375,6 @@ function Glue:tick(dt_ms)
 	end
 
 	local obs = self:observe(now)
-	local ok_menu, game_menu = pcall(reskate.menu.game)
-	self.menu_open = ok_menu and game_menu ~= nil and game_menu.open == true
 
 	if self.running then
 		-- Screens of the game's own, no skater, a pause: hand back at once. Off the board with the game's camera chosen: ease to where
@@ -1235,7 +2419,12 @@ function Glue:tick(dt_ms)
 		if self.spectating then
 			self.spectating = false
 			self.cam:cut()
+			self:reset_joint_lock()
 			self.last_pose = now
+		end
+		if self.return_cut and obs.valid then
+			self:choose_source(now)
+			self:recenter_return(now)
 		end
 		if self.handback then
 			self:handback_tick(now)
@@ -1323,10 +2512,10 @@ function Glue:after_tick(now)
 			.. (source == "deck" and "from the deck" or (source == "feet" and "from the feet" or "unreadable")))
 	end
 	local opts = self.store.options
-	if opts.verbose and self.diag and self.frame and self.snap.valid and self.source == "ride" then
-		self.diag:push(DiagModule.sample_of(now - self.started, self.obs.state, self.manual, self.frame, self.snap))
-		self.diag:tick(now)
-	end
+	-- Gameplay ticks retain compact summaries only. Snapshot construction,
+	-- history formatting and synchronous diagnostic file writes can exceed
+	-- the host deadline even when the camera calculation is inexpensive.
+
 	self:report(now)
 end
 
@@ -1335,7 +2524,18 @@ function Glue:report(now)
 	if now < self.report_at then
 		return
 	end
-	self.report_at = now + 1
+	self.report_at = now + 5 -- compact motion summaries keep their independent one-second rate
+	if self.store.options.stable_timing and now>=(self.timing_report_at or 0) then
+		self.timing_report_at=now+10
+		local span=math.max(now-(self.timing_last_at or now),0.001)
+		local frames,steps=self.render_sequence or 0,self.physics_sequence or 0
+		self:note(string.format("stability test: render %.1f fps (%.2f-%.2f ms) | physics %.1f events/s step %.3f ms | source age %.2f ms | timestamp %s | recovery %s | shake %s | body correction %.3f m | sway enabled %s active %s view %s",
+			(frames-(self.timing_frames or frames))/span,(self.render_min or 0)*1000,(self.render_max or 0)*1000,
+			(steps-(self.timing_steps or steps))/span,(self.step_seconds or 0)*1000,self.timing.age*1000,
+			tostring(self.timing.clock),tostring(self.guard.smoothing),tostring(self.store.settings.shake_enabled),self.body_correction or 0,tostring(self.store.options.camera_sway),tostring(self.sway_applied==true),tostring(self.source)))
+		self.timing_last_at,self.timing_steps,self.timing_frames=now,steps,frames
+		self.render_min,self.render_max=nil,nil
+	end
 	local st = self.stats
 	local f = self.frame
 	if self.store.options.verbose and self.diag and self.source == "foot" and self.off then
@@ -1347,12 +2547,31 @@ function Glue:report(now)
 		local d = f.debug or {}
 		self.diag:note(string.format(
 			"s3cam t=%.0f %d frames, %d steps, %d held, %d resets, %d failed | update %.3f ms mean, %.3f max, %d rays, %d ticks over the ray budget | "
-				.. "state %s shot %s speed %.1f clearance %.2f normal.y %.3f | dist %.2f elev %.1f lag %.2f | fov %.1f (game %.1f) | blend %.2f | board pitch %s manual %s",
+				.. "state %s shot %s speed %.1f clearance %.2f normal.y %.3f | dist %.2f elev %.1f lag %.2f | fov %.1f (game %.1f) | blend %.2f | board pitch %s manual %s"
+				.. " | body follow %s %.0f%% ground %s height %.3f neutral %.3f lift %+.3f"
+				.. " | terrain lift %.1f air rise %.1f view pitch %.1f pull %.3f carry %.3f",
 			now - self.started, st.frames, st.steps, st.held, st.resets, st.failed,
 			st.frames > 0 and st.update_ms / st.frames or 0.0, st.update_ms_max, self.rays_total - st.rays_at, self.rays_capped,
 			tostring(self.state), tostring(d.shot_name), d.speed or 0, self.snap.ground_clearance, self.snap.ground_normal.y,
 			d.distance or 0, (d.elevation or 0) / S3.degrees, d.anchor_lag or 0, f.fov_deg, self.base_fov, self.blend,
-			self.board_pitch_ok and string.format("%+.1f deg", self.board_pitch) or "unreadable", self.manual and "on" or "off"))
+			self.board_pitch_ok and string.format("%+.1f deg", self.board_pitch) or "unreadable", self.manual and "on" or "off",
+			self.store.settings.follow.crouch_enabled and "on" or "off", self.store.settings.follow.crouch_amount * 100,
+			tostring(self.snap.ground_valid == true), self.snap.position.y - self.snap.ground_height,
+			d.crouch_baseline or 0, d.crouch_compensation or 0,
+			(d.downhill_lift or 0)/S3.degrees, (d.air_rise or 0)/S3.degrees,
+			math.asin(clamp(-f.back.y,-1,1))/S3.degrees, d.collision_pull or 0,
+			d.carried and vmagnitude(d.carried) or 0))
+		local shown = self.last_shown
+		local core_rel_y = f.pos.y - self.snap.position.y
+		local shown_rel_y = shown.pos and shown.root and shown.pos.y - shown.root.y or core_rel_y
+		local phase = d.rail_handoff_active and "rail" or d.landing_eye_active and "landing"
+			or d.pop_active and "air" or "core"
+		self.diag:note(string.format("s3cam framing rev %d pop %s %.0f%% %s | phase %s heightW %.2f pitchW %.2f dropW %.2f | core relY %+.3f shown relY %+.3f correction %.3f | core pitch %+.1f shown pitch %+.1f",
+			self.applied_revision, self.cam.settings.follow.trick_pop and "on" or "off", self.cam.settings.follow.pop_amount * 100,
+			self.cam.settings.follow.pop_mode == 1 and "pitch" or "height", phase, d.pop_height_weight or 1,
+			d.pop_pitch_weight or 0, d.pop_drop_weight or 0, core_rel_y, shown_rel_y, self.body_correction or 0,
+			math.asin(clamp(-f.back.y,-1,1))/S3.degrees,
+			shown.forward and math.asin(clamp(shown.forward.y,-1,1))/S3.degrees or 0))
 	end
 	st.frames, st.steps, st.held, st.resets, st.failed = 0, 0, 0, 0, 0
 	st.update_ms, st.update_ms_max, st.rays_at = 0.0, 0.0, self.rays_total
@@ -1392,7 +2611,8 @@ function Glue:watch_frame(frame, now)
 		end
 		f.pull = max(f.pull, d.collision_pull or 0)
 		if d.prediction_valid then
-			self.predicted = { air = d.predicted_air_time or 0, drop = d.predicted_landing_delta or 0 }
+			self.predicted = self.predicted or {}
+			self.predicted.air,self.predicted.drop=d.predicted_air_time or 0,d.predicted_landing_delta or 0
 		end
 	end
 	f.prev_back = frame.back
@@ -1405,6 +2625,9 @@ function Glue:watch_frame(frame, now)
 		self.landing_fall = d.landing_fall or 0
 		self.landing_fraction = d.landing_fraction or 0
 		self.landing_pending = true
+		if verbose then
+			self.landing_dump = { fall = self.landing_fall, fraction = self.landing_fraction } -- taken by after_tick, for the landing dump
+		end
 	end
 	self.airborne = air
 	if self.landing_pending and now - (self.landed_at_run or now) >= 0.3 then
@@ -1443,6 +2666,9 @@ function Glue:dump()
 			.. "air hold %+.2f m | impulse %.3f | fov %.1f | incline %.1f deg", tostring(d.shot_name), (d.shot_fraction or 0) * 100, d.speed or 0,
 			d.distance or 0, (d.elevation or 0) / S3.degrees, (d.heading or 0) / S3.degrees, d.anchor_lag or 0, d.air_hold_delta or 0,
 			d.impulse or 0, f.fov_deg, d.incline_degrees or 0)
+		text ..= string.format("\ncrouch body follow %s %.0f%% | state %s | fresh ground %s | framing lift %.3f m | baseline %.3f m",
+			s.follow.crouch_enabled and "on" or "off", s.follow.crouch_amount * 100,
+			tostring(self.snap.physics_state), tostring(self.snap.ground_valid == true), d.crouch_compensation or 0, d.crouch_baseline or 0)
 	end
 	return text
 end

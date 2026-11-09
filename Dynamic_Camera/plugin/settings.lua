@@ -147,11 +147,11 @@ end
 function M.native_plus()
 	return {
 		air_hold = true, -- hold the camera height in the air (s3_air hold delta added to the native Y)
-		landing_dip = true, -- critically damped dip on touchdown
+		landing_dip = true, -- the landing bounce: the camera drops on touchdown and eases back up (the LANDING BOUNCE card)
 		shake = true, -- impulse + speed shake from s3_shake
 		roll = true, -- the shot's framing roll (and shake roll)
-		dip_depth = 0.12, -- m, deepest point of a full-strength landing; TUNE
-		dip_peak_time = 0.12, -- s, time to the deepest point (the spring's 1/omega); TUNE
+		dip_depth = 0.32, -- m, deepest point of a full-strength landing; TUNE
+		dip_peak_time = 0.18, -- s, recovery: how long the camera takes to ease back up from its deepest point; TUNE
 	}
 end
 
@@ -251,12 +251,29 @@ function M.follow()
 		-- behind the direction you ride. 0 keeps the normal lazy swing, 10 locks it straight behind (a fixed
 		-- chase camera).
 		horizontal = 0.0,
+		crouch_enabled = true,
+		crouch_mode = 0, -- 0: camera height, 1: camera pitch
+		trick_pop = true, -- retain automatic vertical trick framing by default
+		pop_amount = 1.0, -- share of ordinary pop motion followed by the selected channel
+		pop_mode = 0, -- 0: camera height, 1: camera pitch
+		crouch_amount = 1.0, -- fraction of body lowering retained; 1 preserves the original camera
+		camera_style = "classic", -- "classic" keeps the historical crouch/pop framing; "joint_lock" follows a body landmark vertically
+		joint_target = "head", -- head, chest, feet, knee, hips or skateboard
+		joint_damping = 50.0, -- percent; 0 follows immediately, 100 eases strongly without freezing
 	}
 end
 
 function M.valid_follow(s)
 	return ok(s.strength, 0.2, 4.0) and ok(s.dynamic_speed, 0.5, 60.0) and ok(s.dynamic_boost, 0.0, 3.0)
-		and ok(s.horizontal, 0.0, 10.0)
+		and ok(s.horizontal, 0.0, 10.0) and type(s.crouch_enabled) == "boolean"
+		and type(s.crouch_amount) == "number" and ok(s.crouch_amount, 0.0, 1.0)
+		and (s.crouch_mode==0 or s.crouch_mode==1) and type(s.trick_pop)=="boolean"
+		and type(s.pop_amount)=="number" and ok(s.pop_amount,0.0,1.0)
+		and (s.pop_mode==0 or s.pop_mode==1)
+		and (s.camera_style == "classic" or s.camera_style == "joint_lock")
+		and (s.joint_target == "head" or s.joint_target == "chest" or s.joint_target == "feet"
+			or s.joint_target == "knee" or s.joint_target == "hips" or s.joint_target == "skateboard")
+		and ok(s.joint_damping, 0.0, 100.0)
 end
 
 -- Field of view on top of the base FOV (the game camera's own, or fov_override_deg). Every term eases

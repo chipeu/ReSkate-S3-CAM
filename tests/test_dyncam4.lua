@@ -120,11 +120,14 @@ do
     expect(g.snap.manual == true, "Manual named with the nose up: manual on")
     expect(g.snap.board_valid and g.snap.board_position.z > sc.z - 0.3 and g.snap.board_position.z < sc.z + 0.3, "manual: centre between the feet")
     sc.tilt = 0
-    drive(m, sc, make, 0.5)
-    expect(g.snap.manual == true, "level feet: still a manual (the feet do not end it)")
+    drive(m, sc, make, 0.3)
+    expect(g.snap.manual == true, "level feet for 0.3 s: still a manual")
+    drive(m, sc, make, 0.4)
+    expect(g.snap.manual == false, "level feet for 0.4 s in a row: the manual is over (the board is level)")
+    expect(app.manual ~= nil and app.manual.last_event == "manual off (board level)", "and the detector says why (" .. tostring(app.manual and app.manual.last_event) .. ")")
     landed(m, 11)
-    drive(m, sc, make, 0.5)
-    expect(g.snap.manual == false, "its landing note: manual off")
+    drive(m, sc, make, 0.3)
+    expect(g.snap.manual == false, "its landing note, late: nothing changes")
     sc.tilt = -12
     named(m, 12, "Nose Manual")
     drive(m, sc, make, 0.5)
@@ -138,7 +141,7 @@ do
     local notes = 0
     for _, l in ipairs(m.logs) do if string.find(l[2], "board pitch", 1, true) then notes += 1 end end
     expect(notes == 1 and logged(m, "board pitch from the feet") ~= nil, "one note: board pitch from the feet")
-    expect(logged(m, "manual detection: trick list") ~= nil, "the once-a-run note says manual detection: trick list")
+    expect(logged(m, "manual detection: score / trick list") ~= nil, "the once-a-run note says manual detection: score / trick list")
     local o = Settings.copy(app.store.options)
     o.release_blend_time = 0
     app.store:set_options(o)
@@ -456,9 +459,9 @@ do
     local tip = false -- the menu puts a slider's tooltip in the note under it
     for i, x in ipairs(m.widgets) do
         local n = m.widgets[i + 1]
-        if x == w and n and n.kind == "note" and #n.text <= 300 and string.find(n.text, "hands back at once", 1, true) then tip = true end
+        if x == w and n and n.kind == "note" and #n.text <= 180 and string.find(n.text, "returns control immediately", 1, true) then tip = true end
     end
-    expect(w ~= nil and w.kind == "slider" and string.find(w.text, "Hand-back", 1, true) ~= nil and tip, "slider on the ADVANCED tab with a tooltip")
+    expect(w ~= nil and w.kind == "slider" and w.text == "Return to game camera time" and tip, "slider on the ADVANCED tab with a concise description")
     expect(w ~= nil and w.min == 0 and w.value == 0.45, "slider 0..., shows 0.45")
     m.build_page({ tabs = 8, bt_release = 0.8 })
     expect(app.store.options.release_blend_time == 0.8, "the slider sets it")

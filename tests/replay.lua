@@ -218,7 +218,14 @@ function replay.run(scenario, camera_module, opts)
         debug_count = 0,
     }
 
+    local revision_active = false
+    result.revised_differences = 0
     local function fail(frame, message)
+        if revision_active then
+            result.revised_differences += 1
+            result.first_revised = result.first_revised or {frame=frame,message=message}
+            return
+        end
         if result.pass then
             result.pass = false
             result.first_fail = { frame = frame, message = message }
@@ -242,14 +249,14 @@ function replay.run(scenario, camera_module, opts)
         ray_count += 1
         local ray = frame_rays[ray_count]
         if not ray then
-            diverged = true
+            diverged = not revision_active
             fail(ray_frame, string.format("extra ray #%d: the port cast a ray the C++ did not (from %s to %s); the C++ cast %d rays this frame",
                 ray_count, tostring(from), tostring(to), #frame_rays))
             return nil
         end
         local df, dt_ = vector.magnitude(from - ray.from), vector.magnitude(to - ray.to)
         if df > tol.ray or dt_ > tol.ray then
-            diverged = true
+            diverged = not revision_active
             fail(ray_frame, string.format("ray #%d differs: from off by %.4f m, to off by %.4f m\n      port: %s -> %s\n      C++ : %s -> %s",
                 ray_count, df, dt_, tostring(from), tostring(to), tostring(ray.from), tostring(ray.to)))
             return nil
@@ -258,7 +265,17 @@ function replay.run(scenario, camera_module, opts)
         return nil
     end
 
+    local Subject = require("subject")
+    local was_air = false
     for i, frame in ipairs(trace.frames) do
+        if opts.stop_before_frame and frame.index >= opts.stop_before_frame then break end
+        result.checked_frames = (result.checked_frames or 0) + 1
+        local airborne = Subject.air(frame.snapshot)
+        if opts.revise_after_touchdown and was_air and not airborne then
+            revision_active = true
+            result.revision_frame = result.revision_frame or frame.index
+        end
+        was_air = airborne
         frame_rays, ray_count, ray_frame = frame.rays, 0, frame.index
         local extras = { base_fov_deg = frame.base_fov }
         local out = cam:update(frame.dt, frame.snapshot, query, extras)
@@ -266,7 +283,7 @@ function replay.run(scenario, camera_module, opts)
         if ray_count < #frame_rays then
             fail(frame.index, string.format("missing rays: the port cast %d rays, the C++ cast %d (ray #%d is the first it did not cast: %s -> %s)",
                 ray_count, #frame_rays, ray_count + 1, tostring(frame_rays[ray_count + 1].from), tostring(frame_rays[ray_count + 1].to)))
-            break
+            if not revision_active then break end
         end
 
         local want = frame.output
@@ -300,7 +317,7 @@ function replay.run(scenario, camera_module, opts)
         end
         if why then
             fail(frame.index, why .. (want.shot and ("  [C++ shot " .. want.shot .. "]") or ""))
-            if not opts.keep_going then break end
+            if not revision_active and not opts.keep_going then break end
         end
 
         -- The debug fields: informative, fatal only in strict mode.
@@ -357,7 +374,11 @@ function replay.report(result, opts)
     if result.debug_count > 0 then
         line ..= string.format("  (debug diffs: %d, worst %s)", result.debug_count, result.debug_worst_field or "?")
     end
+    if result.revision_frame then
+        line ..= string.format("; STRICT PREFIX before touchdown frame %d, full revised landing diagnostics: %d differences",result.revision_frame,result.revised_differences)
+    end
     print(line)
+    if result.first_revised then print(string.format("      REVISED at frame %d: %s",result.first_revised.frame,result.first_revised.message)) end
     if not result.pass then
         print(string.format("      first failure: frame %d: %s", result.first_fail.frame, result.first_fail.message))
     end

@@ -545,5 +545,41 @@ do
 	end
 end
 
+-- Stepping off after a Low riding camera: it starts below and looks up, then levels out on its own, smoothly; tilting the view
+-- with the right stick stops the level-out.
+do
+	local function low_start(sc)
+		-- the Low riding camera: 2.6 m behind, 0.35 m below the centre, looking up at the skater
+		return { pos = vc(0, sc.centre_y - 0.35, -2.6), forward = vector.normalize(vc(0, 0.25, 1)), up = UP, fov = 60 }
+	end
+	local function pitch_of(f) return math.deg(math.asin(math.clamp(vector.normalize(f).y, -1, 1))) end
+	local sc = new_scene(settings({ recentre_after = 0 }))
+	start(sc, low_start(sc))
+	local _, f0 = step(sc)
+	local first = pitch_of(f0)
+	local prev, worst, last = first, 0, first
+	for _ = 1, 150 do
+		local _, f = step(sc)
+		local p = pitch_of(f)
+		worst = math.max(worst, math.abs(p - prev))
+		prev, last = p, p
+	end
+	expect(first > 2, "a Low riding camera starts the off-board camera looking up (" .. string.format("%.1f", first) .. " deg)")
+	expect(last < -3, "standing still, it levels out to a look down at the skater on its own (" .. string.format("%.1f", last) .. " deg)")
+	expect(worst < 1.0, "smoothly: no more than 1 deg a frame (" .. string.format("%.2f", worst) .. ")")
+	local sc2 = new_scene(settings({ recentre_after = 0 }))
+	start(sc2, low_start(sc2))
+	step(sc2)
+	sc2.input.look_y = -0.6 -- the player tilts the view
+	for _ = 1, 10 do step(sc2) end
+	sc2.input.look_y = 0
+	local held
+	for _ = 1, 10 do local _, f = step(sc2); held = pitch_of(f) end
+	local after
+	for _ = 1, 120 do local _, f = step(sc2); after = pitch_of(f) end
+	expect(sc2.off.level_pending == false, "once the player tilts the view, the level-out stops")
+	expect(after > 0, "and the view the player chose is not pulled down to the rest angle (" .. string.format("%.1f -> %.1f", held, after) .. ")")
+end
+
 T.done()
 if T.failures > 0 then error("offboard tests failed") end

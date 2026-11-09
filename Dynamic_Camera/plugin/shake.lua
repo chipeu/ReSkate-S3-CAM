@@ -14,6 +14,10 @@
 --   Shake.update(s, dt, speed, distance, enabled, settings, bank) -> out
 --        out = s.out (REUSED every call): { pitch, yaw, roll (radians), translation (vector, camera-local x right,
 --        y up, z back) }. `bank` is optional (the default bank).
+--   Shake.kick_rattle(s, fraction, settings) -> started (bool): the landing rattle, a rotation-only shudder that is a pure
+--        function of the time since the kick (see Shake.rattle_at)
+--   Shake.rattle(s, settings, lead) -> vector(pitch, yaw, roll) radians, `lead` seconds back from the last update, times the weight
+--   Shake.rattle_age(s, lead)            s since the running kick
 --   s.impulse, s.weight, s.time          state (read-only)
 --
 -- Number precision: the bank is generated in doubles (the C++ uses floats) and then stored in vectors (floats).
@@ -30,6 +34,7 @@ local fmod = math.fmod
 local vcreate = vector.create
 local vdot = vector.dot
 local vmagnitude = vector.magnitude
+local sin, exp = math.sin, math.exp
 local ZERO = S3.ZERO
 local UP = vcreate(0, 1, 0)
 
@@ -179,6 +184,12 @@ function M.settings()
 		distance_zero = 3.4, -- m: no shake at or beyond this distance
 		weight_rate = 5.0, -- per second fade in/out
 		broken_bone_scale = 20.0, -- landing impulse multiplier for a broken-bone landing
+		-- Landing rattle: a quick rotation-only shudder after a hard landing (see M.rattle_at). Peak angles at a full landing with
+		-- Landing shake strength 10; they scale with the landing fraction squared and with the strength / 10.
+		rattle_pitch_deg = 3.0, -- TUNE
+		rattle_yaw_deg = 1.5, -- TUNE
+		rattle_roll_deg = 2.0, -- TUNE
+		rattle_decay = 0.09, -- TUNE: s, the time constant it dies away with (under 10% by about 0.2 s)
 	}
 end
 
@@ -186,7 +197,7 @@ local NUMERIC = {
 	"one_shot_magnitude", "one_shot_min_velocity", "one_shot_max_velocity", "one_shot_frequency", "one_shot_decay",
 	"amplitude_min", "amplitude_max", "amplitude_top_speed", "frequency_min", "frequency_max", "frequency_top_speed",
 	"data_fps", "translation_multiplier", "rotation_multiplier", "dutch_multiplier", "distance_full", "distance_zero",
-	"weight_rate", "broken_bone_scale",
+	"weight_rate", "broken_bone_scale", "rattle_pitch_deg", "rattle_yaw_deg", "rattle_roll_deg", "rattle_decay",
 }
 
 function M.valid(s)
@@ -202,7 +213,9 @@ function M.valid(s)
 		and s.amplitude_max >= 0 and s.amplitude_top_speed >= 0 and s.frequency_min >= 0 and s.frequency_max >= 0
 		and s.frequency_top_speed >= 0 and s.data_fps > 0 and s.translation_multiplier >= 0
 		and s.rotation_multiplier >= 0 and s.distance_zero > s.distance_full and s.weight_rate >= 0
-		and s.broken_bone_scale >= 0
+		and s.broken_bone_scale >= 0 and s.rattle_pitch_deg >= 0 and s.rattle_pitch_deg <= 45 and s.rattle_yaw_deg >= 0
+		and s.rattle_yaw_deg <= 45 and s.rattle_roll_deg >= 0 and s.rattle_roll_deg <= 45 and s.rattle_decay >= 0.01
+		and s.rattle_decay <= 0.5
 end
 
 -- ---------------------------------------------------------------- the shake
@@ -212,12 +225,15 @@ function M.new()
 		time = 0.0,
 		impulse = 0.0,
 		weight = 0.0,
+		rattle_age = 1.0e9, -- s since the last kick (huge: none yet)
+		rattle_scale = 0.0,
 		out = { pitch = 0.0, yaw = 0.0, roll = 0.0, translation = ZERO },
 	}
 end
 
 function M.reset(s)
 	s.time, s.impulse, s.weight = 0.0, 0.0, 0.0
+	s.rattle_age, s.rattle_scale = 1.0e9, 0.0
 	s.out.pitch, s.out.yaw, s.out.roll, s.out.translation = 0.0, 0.0, 0.0, ZERO
 end
 
@@ -281,7 +297,7 @@ function M.update(s, dt, speed, distance, enabled, set, bank)
 			+ M.curve_sample(set.amplitude_curve, clamp01(speed / set.amplitude_top_speed))
 				* (set.amplitude_max - set.amplitude_min)
 	end
-	amplitude = (s.impulse + amplitude) * s.weight
+	local rumble_amplitude = amplitude * s.weight
 	local frequency = set.frequency_min
 	if set.frequency_top_speed ~= 0.0 then
 		frequency = set.frequency_min
@@ -306,17 +322,92 @@ function M.update(s, dt, speed, distance, enabled, set, bank)
 	local tl, tr = bank.translation[left + 1], bank.translation[right + 1]
 	local rot = rl + (rr - rl) * fraction
 	local tra = tl + (tr - tl) * fraction
-	local rot_gain = amplitude * fade * set.rotation_multiplier
+	-- The speed rumble fades with the camera's distance; the landing impulse does not: a big air pulls the camera back, and the same
+	-- landing shook 0 to 100% depending on where it happened to sit.
+	local kick_amplitude = s.impulse * s.weight
+	local rot_gain = (kick_amplitude + rumble_amplitude * fade) * set.rotation_multiplier
 	local out = s.out
 	out.pitch = rot.x * rot_gain
 	out.yaw = rot.y * rot_gain
 	out.roll = rot.z * rot_gain * set.dutch_multiplier
-	out.translation = tra * (set.translation_multiplier * amplitude * fade)
+	-- The kick's share of the translation leaves out the push along the camera's view axis (local Z): a landing that moved the camera
+	-- toward or away from the skater read as the camera hitting him. The rumble keeps its own (a few mm at most). The rotation is
+	-- untouched, and the kick reads the same bank at the same running position as the rumble.
+	out.translation = tra * (set.translation_multiplier * rumble_amplitude * fade)
+		+ vcreate(tra.x, tra.y, 0.0) * (set.translation_multiplier * kick_amplitude)
+	s.rattle_age = s.rattle_age + dt
 	s.impulse = s.impulse * (1.0 - set.one_shot_decay) -- per update, not dt-scaled
 	if s.impulse < 0.005 then
 		s.impulse = 0.0
 	end
 	return out
+end
+
+-- ---------------------------------------------------------------- the landing rattle
+-- A rotation-only layer, a pure function of the time `t` since the landing kick (no integration, so every frame rate draws the same
+-- curve), added to the camera's yaw / pitch / roll after the shake and never moving the camera:
+--   envelope(t) = (1 - exp(-t / rise)) * exp(-t / decay), 0 from rattle_end on
+--   axis(t)     = amplitude * scale * gain * envelope(t) * (0.65 sin(2 pi f1 t) + 0.35 sin(2 pi f2 t))
+-- The two frequencies per axis are 10-24 Hz and do not divide each other, so it reads as a rattle and not a sway. Every sine starts
+-- at 0, so the first swing builds up within a frame or two; pitch swings down first. `gain` makes the axis peak equal its amplitude.
+M.rattle_rise = 0.006 -- s: the jolt's attack
+M.rattle_end = 0.6 -- s: zero from here on
+
+function M.rattle_envelope(t, set)
+	if not (t >= 0.0) or t >= M.rattle_end then
+		return 0.0
+	end
+	return (1.0 - exp(-t / M.rattle_rise)) * exp(-t / max(set.rattle_decay, 1e-3))
+end
+
+local TWO_PI = 6.28318530718
+local TO_RAD = 0.01745329252
+
+local function wave(t, f1, f2, gain)
+	return gain * (0.65 * sin(TWO_PI * f1 * t) + 0.35 * sin(TWO_PI * f2 * t))
+end
+
+-- The three angles (x pitch, y yaw, z roll, radians) `t` seconds after a kick of `scale` (f^2 * strength / 10; 1 = the full amplitudes).
+function M.rattle_at(t, scale, set)
+	local e = M.rattle_envelope(t, set) * scale
+	if not (e > 0.0) then
+		return ZERO
+	end
+	return vcreate(
+		-set.rattle_pitch_deg * TO_RAD * e * wave(t, 12.7, 19.3, 1.3534),
+		set.rattle_yaw_deg * TO_RAD * e * wave(t, 15.1, 22.9, 1.3660),
+		set.rattle_roll_deg * TO_RAD * e * wave(t, 11.3, 17.9, 1.3687)
+	)
+end
+
+-- A landing of 0..1 `fraction` kicks the rattle. A kick takes over only when it is at least what the running one still gives
+-- (scale >= its envelope * scale), and restarts the clock; a weaker one leaves it alone.
+function M.kick_rattle(s, fraction, set)
+	if fraction - fraction ~= 0 then
+		return false
+	end
+	local f = clamp01(fraction)
+	local scale = f * f * set.one_shot_magnitude * 0.1
+	if not (scale > 0.0) then
+		return false
+	end
+	if scale < s.rattle_scale * M.rattle_envelope(s.rattle_age, set) then
+		return false
+	end
+	s.rattle_scale = scale
+	s.rattle_age = 0.0
+	return true
+end
+
+-- The rattle's angles now, `lead` seconds back from the last update (the published pose is interpolated between two updates), times the
+-- shake's weight: off with the shake, and faded in and out with it.
+function M.rattle(s, set, lead)
+	local r = M.rattle_at(s.rattle_age - (lead or 0.0), s.rattle_scale, set)
+	return r * s.weight
+end
+
+function M.rattle_age(s, lead)
+	return s.rattle_age - (lead or 0.0)
 end
 
 return M

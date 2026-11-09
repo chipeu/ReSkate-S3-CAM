@@ -7,7 +7,7 @@
 --  * Descriptions: toggles and dropdowns carry them as their help text; a slider has none, so its description is a muted note
 --    under it. "Show descriptions" (top card) hides those notes.
 --  * No greyed-out controls: a control that depends on another one stays on screen and simply does nothing while that one is off.
---  * No Native+ style, so the style choice, LANDING BOUNCE and NATIVE+ SETTINGS are not here (a note says so).
+--  * No Native+ style, so the style choice and NATIVE+ SETTINGS are not here (a note says so). LANDING BOUNCE is (the dip works in the Full style).
 --  * No text field: the preset name is typed in a dialog (Manage presets...), which also lists, loads, renames, deletes and
 --    imports presets. There is no clipboard in the plugin API: share a preset as its file (Open preset folder) and import with the
 --    dialog's file button.
@@ -122,14 +122,17 @@ function Menu.build(ui)
 		state.feedback = nil
 	end
 	ui:card("DYNAMIC CAMERA")
-	ui:note("Settings for the camera: follow, tricks, jumps, landings and effects, and the view off the board.")
+	if deps.custom and deps.custom.available and not ui.custom then
+		if ui:button("ui_open_custom", "Open custom menu", true) then deps.custom:show("menu") end
+	end
+
 	local on = ui:toggle("main_on", "Dynamic Camera", store.enabled,
-		"Enables the camera. In menus and the Replay Editor the game's camera takes over. On foot, see the OFF THE BOARD tab.")
+		help and "Use Dynamic Camera while playing." or nil)
 	if on ~= store.enabled then
 		store:set_enabled(on)
 	end
 	ui:info("Status", glue:status())
-	local show = ui:toggle("show_help", "Show descriptions", store.show_help, "Shows a short description under each slider.")
+	local show = ui:toggle("show_help", "Show descriptions", store.show_help, help and "Show control descriptions." or nil)
 	if show ~= store.show_help then
 		store:set_show_help(show)
 	end
@@ -155,9 +158,9 @@ function Menu.build(ui)
 			state.selected = names[1]
 			index = 1
 		end
-		ui:card("PRESETS", "Save, load, and manage camera setups")
+		ui:card("PRESETS")
 		index = ui:dropdown("preset_pick", "Preset", names, index,
-			help and "The saved camera setups. 'Manage presets...' shows them all (this list holds the first 32)." or nil)
+			help and "Select a saved preset." or nil)
 		local picked = names[index]
 		if picked ~= state.selected then
 			state.selected = picked
@@ -177,7 +180,7 @@ function Menu.build(ui)
 			answer(Presets.load(store, state.selected))
 			discard = true
 		end
-		note("Applies the selected preset without changing whether the camera is enabled.")
+
 		local saved = chosen ~= nil and not chosen.built_in
 		local deleting = saved and state.armed_delete == state.selected
 		if ui:button("preset_delete", deleting and "Really delete?" or "Delete preset") then
@@ -191,14 +194,14 @@ function Menu.build(ui)
 				state.armed_delete = state.selected
 			end
 		end
-		if ui:button("preset_manage", "Manage presets... (save, rename, import)") then
+		if ui:button("preset_manage", "Manage presets…") then
 			Menu.open_dialog("")
 		end
-		note("Opens a window to save the camera under a name, rename or delete presets, and import a preset file.")
+
 		if ui:button("preset_folder", "Open preset folder") then
 			answer(Presets.reveal())
 		end
-		note("Shows the preset folder in Explorer. Copy a .json file out to share it, or in to add one: it appears in the list by itself.")
+		note("Copy preset files here to import or share them.")
 		if ui:button("preset_refresh", "Refresh preset list") then
 			state.scan_at = 0.0
 			state.result, state.result_ok = "Preset list refreshed.", true
@@ -212,251 +215,289 @@ function Menu.build(ui)
 		end
 	elseif tab == 2 then
 		-- ---- CAMERA
-		ui:card("CAMERA", "Camera style, view and position")
-		ui:note("Camera style: this plugin has the Full style only (it controls the whole view). Native+ is not included.")
+		ui:card("CAMERA")
+
 		local h, changed = pick("cam_height", "Camera view", { "Low", "High" }, draft.angle == Angle.High and 2 or 1,
-			{ "The camera sits low, close to the ground.", "The camera sits higher and looks down more." })
+			{ "Use the Low view.", "Use the High view." })
 		if changed then
 			draft.angle = h == 2 and Angle.High or Angle.Low
 			s_changed = true
 		end
-		toggle("o_r3", "Switch camera view with R3", "R3 switches between the Low and High camera views, also during bails.", opts, "follow_game_height")
+		toggle("o_r3", "Switch camera view with R3", "Press R3 to switch between Low and High.", opts, "follow_game_height")
+
+		local follow = draft.follow
+		ui:card("CAMERA STYLE")
+		local style, style_changed = pick("cam_style", "Camera style", { "Classic", "Joint lock (Experimental)" },
+			follow.camera_style == "joint_lock" and 2 or 1,
+			{ "Use the existing crouch and pop camera controls.", "Follow a body landmark vertically." })
+		if style_changed then
+			follow.camera_style = style == 2 and "joint_lock" or "classic"
+			s_changed = true
+		end
+		if follow.camera_style == "joint_lock" then
+			ui:card("JOINT LOCK")
+			local targets = { "Head", "Chest", "Feet", "Knee", "Hips", "Skateboard" }
+			local keys = { "head", "chest", "feet", "knee", "hips", "skateboard" }
+			local selected = 1
+			for i, key in keys do
+				if follow.joint_target == key then selected = i end
+			end
+			local target, target_changed = pick("joint_target", "Follow target", targets, selected,
+				{ "Follow the head height.", "Follow the chest height.", "Follow the feet height.", "Follow the knees height.", "Follow the hips height.", "Follow the skateboard height." })
+			if target_changed then follow.joint_target = keys[target]; s_changed = true end
+			local damping = ui:slider("joint_damping", "Joint damping", follow.joint_damping, 0, 100, "%.0f%%")
+			note("0% responds immediately. Higher values ease vertical movement more strongly.")
+			if damping ~= follow.joint_damping then follow.joint_damping = damping; s_changed = true end
+		else
+			ui:card("POP HEIGHT FOLLOW")
+			toggle("pop_follow", "Follow pop height", "Follow the skater's small pops. Large drops stay in view in either setting.", follow, "trick_pop")
+			local pm,pm_changed=pick("pop_mode","Pop follow mode",{"Camera height","Camera pitch"},follow.pop_mode+1,
+				{"Move the camera up with the pop.","Keep camera height steady and tilt up with the pop."})
+			if pm_changed then follow.pop_mode=pm-1;s_changed=true end
+			local pop_percent=ui:slider("pop_amount","Pop follow strength",follow.pop_amount*100.0,0,100,"%.0f%%")
+			if pop_percent~=follow.pop_amount*100.0 then follow.pop_amount=pop_percent/100.0;s_changed=true end
+
+			ui:card("CROUCH")
+			toggle("crouch_on", "Follow crouching", "Follow the skater lowering into a crouch.", follow, "crouch_enabled")
+			local cm,cm_changed=pick("crouch_mode","Crouch follow mode",{"Camera height","Camera pitch"},follow.crouch_mode+1,
+				{"Move the camera down with the crouch.","Keep camera height steady and tilt down with the crouch."})
+			if cm_changed then follow.crouch_mode=cm-1;s_changed=true end
+			local percent = ui:slider("crouch_amount", "Crouch follow strength", follow.crouch_amount * 100.0, 0, 100, "%.0f%%")
+			if percent ~= follow.crouch_amount * 100.0 then follow.crouch_amount = percent / 100.0; s_changed = true end
+			note("Adjust how much the camera follows.")
+		end
 
 		ui:card("CAMERA POSITION")
-		camera_for("pos_for", "Edit camera position for", "Edit the position of the Low camera.", "Edit the position of the High camera.")
+		camera_for("pos_for", "Camera position", "Edit the Low view.", "Edit the High view.")
 		local fr = framing()
 		slider("pos_height", "Camera elevation angle",
-			"How high the camera sits around you, as an angle. Higher: further above you, looking down. Lower: closer to the ground.",
+			"Adjust how high the camera sits.",
 			fr, "height_degrees", -30, 45, "%.1f degrees")
-		slider("pos_pitch", "View aim angle", "Aims the view higher or lower without moving the camera. Higher: more sky. Lower: more ground.",
+		slider("pos_pitch", "View aim angle", "Aim the view up or down.",
 			fr, "pitch_degrees", -30, 30, "%.1f degrees")
 
-		ui:card("CAMERA DISTANCE", "Low and High each have their own")
-		camera_for("dist_for", "Edit camera distance for", "Edit the distance of the Low camera.", "Edit the distance of the High camera.")
+		ui:card("CAMERA DISTANCE")
+		camera_for("dist_for", "Camera distance", "Edit the Low view.", "Edit the High view.")
 		local ride = state.position_for == 1 and draft.ride_distance_high or draft.ride_distance
-		local m, mchanged = pick("dist_mode", "Camera distance mode", { "Speed-based", "Fixed" }, ride.mode == DistMode.Fixed and 2 or 1, {
-			"The camera sits closer when you are slow and further back at top speed.",
-			"The camera stays the same distance at every speed, and the game's own FOV widening at speed is left out (Speed-based FOV still applies). Only a big air moves the camera back, as far as it needs to keep you in view.",
-		})
+		local m, mchanged = pick("dist_mode", "Distance mode", { "Speed-based", "Fixed" }, ride.mode == DistMode.Fixed and 2 or 1, { "Change distance with speed.", "Lock riding distance and FOV to the body. Collision can move the camera." })
 		if mchanged then
 			ride.mode = m == 2 and DistMode.Fixed or DistMode.Speed
 			s_changed = true
 		end
 		if ride.mode == DistMode.Fixed then
 			slider("dist_fixed", "Camera distance",
-				"How far behind you the camera stays while riding, at any speed. A wall can still bring it closer for a moment. Manual and grind close-ups have their own distances.",
+				"Set the riding distance.",
 				ride, "fixed", 0.5, 10, "%.2f m")
 		else
-			slider("dist_slow", "Camera distance at low speed", "How far behind you the camera sits when standing or riding slowly.",
+			slider("dist_slow", "Distance at low speed", "Set the distance when riding slowly.",
 				ride, "slow", 0.5, ride.fast, "%.2f m")
-			slider("dist_fast", "Camera distance at top speed",
-				"How far behind you the camera sits when you ride fast. It eases between the two distances as your speed changes.",
+			slider("dist_fast", "Distance at top speed",
+				"Set the distance when riding fast.",
 				ride, "fast", ride.slow, 10, "%.2f m")
 		end
 
-		ui:card("CAMERA COLLISION", "Walls, poles and the ground")
-		toggle("col_on", "Camera collision", "The camera moves in front of walls instead of going through them.", draft.collision, "enabled")
+		ui:card("CAMERA COLLISION")
+		toggle("col_on", "Camera collision", "Keep the camera clear of walls.", draft.collision, "enabled")
 		toggle("col_auto", "Automatic collision handling",
-			"On: the camera handles walls and the ground by itself, and lets thin things like poles and rails pass. Off: the values in MANUAL COLLISION SETTINGS (ADVANCED tab) are used.",
+			"Handle collision automatically. Turn off to use Manual collision settings.",
 			draft.collision, "automatic")
 	elseif tab == 3 then
 		-- ---- FOLLOW & MOVEMENT
 		local follow = draft.follow
-		ui:card("FOLLOW", "How the camera follows your riding")
-		slider("fl_strength", "Follow responsiveness", "How quickly the camera catches up with you. Higher: less lag. Lower: more lag. 1x is normal.",
+		ui:card("FOLLOW")
+		slider("fl_strength", "Follow responsiveness", "Adjust position and shot easing. Turn-follow strength controls cruising yaw.",
 			follow, "strength", 0.2, 4, "%.2fx")
 		slider("fl_horizontal", "Turn-follow strength",
-			"How strongly the camera turns with your direction. 0: off, the normal lazy swing. 10: locked to your direction, so flat tricks, reverts and spins do not turn it and carving does.",
+			"Set cruising yaw response. At 10, chase the travel direction directly. Trick turn is separate.",
 			follow, "horizontal", 0, 10, "%.1f")
-		toggle("fl_dynamic", "Reduce follow lag at speed", "The faster you go, the less the camera lags behind you.", follow, "dynamic")
-		slider("fl_dspeed", "Speed for max follow boost",
-			"The speed at which the follow boost is full. Higher: you must go faster to get it. Lower: you get it at lower speeds.",
+		toggle("fl_dynamic", "Reduce lag at speed", "Increase follow responsiveness at speed.", follow, "dynamic")
+		slider("fl_dspeed", "Speed for maximum follow boost",
+			"Set the speed for the full follow boost.",
 			follow, "dynamic_speed", 0.5, 60, "%.1f m/s")
-		slider("fl_boost", "Speed-based follow boost", "Extra follow responsiveness at that speed. Higher: the camera lags even less. Lower: it changes less.",
+		slider("fl_boost", "Speed-based follow boost", "Adjust the extra responsiveness at speed.",
 			follow, "dynamic_boost", 0, 3, "+%.2f")
 
 		local sh = draft.shoulder
 		ui:card("SHOULDER CAMERA")
 		local mode, mchanged = pick("sh_mode", "Shoulder camera", { "Off", "Manual", "Auto" },
 			sh.mode == Shoulder.Manual and 2 or (sh.mode == Shoulder.Auto and 3 or 1),
-			{ "You stay in the middle of the screen.", "You pick the side below.", "The camera sits on the toe side of your stance." })
+			{ "Centre the camera.", "Choose a side.", "Use the stance to choose a side." })
 		if mchanged then
 			sh.mode = mode == 2 and Shoulder.Manual or (mode == 3 and Shoulder.Auto or Shoulder.Off)
 			s_changed = true
 		end
-		local side, schanged = pick("sh_side", "Shoulder side", { "Left", "Right" }, sh.side == 1 and 2 or 1, {
-			"The camera sits to your left, so you are right of the screen centre. Used when Shoulder camera is Manual.",
-			"The camera sits to your right, so you are left of the screen centre. Used when Shoulder camera is Manual.",
-		})
+		local side, schanged = pick("sh_side", "Shoulder side", { "Left", "Right" }, sh.side == 1 and 2 or 1, { "Place the camera on the left.", "Place the camera on the right." })
 		if schanged then
 			sh.side = side == 2 and 1 or -1
 			s_changed = true
 		end
-		local stance, tchanged = pick("sh_stance", "Auto shoulder stance", { "Regular", "Goofy" }, sh.goofy and 2 or 1, {
-			"Regular rides with the toes to the right; riding switch flips it. Used when Shoulder camera is Auto.",
-			"Goofy rides with the toes to the left. Used when Shoulder camera is Auto.",
-		})
+		local stance, tchanged = pick("sh_stance", "Auto shoulder stance", { "Regular", "Goofy" }, sh.goofy and 2 or 1, { "Use a regular stance.", "Use a goofy stance." })
 		if tchanged then
 			sh.goofy = stance == 2
 			s_changed = true
 		end
-		slider("sh_offset", "Shoulder offset", "Higher: you sit further to the side of the screen. Lower: closer to the middle.", sh, "offset", 0, 1, "%.2f m")
-		slider("sh_time", "Shoulder switch time", "Higher: the camera slides across slowly. Lower: it slides across quickly.", sh, "switch_time", 0, 5, "%.2f s")
-		ui:note("Bind 'Switch shoulder side' on ReSkate's Binds page (L3 in Skate 3) to switch shoulder sides.")
+		slider("sh_offset", "Shoulder offset", "Move the camera sideways.", sh, "offset", 0, 1, "%.2f m")
+		slider("sh_time", "Shoulder switch time", "Set how long a shoulder switch takes.", sh, "switch_time", 0, 5, "%.2f s")
+		ui:note("L3 switches shoulder side.")
 
 		local look = draft.look
 		ui:card("SLOPE TILT")
-		toggle("sl_on", "Slope tilt", "On the ground, the view tilts down going downhill and up going uphill.", look, "slope_look")
-		slider("sl_strength", "Slope tilt strength", "Higher: the view tilts more on hills. Lower: it stays more level.", look, "slope_look_strength", 0, 1, "%.2f")
+		toggle("sl_on", "Slope tilt", "Tilt with hills while riding.", look, "slope_look")
+		slider("sl_strength", "Slope tilt strength", "Adjust how much the view tilts with hills.", look, "slope_look_strength", 0, 1, "%.2f")
 		slider("sl_response", "Tilt transition time",
-			"How quickly the view's up and down tilt settles. Also sets the timing of the landing tilt, changes to the view aim angle, and the manual and grind camera targets. Higher: slower. Lower: right away.",
+			"Set how quickly tilt and aim changes settle.",
 			look, "response_time", 0.15, 5, "%.2f s")
 	elseif tab == 4 then
 		-- ---- TRICKS & CLOSE-UPS
 		local yaw = draft.trick_yaw
-		ui:card("TRICK CAMERA TURN", "Camera turns during tricks")
-		ui:note("The camera turns to show the trick, holds that angle while you keep tricking, and returns behind you after landing.")
-		toggle("ty_on", "Trick camera turn", "Turns the camera to the side during tricks.", yaw, "enabled")
-		slider("ty_angle", "Trick camera angle", "Higher: the camera turns further to the side. Lower: it stays closer behind you.", yaw, "angle_degrees", 0, 45, "%.0f degrees")
-		local side, changed = pick("ty_side", "Trick camera direction", { "Auto", "Left", "Right" }, yaw.side < 0 and 2 or (yaw.side > 0 and 3 or 1), {
-			"Follows the shoulder side, or your stance if the shoulder is off.", "The camera turns to your left.", "The camera turns to your right.",
-		})
+		ui:card("TRICK CAMERA")
+
+		toggle("ty_on", "Trick camera turn", "Turn the camera to show tricks.", yaw, "enabled")
+		slider("ty_angle", "Trick camera angle", "Set how far the camera turns.", yaw, "angle_degrees", 0, 45, "%.0f degrees")
+		local side, changed = pick("ty_side", "Trick camera direction", { "Auto", "Left", "Right" }, yaw.side < 0 and 2 or (yaw.side > 0 and 3 or 1), { "Follow the shoulder side or stance.", "Turn left.", "Turn right." })
 		if changed then
 			yaw.side = side == 2 and -1 or (side == 3 and 1 or 0)
 			s_changed = true
 		end
-		toggle("ty_air", "Air trick camera turn", "Turns the camera during airs and flip tricks.", yaw, "in_air")
-		toggle("ty_grind", "Grind camera turn", "Turns the camera while grinding.", yaw, "on_grinds")
-		toggle("ty_manual", "Manual camera turn", "Turns the camera while manualling.", yaw, "on_manuals")
+		toggle("ty_air", "Air trick camera turn", "Turn the camera during air tricks.", yaw, "in_air")
+		toggle("ty_grind", "Grind camera turn", "Turn the camera during grinds.", yaw, "on_grinds")
+		toggle("ty_manual", "Manual camera turn", "Turn the camera during manuals.", yaw, "on_manuals")
 		slider("ty_minair", "Minimum airtime for camera turn",
-			"Higher: you must be in the air longer before the camera turns, so a plain ollie stays centred. Lower: it turns sooner.",
+			"Set the airtime needed before the camera turns.",
 			yaw, "min_air_time", 0, 3, "%.2f s")
-		slider("ty_in", "Camera turn-in time", "Higher: the camera turns slowly. Lower: it turns quickly.", yaw, "in_time", 0.15, 5, "%.2f s")
+		slider("ty_in", "Camera turn time", "Set how long the camera takes to turn.", yaw, "in_time", 0.15, 5, "%.2f s")
 		slider("ty_hold", "Camera angle hold time",
-			"Higher: the camera stays turned longer after the trick. Lower: it comes back sooner. A new trick keeps the angle.", yaw, "hold_time", 0, 5, "%.2f s")
-		slider("ty_return", "Camera return time", "Higher: the camera is slower to come back behind you. Lower: it comes back quicker.",
+			"Hold the angle after a trick.", yaw, "hold_time", 0, 5, "%.2f s")
+		slider("ty_return", "Camera return time", "Set how long the camera takes to return behind you.",
 			yaw, "return_time", 0.15, 10, "%.2f s")
 
 		local cmd = Settings.closeup_min_distance
 		ui:card("MANUAL CAMERA")
-		camera_for("man_for", "Edit manual camera for", "Edit the manual close-up of the Low camera.", "Edit the manual close-up of the High camera.")
+		camera_for("man_for", "Manual camera", "Edit the Low view.", "Edit the High view.")
 		local fr = framing()
-		toggle("man_on", "Manual close-up", "On: the camera moves in close for manuals and nose manuals. Off: it keeps its normal distance.", fr, "manual_camera")
-		local mm, mchanged = pick("man_mode", "Manual camera distance mode", { "Fixed close-up", "Speed-based" }, fr.manual_mode == ManualMode.Speed and 2 or 1, {
-			"The camera stays at the manual camera distance at every speed.",
-			"The camera sits at the minimum distance when slow and eases out to the maximum at 8 m/s and faster.",
-		})
+		toggle("man_on", "Manual close-up", "Use a closer view during manuals.", fr, "manual_camera")
+		local mm, mchanged = pick("man_mode", "Manual distance mode", { "Fixed", "Speed-based" }, fr.manual_mode == ManualMode.Speed and 2 or 1, { "Keep a fixed distance.", "Change distance with speed." })
 		if mchanged then
 			fr.manual_mode = mm == 2 and ManualMode.Speed or ManualMode.Fixed
 			s_changed = true
 		end
 		if fr.manual_mode == ManualMode.Speed then
-			slider("man_min", "Minimum manual camera distance", "How far back the camera sits in a slow manual. It never comes closer than this.",
+			slider("man_min", "Minimum manual distance", "Set the distance at low speed.",
 				fr, "manual_min_distance", cmd, fr.manual_max_distance, "%.2f m")
-			slider("man_max", "Maximum manual camera distance",
-				"How far back the camera sits in a manual at 8 m/s and faster. It never goes further than this.", fr, "manual_max_distance",
+			slider("man_max", "Maximum manual distance",
+				"Set the distance at 8 m/s and above.", fr, "manual_max_distance",
 				fr.manual_min_distance, 8, "%.2f m")
 		else
-			slider("man_dist", "Manual camera distance", "How far back the camera sits in a manual, at every speed. Separate from the main camera distance.",
+			slider("man_dist", "Manual camera distance", "Set the distance during manuals.",
 				fr, "manual_distance", cmd, 8, "%.2f m")
 		end
 		slider("man_height", "Manual camera elevation angle",
-			"Higher: the camera sits further above you in a manual. Lower: closer to the ground. Separate from the main elevation angle.",
+			"Adjust the camera height during manuals.",
 			fr, "manual_height_degrees", -30, 45, "%.1f degrees")
-		slider("man_pitch", "Manual view aim angle", "Where the view points in a manual. Higher: up. Lower: down. Separate from the main view aim angle.",
+		slider("man_pitch", "Manual view aim angle", "Aim the view during manuals.",
 			fr, "manual_pitch_degrees", -30, 30, "%.1f degrees")
-		slider("man_focus", "Manual camera target", "0: the camera looks at the board. 1: it looks at your upper body.", draft.look, "manual_focus", 0, 1, "%.2f")
+		slider("man_focus", "Manual camera target", "0 targets the board. 1 targets the upper body.", draft.look, "manual_focus", 0, 1, "%.2f")
 
 		ui:card("GRIND CAMERA")
-		camera_for("grd_for", "Edit grind camera for", "Edit the grind close-up of the Low camera.", "Edit the grind close-up of the High camera.")
+		camera_for("grd_for", "Grind camera", "Edit the Low view.", "Edit the High view.")
 		fr = framing()
-		toggle("grd_on", "Grind close-up", "On: grinds use their own close-up view. Off: the camera keeps its normal view.", fr, "grind_camera")
-		slider("grd_dist", "Grind camera distance", "How far back the camera sits in a grind. Separate from the main camera distance.",
+		toggle("grd_on", "Grind close-up", "Use a closer view during grinds.", fr, "grind_camera")
+		slider("grd_dist", "Grind camera distance", "Set the distance during grinds.",
 			fr, "grind_distance", cmd, 8, "%.2f m")
 		slider("grd_height", "Grind camera elevation angle",
-			"Higher: the camera sits further above you in a grind. Lower: closer to the ground. Separate from the main elevation angle.",
+			"Adjust the camera height during grinds.",
 			fr, "grind_height_degrees", -30, 45, "%.1f degrees")
-		slider("grd_pitch", "Grind view aim angle", "Where the view points in a grind. Higher: up. Lower: down. Separate from the main view aim angle.",
+		slider("grd_pitch", "Grind view aim angle", "Aim the view during grinds.",
 			fr, "grind_pitch_degrees", -30, 30, "%.1f degrees")
-		slider("grd_focus", "Grind camera target", "0: the camera looks at the board. 1: it looks at your upper body.", draft.look, "grind_focus", 0, 1, "%.2f")
+		slider("grd_focus", "Grind camera target", "0 targets the board. 1 targets the upper body.", draft.look, "grind_focus", 0, 1, "%.2f")
 
-		ui:card("CLOSE-UP SETTINGS", "Shot changes, manuals and grinds")
+		ui:card("CLOSE-UPS")
 		slider("cu_blend", "Camera transition time multiplier",
-			"Multiplies how long the camera takes to change from one shot to the next (riding, tricks, manuals, grinds) and to move into a close-up. Higher: slower. Lower: quicker. 1x is normal. Close-up return time and the trick camera turn times are not affected.",
+			"Adjust the time between camera views.",
 			draft.look, "shot_blend", 0.25, 4, "%.2fx")
 		toggle("cu_board", "Track board in close-ups",
-			"On: in manuals and grinds the camera circles and aims at your board. Off: it aims at your body as usual.", draft.look, "board_anchor")
+			"Use the board as the close-up target.", draft.look, "board_anchor")
 		slider("cu_exit", "Close-up return time",
-			"How long the camera takes to move back out after a manual or grind ends (a trick, or riding off). Higher: slower. Lower: quicker.",
+			"Set how long the camera takes to leave a close-up.",
 			draft.look, "closeup_exit_time", 0.2, 3, "%.2f s")
 	elseif tab == 5 then
 		-- ---- AIR & LANDING
 		local air = draft.air_camera
-		ui:card("BIG AIR", "Camera movement while jumping")
-		toggle("ba_keep", "Keep skater in frame", "Aims the camera so you do not leave the screen while you are in the air.", air, "keep_in_frame")
+		ui:card("BIG AIR")
+		toggle("ba_keep", "Keep skater in frame", "Keep the skater visible during jumps.", air, "keep_in_frame")
 		slider("ba_follow", "Camera rise ratio",
-			"How much of your height gain the camera follows in a big air. Higher: it rises more with you. Lower: it stays near the height you took off from.",
+			"Adjust how much the camera rises with the skater.",
 			air, "follow_height", 0.25, 1, "%.2f")
 		slider("ba_rise", "Big-air camera rise angle",
-			"Higher: in a big air the camera swings further up over you and looks down at the landing. Lower: it stays behind you.",
+			"Set how far the camera rises over the skater.",
 			air, "rise_degrees", 0, 40, "%.0f degrees")
-		slider("ba_full", "Jump height for max big-air rise",
-			"Jump height (or drop below takeoff) for the full rise. Higher: only very big jumps or drops get it. Lower: even small ones do.",
+		slider("ba_full", "Jump height for maximum rise",
+			"Set the height needed for full camera rise.",
 			air, "rise_full_height", 0.1, 20, "%.1f m")
-		slider("ba_ease", "Big-air rise transition time", "Higher: the rise builds and settles back more slowly. Lower: it reacts faster.",
+		slider("ba_ease", "Big-air rise time", "Set how quickly the camera rises and settles.",
 			air, "ease_time", 0.15, 3, "%.2f s")
 
 		local look = draft.look
 		ui:card("LANDING VIEW")
 		toggle("lv_on", "Landing camera tilt",
-			"When you jump down to something lower (stairs, gaps), the camera tilts down to show where you will land.", look, "landing_look")
-		slider("lv_strength", "Landing tilt strength", "Higher: the camera tilts down more toward the landing. Lower: it tilts less.",
+			"Tilt toward the landing on drops.", look, "landing_look")
+		slider("lv_strength", "Landing tilt strength", "Adjust how much the view tilts toward the landing.",
 			look, "landing_look_strength", 0, 1, "%.2f")
-		slider("lv_drop", "Drop height for max landing tilt",
-			"How far below the takeoff the landing must be for the full tilt. Higher: a bigger drop is needed. Lower: a small drop is enough.",
+		slider("lv_drop", "Drop height for maximum tilt",
+			"Set the drop needed for full landing tilt.",
 			look, "landing_look_full_drop", 0.5, 10, "%.1f m")
 		slider("lv_vertical", "Air vertical tracking strength",
-			"Higher: the view tilts to follow you up and down as you jump (every jump, not just landings). 0: it stays level.",
+			"Adjust how much the view follows vertical movement.",
 			look, "vertical_follow", 0, 1, "%.2f")
-		ui:note("How quickly the landing tilt changes is Tilt transition time, in FOLLOW & MOVEMENT.")
+
 	elseif tab == 6 then
 		-- ---- CAMERA EFFECTS
 		local sp, landing = draft.speed_shake, draft.landing_shake
-		ui:card("CAMERA SHAKE", "Speed, downhill and landing shake")
+		ui:card("CAMERA SHAKE")
 		local shake_on = ui:toggle("sk_on", "Camera shake", draft.shake_enabled,
-			help and "Turns camera shake effects on or off: speed, downhill and landing shake." or nil)
+			help and "Enable camera shake effects." or nil)
 		if shake_on ~= draft.shake_enabled then
 			draft.shake_enabled = shake_on
 			s_changed = true
 		end
-		toggle("sk_speed", "Speed shake", "The camera rumbles more the faster you go.", sp, "enabled")
-		slider("sk_strength", "Speed shake strength", "Higher: a stronger rumble at speed. Lower: a gentler one. 0: none.", sp, "strength", 0, 10, "%.2fx")
-		slider("sk_top", "Speed for max shake", "Higher: you must go faster for the strongest rumble. Lower: it peaks at lower speeds.",
+		toggle("sk_speed", "Speed shake", "Increase shake with speed.", sp, "enabled")
+		slider("sk_strength", "Speed shake strength", "Adjust the shake while riding.", sp, "strength", 0, 10, "%.2fx")
+		slider("sk_top", "Speed for maximum shake", "Set the speed needed for full shake.",
 			sp, "top_speed", 0.5, 80, "%.1f m/s")
-		toggle("sk_down", "Downhill shake", "More rumble riding downhill.", sp, "downhill_boost")
-		slider("sk_down_s", "Downhill shake strength", "Higher: the rumble gets much stronger on a steep downhill. Lower: only a little.",
+		toggle("sk_down", "Downhill shake", "Add shake while riding downhill.", sp, "downhill_boost")
+		slider("sk_down_s", "Downhill shake strength", "Adjust the extra downhill shake.",
 			sp, "downhill_scale", 1, 10, "%.2fx")
-		slider("sk_down_a", "Slope angle for max downhill shake", "Higher: the hill must be steeper for the full extra rumble. Lower: a gentle hill is enough.",
+		slider("sk_down_a", "Slope angle for maximum shake", "Set the slope needed for full downhill shake.",
 			sp, "downhill_full_degrees", 1, 80, "%.0f degrees")
-		slider("sk_land", "Landing shake strength", "Higher: the camera kicks harder when you land. Lower: gentler. 0: no kick.",
+		slider("sk_land", "Landing shake strength", "Adjust the shake on landing.",
 			draft.shake, "one_shot_magnitude", 0, 10, "%.2f")
-		slider("sk_minfall", "Min drop height for landing shake",
-			"Landings that fell less than this do not shake the camera. Higher: more landings count as light. Lower: even small drops shake it.",
+		slider("sk_minfall", "Minimum drop height for shake",
+			"Ignore drops below this height.",
 			landing, "min_fall", 0, min(10, landing.full_fall - 0.1), "%.1f m")
-		slider("sk_fullfall", "Drop height for max landing shake", "Higher: you must fall further for the strongest shake. Lower: smaller falls shake fully.",
+		slider("sk_fullfall", "Drop height for maximum shake", "Set the drop needed for full landing shake.",
 			landing, "full_fall", max(0.5, landing.min_fall + 0.1), 10, "%.1f m")
-		slider("sk_weight", "Speed-based landing shake strength", "Higher: riding fast makes landings shake harder. 0: only how far you fell counts.",
+		slider("sk_weight", "Landing speed influence", "Adjust how much speed adds to landing shake.",
 			landing, "speed_weight", 0, 1, "%.2f")
+
+		local bounce = draft.native_plus
+		ui:card("LANDING BOUNCE")
+		if draft.follow.camera_style == "joint_lock" then
+			ui:note("Landing bounce is disabled by Joint Lock.")
+		else
+			toggle("lb_on", "Landing bounce", "Lower the camera briefly on landing.", bounce, "landing_dip")
+			slider("lb_depth", "Bounce depth", "Adjust how far the camera drops.", bounce, "dip_depth", 0, 2, "%.2f m")
+			slider("lb_time", "Bounce recovery time", "Set how quickly the camera returns after landing.", bounce, "dip_peak_time", 0.02, 2, "%.2f s")
+		end
 
 		local fov = draft.fov
 		ui:card("FIELD OF VIEW")
 		toggle("fv_override", "Override game FOV",
-			"On: this camera sets the FOV. Required for the speed-based and big-air FOV increases. Off: the game's own FOV.", opts, "shot_fov")
+			"Allow Dynamic Camera to set the field of view.", opts, "shot_fov")
 		-- The console accepts 0 or 30-120; the slider jumps over the gap.
 		do
 			local shown = clamp(floor(draft.fov_override_deg + 0.5), 0, 120)
-			local v = floor(ui:slider("fv_base", "Base FOV (0 = game's own)", shown, 0, 120, "%d degrees") + 0.5)
-			note("Higher: a wider view that shows more around you. Lower: a narrower, more zoomed-in view. 0 keeps the game's FOV.")
+			local v = floor(ui:slider("fv_base", "Base FOV", shown, 0, 120, "%d degrees") + 0.5)
+			note("0 uses the game's FOV.")
 			if v ~= shown then
 				if v > 0 and v < 30 then
 					v = v < 15 and 0 or 30
@@ -465,64 +506,62 @@ function Menu.build(ui)
 				s_changed = true
 			end
 		end
-		slider("fv_smooth", "FOV transition time", "How quickly the FOV changes. Higher: slower. Lower: quicker.", fov, "smoothing_time", 0, 5, "%.2f s")
+		slider("fv_smooth", "FOV transition time", "Set how quickly the field of view changes.", fov, "smoothing_time", 0, 5, "%.2f s")
 
 		ui:card("SPEED-BASED FOV")
 		if not opts.shot_fov then
-			ui:note("Turn on Override game FOV above to use this.")
+			ui:note("Enable Override game FOV to use this.")
 		end
-		toggle("sf_on", "Speed-based FOV increase", "The faster you go, the wider the FOV.", fov, "speed_fov")
-		slider("sf_deg", "Maximum speed-based FOV increase", "Higher: the FOV is wider at speed. Lower: it changes less.", fov, "speed_fov_degrees", 0, 40, "+%.1f degrees")
-		slider("sf_min", "Speed to start FOV increase", "Higher: you must go faster before the FOV starts to increase. Lower: it starts at lower speeds.",
+		toggle("sf_on", "Speed-based FOV increase", "Widen the view with speed in Speed-based distance mode.", fov, "speed_fov")
+		slider("sf_deg", "Maximum speed-based FOV increase", "Set the extra field of view at full speed.", fov, "speed_fov_degrees", 0, 40, "+%.1f degrees")
+		slider("sf_min", "Speed to start FOV increase", "Set when the field of view starts widening.",
 			fov, "speed_fov_min", 0, min(60, fov.speed_fov_max - 0.1), "%.1f m/s")
-		slider("sf_max", "Speed for max FOV increase", "Higher: the FOV is widest at a higher speed. Lower: at a lower speed.",
+		slider("sf_max", "Speed for maximum FOV increase", "Set the speed needed for full widening.",
 			fov, "speed_fov_max", max(0.1, fov.speed_fov_min + 0.1), 80, "%.1f m/s")
 
 		ui:card("BIG-AIR FOV")
 		if not opts.shot_fov then
-			ui:note("Turn on Override game FOV above to use this.")
+			ui:note("Enable Override game FOV to use this.")
 		end
-		toggle("af_on", "Big-air FOV increase", "The FOV is wider in a big air.", fov, "air_fov")
-		slider("af_deg", "Maximum big-air FOV increase", "Higher: the FOV is wider in a big air. Lower: it changes less.", fov, "air_fov_degrees", 0, 40, "+%.1f degrees")
-		slider("af_full", "Jump height for max FOV increase", "Higher: only very big jumps give the full FOV increase. Lower: smaller jumps do too.",
+		toggle("af_on", "Big-air FOV increase", "Widen the view during big jumps.", fov, "air_fov")
+		slider("af_deg", "Maximum big-air FOV increase", "Set the extra field of view during big jumps.", fov, "air_fov_degrees", 0, 40, "+%.1f degrees")
+		slider("af_full", "Jump height for maximum FOV increase", "Set the jump height needed for full widening.",
 			fov, "air_fov_full_height", 0.1, 50, "%.1f m")
 	elseif tab == 7 then
 		-- ---- OFF THE BOARD
 		local ob = opts.offboard
-		ui:card("OFF THE BOARD", "The camera while you walk, stand, run and bail")
+		ui:card("OFF-BOARD CAMERA")
 		if not ob or not Off then
 			ui:note("The off-board camera is not available in this install.")
 		else
-			local mode, mchanged = pick("ob_mode", "Off-board camera", { "Dynamic", "Game" }, opts.offboard_mode == "game" and 2 or 1, {
-				"This camera keeps the view on foot and in bails. Use the right stick to look around.",
-				"The game's own camera takes over when you step off the board, after a short ease.",
-			})
+			local mode, mchanged = pick("ob_mode", "Off-board camera mode", { "Dynamic", "Game" }, opts.offboard_mode == "game" and 2 or 1, { "Use Dynamic Camera on foot.", "Use the game's camera on foot." })
 			if mchanged then
 				opts.offboard_mode = mode == 2 and "game" or "dynamic"
 				o_changed = true
 			end
-			local style, tchanged = pick("ob_style", "Style", { "Orbit", "Shoulder" }, ob.style == "shoulder" and 2 or 1, {
-				"A view from behind and above you, a little further out. Fills the sliders below.",
-				"Close over one shoulder, like the Arkham games. Fills the sliders below; the shoulder side is the riding one (Switch shoulder side).",
-			})
+			local style, tchanged = pick("ob_style", "Camera type", { "Orbit", "Shoulder" }, ob.style == "shoulder" and 2 or 1, { "Look around the skater.", "Use an over-the-shoulder view." })
 			if tchanged then
-				Off.apply_style(ob, style == 2 and "shoulder" or "orbit", glue.base_fov)
+				if (style == 2) ~= (ob.style == "shoulder") then
+					-- Each style keeps its own sliders (the same switch as double R3 and the bind).
+					store.offboard_other = Off.switch_style(ob, glue.base_fov, store.offboard_other)
+				end
 				o_changed = true
 			end
-			ui:note("Look around with the right stick. R3 swings the camera behind you. The mouse is not used.")
+			ui:note("R3 recentres. Double R3 switches Orbit / Shoulder.")
+			toggle("ob_sway", "Camera Sway", "Use the smooth camera momentum felt after a bail. Works without crashing.", opts, "camera_sway")
 
 			ui:card("FRAMING")
-			slider("ob_dist", "Distance", "Higher: the camera sits further from you. Lower: closer.", ob, "distance", 1.0, 6.0, "%.1f m")
-			slider("ob_height", "Height", "How high the camera sits above the middle of your body.", ob, "height", -0.5, 1.5, "%.2f m")
-			slider("ob_look", "Look height", "Where the camera aims, above the middle of your body. Higher: you sit lower on the screen.",
+			slider("ob_dist", "Camera distance", "Set the distance from the skater.", ob, "distance", 1.0, 6.0, "%.1f m")
+			slider("ob_height", "Camera height", "Set the height above the body centre.", ob, "height", -0.5, 1.5, "%.2f m")
+			slider("ob_look", "Look height", "Set the height the camera aims at.",
 				ob, "look_height", -0.3, 1.0, "%.2f m")
 			slider("ob_offset", "Horizontal offset",
-				"Moves the camera to the side. Positive: to the right. Negative: to the left. Switch shoulder side flips it.", ob, "offset", -1.2, 1.2, "%.2f m")
+				"Move the view sideways. L3 switches sides.", ob, "offset", -1.2, 1.2, "%.2f m")
 			do
 				-- 0 is the game's FOV, else 40 to 110; the slider jumps over the gap.
 				local shown = clamp(floor(ob.fov + 0.5), 0, 110)
-				local v = floor(ui:slider("ob_fov", "Field of view (0 = game's own)", shown, 0, 110, "%d degrees") + 0.5)
-				note("Higher: a wider view. Lower: a narrower, more zoomed-in view. 0 keeps the game's FOV.")
+				local v = floor(ui:slider("ob_fov", "Field of view", shown, 0, 110, "%d degrees") + 0.5)
+				note("0 uses the game's FOV.")
 				if v ~= shown then
 					if v > 0 and v < 40 then
 						v = v < 20 and 0 or 40
@@ -532,54 +571,63 @@ function Menu.build(ui)
 				end
 			end
 
-			ui:card("FEEL", "Everything eases; nothing snaps")
-			slider("ob_follow", "Follow smoothing", "Higher: the camera trails you more softly. Lower: it keeps closer to you.", ob, "follow_time", 0.02, 1.0, "%.2f s")
-			slider("ob_turn", "Turn smoothing", "Higher: the view starts and stops turning more gradually. 0: it follows the stick exactly.", ob, "turn_time", 0.0, 0.5, "%.2f s")
-			slider("ob_stick", "Stick speed", "How fast the right stick turns the view. The game's own is about 170.", ob, "stick_speed", 60, 360, "%.0f deg/s")
-			toggle("ob_invert", "Invert Y", "On: pushing the right stick up looks down.", ob, "invert_y")
-			slider("ob_recentre", "Recentre after (0 = never)",
-				"While you move and leave the right stick alone, the camera swings behind you after this long. Standing still never recentres.",
+			ui:card("CAMERA MOVEMENT")
+			slider("ob_follow", "Follow smoothing", "Adjust position and shot easing. Turn-follow strength controls cruising yaw.", ob, "follow_time", 0.02, 1.0, "%.2f s")
+			slider("ob_turn", "Look smoothing", "Smooth the start and stop of camera turns.", ob, "turn_time", 0.0, 0.5, "%.2f s")
+			slider("ob_stick", "Look speed", "Set how quickly the right stick turns the view.", ob, "stick_speed", 60, 360, "%.0f deg/s")
+			toggle("ob_invert", "Invert vertical look", "Push the right stick up to look down.", ob, "invert_y")
+			slider("ob_recentre", "Recentre delay",
+				"Set the delay before the camera returns behind you. 0 disables recentring.",
 				ob, "recentre_after", 0.0, 10.0, "%.1f s")
-			toggle("ob_match", "Match walking to the view",
-				"Slowly turns the view toward the direction the left stick walks 'forward', which the game decides with its own hidden camera.", ob, "match_walking")
+			toggle("ob_match", "Align view with walking",
+				"Align the view with the walking direction.", ob, "match_walking")
 
-			ui:card("BODY")
-			slider("ob_level", "Level with the body",
-				"Higher: steps, stairs and crouches do not bob the camera. 0: it follows your body's height exactly.", ob, "level", 0.0, 1.0, "%.2f")
-			slider("ob_bob", "Bobbing strength", "A walking bob put back on purpose, stronger when you run. 0: none.", ob, "bob", 0.0, 1.0, "%.2f")
-			slider("ob_bail", "Bail distance", "How much further out the camera goes when you bail. 1: no change.", ob, "bail_distance", 1.0, 2.5, "%.2fx")
+			ui:card("BODY FOLLOWING")
+			slider("ob_level", "Body height smoothing",
+				"Reduce camera movement from body height changes.", ob, "level", 0.0, 1.0, "%.2f")
+			slider("ob_bob", "Walking bob strength", "Adjust camera bob while walking.", ob, "bob", 0.0, 1.0, "%.2f")
+			slider("ob_bail", "Bail distance multiplier", "Move further back during bails. 1 keeps the same distance.", ob, "bail_distance", 1.0, 2.5, "%.2fx")
 
-			ui:card("BOARD TRANSITION")
-			slider("ob_trans", "Board / foot transition time",
-				"How long the view takes to change between the riding camera and this one, either way. 0: straight away.", ob, "transition_time", 0.0, 3.0, "%.2f s")
+			ui:card("BOARD TRANSITIONS")
+			slider("ob_trans", "Board-to-foot transition time",
+				"Set the transition time between riding and walking views.", ob, "transition_time", 0.0, 3.0, "%.2f s")
 		end
 	else
 		-- ---- ADVANCED
-		local col = draft.collision
-		ui:card("MANUAL COLLISION SETTINGS")
-		if col.automatic then
-			ui:note("Used when Automatic collision handling is off (CAMERA tab).")
+		if deps.custom and deps.custom.available then
+			ui:card("MENU")
+			if ui:button("ui_shortcut", "Menu shortcut: "..deps.custom.input.binding) then deps.custom:change("ui_shortcut",true) end
+			ui:note(deps.custom.capture and "Press a key or modifier combo. Esc cancels." or "Choose a keyboard shortcut. Reserved shortcuts are excluded.")
+			if deps.custom.error then ui:warn(deps.custom.error) end
+			if ui:button("ui_changelogs", "Changelogs") then deps.custom:changelogs() end
 		end
-		slider("mc_radius", "Wall clearance", "Higher: the camera stays further from walls. Lower: it can get right up to them.", col, "radius", 0, 2, "%.2f m")
-		slider("mc_in", "Collision entry time", "Higher: the camera moves in front of a wall slowly. Lower: it moves in at once.", col, "pull_in_time", 0.05, 2, "%.2f s")
-		slider("mc_out", "Collision exit time", "Higher: the camera returns slowly once the wall is gone. Lower: it returns quickly.", col, "release_time", 0.1, 5, "%.2f s")
-		slider("mc_ground", "Ground clearance", "Higher: the camera stays further above the ground. Lower: it can sit closer to the ground.",
+		ui:card("STABILITY")
+		toggle("o_stability", "Stability test", "Keep camera sampling aligned with the skater. Turn off to compare.", opts, "stable_timing")
+		local col = draft.collision
+		ui:card("MANUAL COLLISION")
+		if col.automatic then
+			ui:note("Turn off Automatic collision handling to use these settings.")
+		end
+		slider("mc_radius", "Wall clearance", "Set the distance from walls.", col, "radius", 0, 2, "%.2f m")
+		slider("mc_in", "Collision entry time", "Set how quickly the camera moves clear of a wall.", col, "pull_in_time", 0.05, 2, "%.2f s")
+		slider("mc_out", "Collision exit time", "Set how quickly the camera returns after a wall.", col, "release_time", 0.1, 5, "%.2f s")
+		slider("mc_ground", "Ground clearance", "Set the distance above the ground.",
 			col, "ground_clearance", 0, 3, "%.2f m")
 
 		ui:card("BOARD TRANSITIONS")
 		slider("bt_take", "Board mount transition time",
-			"Higher: the switch to this camera takes longer when you get on the board. 0: it cuts at once.", opts, "take_blend_time", 0, 5, "%.2f s")
-		slider("bt_release", "Hand-back blend time",
-			"Higher: when you get off the board the camera takes longer to settle where the game's camera will be before it is handed back. 0: it hands back at once.",
+			"Set the transition time when taking the camera.", opts, "take_blend_time", 0, 5, "%.2f s")
+		slider("bt_release", "Return to game camera time",
+			"Set the return time. 0 returns control immediately.",
 			opts, "release_blend_time", 0, 5, "%.2f s")
-		ui:note("The plugin cannot see the game's camera while it holds the view, so it eases to where it expects it to be, learned from the last time you were on foot.")
+
 
 		ui:card("LOGGING")
 		toggle("lg_on", "Camera logging",
-			"Writes camera state and landing information to files in the plugin's data folder (diag/), with one line per fault in the log. Same as dyncam_log 1.",
+			"Record camera diagnostics for troubleshooting.",
 			opts, "verbose")
 
-		ui:card("DEFAULTS", "Changes apply at once and are saved between launches")
+		ui:card("DEFAULTS")
 		if ui:button("reset_all", "Reset all settings") then
 			store:reset()
 			state.feedback = "Dynamic Camera settings are back to their defaults."
@@ -625,8 +673,10 @@ function Menu.open_dialog(message)
 		buttons = { { id = "save", label = "Save as new" }, { id = "close", label = "Close" } },
 		file = { label = "Import a preset file", filter = "*.json" },
 	})
-	if not ok then
+	if not ok or err==false then
 		state.result, state.result_ok = "The presets window is not available here (" .. tostring(err) .. ").", false
+	elseif deps.custom then
+		deps.custom.suspended=true
 	end
 end
 
@@ -641,6 +691,7 @@ function Menu.on_dialog(e)
 	local message
 	if button == "cancel" or button == "close" then
 		pcall(reskate.ui.close_dialog, Menu.DIALOG_ID)
+		if deps.custom then deps.custom.suspended=false;deps.custom.view:reset() end
 		return
 	elseif button == "row" then
 		if entry then

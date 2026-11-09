@@ -48,15 +48,17 @@ local BLEND_TIME = 0.1 -- s to move between the rider's velocity and the board's
 M.rider_samples = SAMPLES
 M.rider_blend_time = BLEND_TIME
 
-function M.new()
+function M.new(capacity)
+	capacity=capacity or SAMPLES
 	local ring = {}
-	for i = 1, SAMPLES do
+	for i = 1, capacity do
 		-- seen: frame time the change was first seen at; at: when the physics step made it (the steps counted
 		-- from the one before); root
 		ring[i] = { seen = 0.0, at = 0.0, root = ZERO }
 	end
 	return {
 		ring = ring,
+		capacity = capacity,
 		next = 0, -- 0-based slot of the next write
 		count = 0,
 		last_now = 0.0,
@@ -73,20 +75,22 @@ function M.new()
 	}
 end
 
-function M.reset(r)
-	local fresh = M.new()
+function M.reset(r,capacity)
+	r.sequence=nil
+	r.render_sampled=false
+	local fresh = M.new(capacity)
 	for k, v in fresh do
 		r[k] = v
 	end
 end
 
 local function newest(r)
-	return r.ring[(r.next + SAMPLES - 1) % SAMPLES + 1]
+	return r.ring[(r.next + r.capacity - 1) % r.capacity + 1]
 end
 
 -- 0 = oldest
 local function nth(r, i)
-	return r.ring[(r.next + SAMPLES - r.count + i) % SAMPLES + 1]
+	return r.ring[(r.next + r.capacity - r.count + i) % r.capacity + 1]
 end
 
 local function round_half_away(x)
@@ -99,7 +103,7 @@ end
 -- and at 60 fps (a frame the length of a step) a step is seen a frame early or late at random, so a change
 -- of two steps looks like one and the speed doubles. The rider moves about the same each step, so when the
 -- move is nearer to the last step's with one count more or less, that count is used.
-local function observe(r, now, root, step)
+local function observe(r, now, root, step, sequence)
 	local at = now
 	if r.count > 0 then
 		local last = newest(r)
@@ -109,12 +113,25 @@ local function observe(r, now, root, step)
 		if now - last.seen > STALE or vmagnitude(root - last.root) > JUMP then
 			r.count = 0
 			r.have_move = false
+			r.render_sampled=false
 		elseif step > 0.0 then
+			-- A root moving between two physics events is render-sampled. Its
+			-- displacement must use observation time, not one whole physics step.
+			local d=root-last.root
+			if sequence~=nil and sequence==r.sequence and d.x*d.x+d.z*d.z>1e-8 then
+				if not r.render_sampled then
+					for i=0,r.count-1 do local sample=nth(r,i);sample.at=sample.seen end
+				end
+				r.render_sampled=true
+			end
+			if not r.render_sampled then
 			local by_clock = max(1.0, round_half_away((now - last.seen) / step))
 			local steps = by_clock
+			local counted=type(sequence)=="number" and r.sequence~=nil and sequence>r.sequence
+			if counted then steps=sequence-r.sequence end
 			local lr = last.root
 			local dx, dy, dz = root.x - lr.x, root.y - lr.y, root.z - lr.z
-			if r.have_move and sqrt(r.move_x * r.move_x + r.move_y * r.move_y + r.move_z * r.move_z) > MOVE_MIN then
+			if not counted and r.have_move and sqrt(r.move_x * r.move_x + r.move_y * r.move_y + r.move_z * r.move_z) > MOVE_MIN then
 				local mx, my, mz = r.move_x, r.move_y, r.move_z
 				local function miss(count)
 					local ex, ey, ez = dx / count - mx, dy / count - my, dz / count - mz
@@ -133,12 +150,14 @@ local function observe(r, now, root, step)
 			r.move_x, r.move_y, r.move_z = dx / steps, dy / steps, dz / steps
 			r.have_move = true
 			at = last.at + steps * step
+			end
 		end
 	end
 	local slot = r.ring[r.next + 1]
 	slot.seen, slot.at, slot.root = now, at, root
-	r.next = (r.next + 1) % SAMPLES
-	r.count = min(r.count + 1, SAMPLES)
+	r.sequence=sequence
+	r.next = (r.next + 1) % r.capacity
+	r.count = min(r.count + 1, r.capacity)
 end
 
 -- Fits a curve through the recorded roots. Returns true and leaves the velocity in r.vx/vy/vz, or false.
@@ -147,7 +166,12 @@ local function measure(r, now, step)
 		return false
 	end
 	local last = newest(r)
-	if last.at - nth(r, 0).at < MIN_SPAN or now - last.seen > (step > 0.0 and STILL_STEPS * step or STILL_TIME) then
+	-- Five roots span too little time at 144/240 Hz, otherwise measurement never
+	-- starts and the camera falls back to the tricking board's velocity. Extend only
+	-- as far back as needed; low-rate delivery retains the original five-root window.
+	local first=max(0,r.count-SAMPLES)
+	while first>0 and last.at-nth(r,first).at<MIN_SPAN do first-=1 end
+	if last.at - nth(r, first).at < MIN_SPAN or now - last.seen > (step > 0.0 and STILL_STEPS * step or STILL_TIME) then
 		return false
 	end
 	-- Positions against the newest root and times against its step, so the numbers stay small: p(u) = a + b u + c u^2.
@@ -155,7 +179,7 @@ local function measure(r, now, step)
 	local m0x, m0y, m0z, m1x, m1y, m1z, m2x, m2y, m2z = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 	local lroot = last.root
 	local lx, ly, lz = lroot.x, lroot.y, lroot.z
-	for i = 0, r.count - 1 do
+	for i = first, r.count - 1 do
 		local sample = nth(r, i)
 		local u = sample.at - last.at
 		local u2 = u * u
@@ -170,7 +194,9 @@ local function measure(r, now, step)
 		m1x, m1y, m1z = m1x + px * u, m1y + py * u, m1z + pz * u
 		m2x, m2y, m2z = m2x + px * u2, m2y + py * u2, m2z + pz * u2
 	end
-	local ahead = clamp(now - last.seen, 0.0, step > 0.0 and step or STILL_TIME) -- the root is this long old
+	-- The timestamped path predicts position separately, so hand it velocity at the
+	-- source sample. Advancing here too would count part of gravity a second time.
+	local ahead = r.sequence~=nil and 0.0 or clamp(now - last.seen, 0.0, step > 0.0 and step or STILL_TIME)
 	local vx, vy, vz = 0.0, 0.0, 0.0
 	local ax, ay, az = 0.0, 0.0, 0.0
 	if r.count >= QUADRATIC_FROM then
@@ -213,11 +239,15 @@ end
 -- rider's own measured velocity is used at all times; `board` stands in until there is a measurement (the
 -- first frames, after a teleport, paused), and the two are blended so the switch never steps. `step` is the
 -- physics step in seconds (0 when unknown: frame times are used).
-function M.update(r, now, root, board, onboard, step)
+-- Optional sequence: number of physics events received. Use the exact event count instead
+-- of guessing steps from render intervals (which can lock onto the wrong count at 75 FPS).
+function M.update(r, now, root, board, onboard, step, sequence)
+	local capacity=sequence~=nil and 64 or SAMPLES
+	if r.capacity~=capacity then M.reset(r,capacity) end
 	step = step or 0.0
 	local frame = clamp(now - r.last_now, 0.0, BLEND_TIME)
 	r.last_now = now
-	observe(r, now, root, step)
+	observe(r, now, root, step, sequence)
 	if not onboard then
 		r.weight = 0.0
 		return board

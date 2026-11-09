@@ -52,6 +52,8 @@ function M.new_snapshot()
 		position = ZERO, -- skater root, Y up
 		forward = vcreate(0, 0, 1), -- unit, entity row 2
 		velocity = ZERO, -- m/s
+		physical_velocity = nil, -- optional board/physics Y velocity; root-derived X/Z still steer the camera
+		physical_height = nil, -- integrated physics-step vertical travel (relative datum)
 		physics_state = PS.ride,
 		onboard = true, -- false off the board (state 504); the camera then holds unless bailing
 		bailing = false, -- the wipeout shot
@@ -62,6 +64,8 @@ function M.new_snapshot()
 		board_valid = false, -- false: use the estimate (root - board_drop)
 		ground_normal = vcreate(0, 1, 0),
 		ground_clearance = 0.95, -- m, root height above the ground beneath it (~0.95 riding)
+		ground_valid = false, -- a fresh ground hit; crouch framing must not use stale clearance
+		ground_height = 0.0, -- measured world Y, separate from the legacy clearance convention on steep ramps
 		valid = false, -- false: the publisher had no trustworthy data this frame
 	}
 end
@@ -82,6 +86,8 @@ end
 function M.usable(s)
 	local t, gc = s.time, s.ground_clearance
 	return s.valid and t - t == 0 and finite3(s.position) and finite3(s.forward) and finite3(s.velocity)
+		and (s.physical_velocity == nil or finite3(s.physical_velocity))
+		and (s.physical_height == nil or (type(s.physical_height)=="number" and s.physical_height-s.physical_height==0))
 		and finite3(s.ground_normal) and finite3(s.board_position) and gc - gc == 0
 		and vmagnitude(s.forward) > 1e-4 and vmagnitude(s.ground_normal) > 1e-4
 		and s.grind_side >= -1 and s.grind_side <= 1

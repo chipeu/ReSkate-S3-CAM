@@ -38,6 +38,9 @@ local Shake = require("shake")
 local Traj = require("trajectory")
 local T = require("tracker")
 local Settings = require("settings")
+local Crouch = require("crouch")
+local TerrainContext = require("terrain_context")
+local AdaptiveOrbit = require("adaptive_orbit")
 
 local Camera = {}
 Camera.__index = Camera
@@ -116,7 +119,7 @@ local fast_pull_time, fast_pull_release, penetration_skin = 0.012, 0.05, 0.10
 local ray_budget = 12
 local coll_lookahead_time, coll_lookahead_max = 0.08, 1.0
 local coll_hold_time, coll_hold_hysteresis = 0.3, 0.05
-local trick_side_period, trick_side_dwell, trick_side_lookahead = 0.2, 0.5, 0.3
+local trick_side_period, trick_side_dwell = 0.2, 0.5
 local thin_near_end = 0.5
 local whisker_skin = 0.05
 local wall_lift_time = 0.2
@@ -136,14 +139,12 @@ local big_air_room_cap = 8.0
 local fixed_ease_time = 0.3
 local limits_rate = 6.0
 local rider_hold_rate = 2.0
+local landing_eye_rate = 6.0 -- m/s relative to the skater; carries a held air eye through the ground handoff
+local landing_eye_accel = 60.0 -- m/s^2: the transfer builds speed over several steps instead of starting at its cap
 local rest_fov_max_speed = 4.0
 local rest_fov_ease_time = 0.5
 local keep_in_time = 0.08
 local keep_ramp_normal_y = 0.77
--- After a landing that shakes, the keep-in-frame offset and the landing look hold still for landing_hold_time, then let go over
--- landing_fade_time (1.0.2 test 9: after a big air they unwound right at the touchdown and drowned the landing shake).
--- landing_hold counts down from the sum; the hold is full while more than the fade is left.
-local landing_hold_time, landing_fade_time = 0.25, 0.4
 local follow_min_speed = 1.0
 local follow_slowest_time, follow_fastest_time = 0.45, 0.1
 local follow_slowest_turn, follow_fastest_turn = 90.0, 240.0
@@ -180,6 +181,23 @@ local transition_path_degrees, ramp_path_min_speed = 30.0, 1.0
 local hill_rise_min = 5.0
 local downhill_lift_margin, downhill_lift_max, downhill_lift_time = 5.0, 60.0, 0.3
 local downhill_lift_after, downhill_side_cap = 0.5, 60.0
+local ramp_clear_speed = 4.0 -- m/s of forward speed that means the ramp is being left, not returned to
+local hill_return_time = 0.60 -- s for the trick yaw to come home after a landing on a slope
+local hill_new_across = 0.17 -- sine of the ground slope below which a landing counts as flat
+local hill_landing_window = 0.25 -- s after touchdown that still counts as the landing
+local land_probe_time = 0.90 -- s before a predicted landing the eye starts to clear a slope behind it
+local land_probe_near, land_probe_far = 1.2, 2.6 -- m behind the landing point
+local land_probe_near_share = 0.25 -- a ledge shows no rise close in; a slope does
+local hill_look_after, hill_look_ramp = 0.25, 0.25 -- s of steady descent before the lift replaces the slope look; rollers never get there
+local hill_look_min_deg = 8.0
+local hill_probe_near, hill_probe_far = 0.30, 0.60 -- s of travel ahead at which the ground is sampled
+local hill_probe_min_speed, hill_probe_hold = 3.0, 0.25 -- m/s; s a seen hill stays believed
+local hill_probe_min_deg, hill_probe_max_deg = 8.0, 45.0
+local hill_crest_margin = 6.0 -- degrees the ground ahead must be steeper than the ground underfoot to be a crest
+local hill_probe_min_drop = 0.60 -- m below the rider at the far sample: rollers and small bumps never reach it
+local hill_probe_near_share = 0.15 -- a ledge ahead leaves the near sample flat while the far one has fallen
+local hill_probe_after_landing = 0.50 -- s on the ground before a crest can move the eye: a landing has its own framing
+local hill_probe_growth = 1.4 -- a hill keeps falling away; a ledge's drop stays the same further out
 local transition_lag_cut = 0.8
 local manual_grind_min_height = 0.3
 local floor_in_time = 0.3
@@ -187,6 +205,9 @@ local floor_out_share = 0.55
 local height_ease_time = 0.2
 local board_anchor_height = 0.3
 local board_smooth_time = 0.12
+local finish_in_time, finish_out_time = 0.10, 0.45 -- s the last eye correction takes to arrive and to let go
+local finish_max_speed = 12.0 -- m/s; stays under the one-frame jump the snap guard reacts to
+local finish_near = 0.8 -- m from the look point: a surface closer than this never brings the eye closer
 
 -- Automatic collision: the stock values (the player's own are only used with automatic off).
 local AUTO_COLLISION = Settings.collision()
@@ -304,7 +325,7 @@ local function limiter_new()
 	return { rel = ZERO, target = ZERO, velocity = ZERO, valid = false, engaged = false }
 end
 
-local function limiter_update(l, camera, root, snap, engage, max_speed, accel, dt, max_orbit)
+local function limiter_update(l, camera, root, snap, engage, max_speed, accel, dt, max_orbit, constrained, total_speed)
 	max_orbit = max(max_orbit, max_speed)
 	local wanted = camera - root
 	if snap or not l.valid then
@@ -353,6 +374,16 @@ local function limiter_update(l, camera, root, snap, engage, max_speed, accel, d
 		in_up = in_up * (max_speed / in_up_speed)
 	end
 	velocity = around + in_up
+	if total_speed and vmag(velocity)>total_speed then velocity*=total_speed/vmag(velocity) end
+	if constrained then
+		-- Clearance was checked for the target, not outward filter momentum.
+		-- Brake an axis at that target instead of crossing into a wall and
+		-- relying on a large hard correction to pull the eye back next.
+		local move=velocity*dt
+		move=vcreate(clamp(move.x,min(0,err.x),max(0,err.x)),
+			clamp(move.y,min(0,err.y),max(0,err.y)),clamp(move.z,min(0,err.z),max(0,err.z)))
+		velocity=move/dt
+	end
 	l.velocity = velocity
 	l.rel = rel + velocity * dt
 	if not engage and distance < 0.02 and vmag(relative_velocity) < 0.3 then
@@ -394,6 +425,8 @@ local function copy_snapshot(dst, src)
 	dst.position = src.position
 	dst.forward = src.forward
 	dst.velocity = src.velocity
+	dst.physical_velocity = src.physical_velocity
+	dst.physical_height = src.physical_height
 	dst.physics_state = src.physics_state
 	dst.onboard = src.onboard
 	dst.bailing = src.bailing
@@ -404,6 +437,8 @@ local function copy_snapshot(dst, src)
 	dst.board_valid = src.board_valid
 	dst.ground_normal = src.ground_normal
 	dst.ground_clearance = src.ground_clearance
+	dst.ground_valid = src.ground_valid
+	dst.ground_height = src.ground_height
 	dst.valid = src.valid
 end
 
@@ -419,6 +454,9 @@ local function new_step_out()
 		subject = ZERO,
 		fov_extra = 0.0,
 		shoulder = 0.0,
+		impact = 0.0,
+		crouch_lift = 0.0,
+		distance = 0.0,
 	}
 end
 
@@ -433,6 +471,11 @@ local function copy_step_out(dst, src)
 	dst.subject = src.subject
 	dst.fov_extra = src.fov_extra
 	dst.shoulder = src.shoulder
+	dst.impact = src.impact
+	dst.crouch_lift = src.crouch_lift
+	dst.physical_height=src.physical_height
+	dst.support_height=src.support_height
+	dst.distance = src.distance
 end
 
 local function step_out_finite(o)
@@ -485,6 +528,7 @@ end
 
 function Camera.new()
 	local self = setmetatable({}, Camera)
+	self.terrain_context=TerrainContext.new()
 	self.settings = Settings.camera()
 	self.settings_valid_shake = nil
 	-- The frame handed out (reused).
@@ -500,7 +544,8 @@ function Camera.new()
 			shot_name = "chase", reset = false, held = false, preset = 0, steps = 0, accumulator = 0.0, airborne = false,
 			landing_active = false, transitioning = false, shot_fraction = 1.0, chase_blend = 0.0, prediction_valid = false,
 			predicted_max_height = 0.0, predicted_air_time = 0.0, predicted_landing_delta = 0.0, air_hold_delta = 0.0,
-			anchor_lag = 0.0, heading = 0.0, elevation = 0.0, distance = 0.0, impulse = 0.0, landing_dip = 0.0, speed = 0.0,
+			anchor_lag = 0.0, heading = 0.0, elevation = 0.0, distance = 0.0, impulse = 0.0, landing_dip = 0.0, impact_y = 0.0,
+			rattle_pitch = 0.0, rattle_yaw = 0.0, rattle_roll = 0.0, rattle_time = 1.0e9, speed = 0.0,
 			incline_degrees = 0.0, forward_acceleration = 0.0, push_state = false, push_kick = false, fov_base = 0.0,
 			fov_extra = 0.0, landing_look_weight = 0.0, look_pitch_offset = 0.0, shoulder = 0.0, follow_strength = 1.0,
 			collision_pull = 0.0, trick_yaw = 0.0, air_follow_weight = 0.0, air_reference_height = 0.0, air_rise = 0.0,
@@ -517,6 +562,7 @@ function Camera.new()
 	self.graph = Graph.new()
 	self.air = Air.new()
 	self.rig = Rig.new()
+	self.crouch = Crouch.new()
 	self.shake = Shake.new()
 	self.pan = T.new_state()
 	self.tilt = T.new_state()
@@ -640,11 +686,19 @@ function Camera.new()
 	self.held_speed = 0.0
 	self.trick_yaw = {}
 	trick_yaw_reset(self.trick_yaw)
+	self.adaptive_orbit = {}
+	AdaptiveOrbit.reset(self.adaptive_orbit)
 	-- Alpha 5
 	self.air_peak_y = 0.0
 	self.last_landing_fall = 0.0
 	self.last_landing_fraction = 0.0
-	self.landing_hold = 0.0
+	-- The landing bounce: its depth now, the depth it started from, its depth, the time since the touchdown and whether it plays; how far
+	-- it may go down this step (the ground ray reaches that much further) and how far it took the camera down.
+	self.dip_x, self.dip_from, self.dip_peak, self.dip_age, self.dip_on = 0.0, 0.0, 0.0, 0.0, false
+	self.dip_reach, self.dip_applied = 0.0, 0.0
+	self.landing_eye_y = nil
+	self.landing_eye_speed = 0.0
+	self.rail_land_rel = nil
 	self.travel_heading = 0.0
 	self.travel_stage = 0.0
 	self.hf_w = 0.0
@@ -667,6 +721,7 @@ function Camera.new()
 	self.ramp_zero_clear = false
 	self.ramp_down = FWD
 	self.last_shift = ZERO
+	self.ramp_nominal_shift,self.adaptive_goal_last,self.ramp_intent_velocity=nil,nil,nil
 	self.coll_blocked = false
 	self.ray_parity = false
 	self.shoulder_goal_cached = 0.0
@@ -685,6 +740,11 @@ function Camera.new()
 	self.downhill_lift = 0.0
 	self.downhill_lift_stage = 0.0
 	self.hill_grade = 0.0
+	self.rail_grade = 0.0
+	self.rail_grade_hold = 0.0
+	self.rail_support_pos = nil
+	self.rail_support_y = nil
+	self.rail_support_source = nil
 	self.transition_from_hill = false
 	self.downhill_time = 0.0
 	self.downhill_rise = false
@@ -697,6 +757,7 @@ function Camera.new()
 	self.board_rel_stage = ZERO
 	self.trajectory_arc = ZERO
 	self.trajectory_arc_stage = ZERO
+	self.finish_offset, self.finish_velocity = ZERO, ZERO
 	self.board_w = 0.0
 	self.board_w_stage = 0.0
 	self.layers = {}
@@ -714,6 +775,8 @@ function Camera.new()
 	-- diagnostics from the last step
 	self.kick_in_update = false
 	self.step_rays = 0
+	self.finished_rays = 0
+	self.adaptive_rays = 0
 	self.update_rays = 0
 	self.update_rays_max = 0
 	self.last_pick_chase_blend = 0.0
@@ -925,6 +988,59 @@ local function landing_fraction_of(self, fall_height, flat_speed)
 	return clamp01((impact - low) / max(high - low, 1e-3))
 end
 
+-- Landing bounce: an impact, not a spring. At touchdown the camera builds to its full depth over a short rise, then
+-- eases back up (an exponential with the recovery time) with one small rebound over the rest position, about a tenth of the
+-- depth a fifth of a second later. The depth is a function of the time t since the touchdown alone (m below the normal camera), so it is
+-- the same curve at any frame rate.
+--   t <= hold:  from + (peak - from) * (1 - exp(-t / attack))      from is the depth the touchdown found (0 when none was playing)
+--   t >  hold:  top * exp(-s / tau) * cos(turn * s / tau)          s = t - hold, top = the depth at the hold, tau = recovery / decay
+-- The cosine's first zero is where the camera is back at rest, its first minimum the rebound (turn 1.25: 10.8% of the depth, at 2 tau).
+local BOUNCE_ATTACK = 0.055 -- s: a full-depth landing no longer moves most of its 0.32 m in one 60 Hz frame
+local BOUNCE_HOLD = 0.16 -- s: about 95% of the chosen depth before recovery begins
+local BOUNCE_DECAY = 1.6 -- the recovery time covers this many time constants: under 2 mm by 4 recovery times
+local BOUNCE_TURN = 1.25 -- rebound shape, see above
+local BOUNCE_TAIL = 10.0 -- time constants after which the depth is taken as 0 (under 0.02 mm)
+
+local function bounce_tau(recovery)
+	return max(recovery, 1e-3) / BOUNCE_DECAY
+end
+
+local function landing_bounce_depth(t, from, peak, recovery)
+	local rise = 1.0 - math.exp(-min(t, BOUNCE_HOLD) / BOUNCE_ATTACK)
+	local top = from + (peak - from) * rise
+	if t <= BOUNCE_HOLD then
+		return top
+	end
+	local s = (t - BOUNCE_HOLD) / bounce_tau(recovery)
+	if s > BOUNCE_TAIL then
+		return 0.0
+	end
+	return top * math.exp(-s) * math.cos(BOUNCE_TURN * s)
+end
+
+-- The touchdown's kick: the bounce starts, dip_depth * fraction^2 deep, the fraction being landing_fraction_of (the same 0..1 as the
+-- shake impulse). A touchdown while one plays starts from the depth it is at and goes no shallower than it, so the camera never jumps
+-- up. The camera is lowered by it before the ground limits (see the dip in step_once).
+local function kick_dip(self, fraction, scale)
+	local np = self.settings.native_plus
+	if not np.landing_dip or not (fraction > 0.0) then
+		return
+	end
+	local f = clamp01(fraction)
+	local depth = np.dip_depth * f * f * (scale or 1.0)
+	local now = self.dip_on and self.dip_x or 0.0
+	self.dip_from = now
+	self.dip_peak = max(depth, now)
+	self.dip_age = 0.0
+	self.dip_on = true
+end
+
+-- The camera's ground clearance as the collision uses it (the stock one with automatic collision).
+local function ground_clearance_of(self)
+	local sc = self.settings.collision
+	return sc.automatic and AUTO_COLLISION.ground_clearance or sc.ground_clearance
+end
+
 -- The slope of the direction of travel along the ground, degrees, + uphill, from the velocity on the surface, faded out below
 -- incline_full_speed.
 local function incline_of(s, normal)
@@ -1022,6 +1138,23 @@ local function cast(self, query, from, to)
 	return hit
 end
 
+-- Adaptive framing has a separate small quota. It never consumes the legacy
+-- 12 rays reserved for ramp, shoulder, floor and final collision in this step.
+local function adaptive_cast(self, query, from, to)
+	if self.adaptive_rays >= 7 then return nil end
+	self.adaptive_rays += 1
+	local hit = query(from, to, false)
+	if hit ~= nil and not finite3(hit) then return nil end
+	local normal = self.adaptive_ground_normal
+	if hit and normal and normal.y > 0.2 then
+		local origin = self.adaptive_ground_origin
+		local ground_y = self.adaptive_ground_height
+			- (normal.x * (hit.x - origin.x) + normal.z * (hit.z - origin.z)) / normal.y
+		if abs(hit.y - ground_y) <= 0.04 then return nil end -- measured support belongs to floor collision
+	end
+	return hit
+end
+
 -- Is what the line meets the ground he rides on or a ledge he has landed on, rather than a wall? One look straight down, a
 -- little toward him from the hit, finds a top surface at or just above the hit that is no higher than his look point.
 local function ground_under_hit(self, query, from, hit)
@@ -1033,23 +1166,11 @@ end
 
 -- ---------------------------------------------------------------- keep in frame
 
--- 0..1, how much of the landing hold applies now: full while the hold lasts, then a smooth fade to 0.
--- Full while more than the fade is left, with a quarter of a millisecond to spare so the last full step is the same in float and double.
-local function landing_held(self)
-	return self.landing_hold > landing_fade_time + 0.00025
-end
-
-local function landing_hold_weight(self)
-	local x = clamp01(self.landing_hold / landing_fade_time)
-	return x * x * (3.0 - 2.0 * x)
-end
-
 -- Keep the skater inside the vertical view while airborne (air_camera.keep_in_frame). `view_pitch` is the view's pitch BEFORE
 -- this offset. The first `held` points are held inside the hard limit; the rest only steer the view toward keeping them in too.
--- `weight` (0..1, eased by the caller) is how much of the guard applies. `hold` (0..1, the landing kick, 1.0.2 test 9) keeps the
--- offset where it is: the soft goal is blended toward the offset itself by it; the hard limits still move it, so the skater stays
--- framed, and as the hold eases out the offset eases on to the goal. Returns the offset, radians.
-local function update_keep_in_frame(self, cam_pos, view_pitch, points, count, held, weight, snap, hold)
+-- `weight` (0..1, eased by the caller) is how much of the guard applies. Returns the offset, radians.
+local function update_keep_in_frame(self, cam_pos, view_pitch, points, count, held, weight, snap)
+	self.keep_before=self.keep_off
 	local half_fov = 0.5 * clamp(fov_base_deg(self) + self.fov_extra, 1.0, 170.0) * DEG
 	local soft, hard = 0.7 * half_fov, 0.9 * half_fov
 	local w = (self.settings.air_camera.keep_in_frame and not snap) and clamp01(weight) or 0.0
@@ -1070,9 +1191,7 @@ local function update_keep_in_frame(self, cam_pos, view_pitch, points, count, he
 		-- The offset eases toward the weighted share of the one that brings every point inside the soft band, and is then held
 		-- at once inside the weighted hard limits (range_lo > range_hi: the points cannot all fit, aim between them).
 		local keep_off = self.keep_off
-		local soft_goal = w * (goal_up - goal_down)
-		local h = clamp01(hold or 0.0)
-		local wanted = ease_to(keep_off, soft_goal + (keep_off - soft_goal) * h, keep_response_time, fixed_step)
+		local wanted = ease_to(keep_off, w * (goal_up - goal_down), keep_response_time, fixed_step)
 		if range_lo <= range_hi then
 			wanted = clamp(wanted, w * range_lo, w * range_hi)
 		else
@@ -1092,64 +1211,37 @@ local function update_keep_in_frame(self, cam_pos, view_pitch, points, count, he
 			self.keep_off = keep_off + step
 		end
 	end
+	if not snap and self.terrain_pitch_rate and self.keep_view_pitch then
+		local base_delta=view_pitch-self.keep_view_pitch
+		local allowance=self.terrain_pitch_rate*DEG*fixed_step
+		local previous=self.keep_before or 0
+		-- Do not counteract intentional shake/dip when it alone exceeds the
+		-- budget. Only prevent the guard adding another turn in that direction.
+		local lo=min(0,-allowance-base_delta)
+		local hi=max(0, allowance-base_delta)
+		self.keep_off=previous+clamp(self.keep_off-previous,lo,hi)
+		self.keep_rate=(self.keep_off-previous)/fixed_step
+	end
+	self.keep_view_pitch=view_pitch
 	return self.keep_off
 end
 
 -- ---------------------------------------------------------------- trick yaw
 
--- Is the side `toward` (+1 right, -1 left) walled: a surface within the swing's reach beside the skater, now or where he will
--- be in trick_side_lookahead (at most 2.5 m on).
-local function trick_side_blocked(self, query, s, pivot, heading, shoulder_metres, toward)
-	local ty = self.settings.trick_yaw
-	local v = s.velocity
-	local flat_velocity = vcreate(v.x, 0.0, v.z)
-	local ahead = flat_velocity * min(trick_side_lookahead, 2.5 / max(vmag(flat_velocity), 1e-3))
-	local sin_a = sin(ty.angle_degrees * DEG)
-	local reach = max(self.distance_used, 1.0) * sin_a + self.settings.collision.radius + max(0.0, shoulder_metres * toward)
-	local right = vcreate(cos(heading), 0.0, sin(heading))
-	local sideways = right * (reach * toward)
-	return cast(self, query, pivot, pivot + sideways) ~= nil or cast(self, query, pivot + ahead, pivot + ahead + sideways) ~= nil
-end
-
--- Is there something in the camera's own path while it is turned `yaw` out (a pole it would ride into).
-local function trick_path_blocked(self, query, s, pivot, heading, yaw)
-	local v = s.velocity
-	local flat_velocity = vcreate(v.x, 0.0, v.z)
-	local speed = vmag(flat_velocity)
-	if speed < 0.5 then
-		return false
-	end
-	local radius = self.settings.collision.radius
-	local h = heading - yaw
-	local reach = max(self.distance_used * cos(self.last_elevation_used), 0.5)
-	local spot = pivot + vcreate(-sin(h) * reach, 0.0, cos(h) * reach)
-	local run = min(speed * trick_side_lookahead, 2.5) + radius
-	local along = flat_velocity * (run / speed)
-	-- The camera's width: its centre line and one either side, a radius out.
-	local across = vcreate(flat_velocity.z, 0.0, -flat_velocity.x) * (radius / speed)
-	if cast(self, query, spot, spot + along) ~= nil then
-		return true
-	end
-	local a = spot + across
-	if cast(self, query, a, a + along) ~= nil then
-		return true
-	end
-	local b = spot - across
-	if cast(self, query, b, b + along) ~= nil then
-		return true
-	end
-	return false
-end
-
 -- The trick-yaw state machine (one fixed step). Tricking = airborne for min_air_time, grinding or in a manual, each only if its
 -- switch is on. The target is angle * side while tricking and for hold_time after the last trick step, then 0.
-local function update_trick_yaw(self, query, s, snap, dt, pivot, heading, shoulder_metres)
+local function update_trick_yaw(self, s, snap, dt)
 	local cs = self.settings
 	local ty = cs.trick_yaw
 	local st = self.trick_yaw
 	if snap then
 		trick_yaw_reset(st)
 		return
+	end
+	if not is_air_state(s.physics_state) and st.hold_left > 0.0 and (self.since_landing or 1.0) < hill_landing_window
+		and (self.landing_onto_grade or 0.0) > 0.0 then
+		st.hold_left, st.urgent = 0.0, true
+		self.landing_onto_grade = 0.0
 	end
 	local tricking = ty.enabled and not s.bailing
 		and ((ty.in_air and is_air_state(s.physics_state) and self.air_time >= ty.min_air_time)
@@ -1168,11 +1260,7 @@ local function update_trick_yaw(self, query, s, snap, dt, pivot, heading, should
 			st.side_clock = st.side_clock + dt
 			if not st.side_known or st.side_clock >= trick_side_period then
 				local chosen = preferred
-				if cs.collision.enabled and ty.angle_degrees > 1.0 then
-					if trick_side_blocked(self, query, s, pivot, heading, shoulder_metres, preferred) then
-						chosen = trick_side_blocked(self, query, s, pivot, heading, shoulder_metres, -preferred) and 0 or -preferred
-					end
-				end
+				-- The shared orbit solver resolves clearance at the actual eye after distance and elevation settle.
 				st.side_clock = 0.0
 				if not st.side_known then
 					st.side_used = chosen
@@ -1190,18 +1278,6 @@ local function update_trick_yaw(self, query, s, snap, dt, pivot, heading, should
 		goal = ty.angle_degrees * DEG * side
 	else
 		st.hold_left = (ty.enabled and not s.bailing) and max(0.0, st.hold_left - dt) or 0.0
-		-- Held out to the side after the trick: a wall or a pole coming up on that side ends the hold.
-		if st.hold_left > 0.0 and st.target ~= 0.0 and cs.collision.enabled then
-			st.side_clock = st.side_clock + dt
-			if st.side_clock >= trick_side_period then
-				st.side_clock = 0.0
-				if trick_side_blocked(self, query, s, pivot, heading, shoulder_metres, st.target < 0.0 and -1 or 1)
-					or trick_path_blocked(self, query, s, pivot, heading, st.value) then
-					st.hold_left = 0.0
-					st.urgent = true -- back as fast as the swing may go, not at the player's return time
-				end
-			end
-		end
 		goal = st.hold_left > 0.0 and st.target or 0.0
 		if st.hold_left <= 0.0 then
 			st.side_known = false
@@ -1214,7 +1290,7 @@ local function update_trick_yaw(self, query, s, snap, dt, pivot, heading, should
 		-- At least min_ease_time, and long enough that the camera's sine-eased swing round him stays within trick_yaw_speed.
 		local swing_time = abs(st.target - st.start) * max(self.distance_used, 1.0) * 0.5 * PI / trick_yaw_speed
 		if st.urgent and goal == 0.0 then
-			st.duration = max(min_ease_time, swing_time)
+			st.duration = max(hill_return_time, swing_time)
 		else
 			st.duration = max(with_minimum(goal == 0.0 and ty.return_time or ty.in_time), swing_time)
 		end
@@ -1241,6 +1317,27 @@ local function update_transition(self, snap, grounded, normal, velocity, dt)
 		up_speed = (-normal.y * normal.x * velocity.x + across * across * velocity.y - normal.y * normal.z * velocity.z) / across
 	end
 	local was_held = self.transition_hold
+	-- Carrying on forward over the lip: nothing to slide round, the wall is behind him and going away.
+	local flat_x, flat_z = velocity.x, velocity.z
+	local flat_len = sqrt(flat_x * flat_x + flat_z * flat_z)
+	self.ramp_clearing = not grounded and flat_len > ramp_clear_speed
+		and flat_x * self.ramp_down.x + flat_z * self.ramp_down.z < -0.5 * flat_len
+	if grounded and self.transition_was_grounded == false then self.since_landing = 0.0 end
+	self.transition_was_grounded = grounded
+	self.since_landing = (self.since_landing or hill_landing_window) + dt
+	-- Contact is confirmed a few steps before the ground's normal and the transition catch up.
+	local landed = grounded and self.since_landing < hill_landing_window
+	-- On the first contact frames the speed along the surface is unreliable; the direction he is moving over the ground is not.
+	local landing_descent = landed and across > hill_new_across and (up_speed < -ramp_turn_speed or velocity.x * normal.x + velocity.z * normal.z > 0.0)
+	-- Landing onto ground that falls away the way he is going is a new descent, not the ramp he left:
+	-- that ramp faced him, this one falls away from him. Riding back into the same ramp keeps its rules.
+	if landing_descent and not snap and self.transition
+		and normal.x * self.ramp_down.x + normal.z * self.ramp_down.z < 0.2 * across then
+		self.transition = false
+		self.transition_hold, was_held = false, false
+		self.transition_up_seen = false
+		self.transition_shallow = 0.0
+	end
 	if steep and across > 1e-3 then
 		self.ramp_down = vcreate(normal.x / across, 0.0, normal.z / across) -- the wall's way down
 	end
@@ -1275,18 +1372,22 @@ local function update_transition(self, snap, grounded, normal, velocity, dt)
 		self.transition_hold = false
 		self.transition_up_seen = false
 	elseif not was_on then
-		self.transition_hold = up_speed > -ramp_turn_speed -- dropping in down a ramp has no reversal ahead
-		-- Already riding down a hill as the ground steepens into a transition: it stays above it.
-		self.transition_from_hill = self.hill_grade > hill_rise_min * DEG
+		self.transition_hold = up_speed > -ramp_turn_speed and not landing_descent -- dropping in down a ramp has no reversal ahead
+		-- Already riding down a hill as the ground steepens into a transition, or landing on one
+		-- going down it: the camera stays above it rather than sliding round the side.
+		self.transition_from_hill = self.hill_grade > hill_rise_min * DEG or landing_descent
 	elseif steep then
 		if up_speed > ramp_turn_speed then
 			self.transition_hold = true -- riding up (again): the reversal is ahead
 		elseif up_speed < -ramp_turn_speed then
 			self.transition_hold = false -- riding down: turn round behind it
 		end
-	elseif not grounded and self.transition_hold and velocity.y < -ramp_air_fall_speed
-		and sqrt(velocity.x * velocity.x + velocity.z * velocity.z) < ramp_air_flat_speed then
-		self.transition_hold = false -- over the lip and falling straight down: it has reversed
+	elseif not grounded and self.transition_hold and velocity.y < -ramp_air_fall_speed then
+		local flat=vcreate(velocity.x,0,velocity.z)
+		-- A fakie return can retain substantial horizontal speed. It does not
+		-- need to fall almost vertically before the held ascent view releases.
+		local returning=vmag(flat)>follow_min_speed and vdot(flat,self.ramp_down)>0.5*vmag(flat)
+		if vmag(flat)<ramp_air_flat_speed or (not self.settings.follow.trick_pop and returning) then self.transition_hold=false end
 	end
 	if self.transition_hold then
 		self.transition_up_seen = true
@@ -1303,13 +1404,18 @@ local function update_transition(self, snap, grounded, normal, velocity, dt)
 	if grounded then
 		self.hill_grade = grade
 	end
-	self.downhill_grade = (self.transition and not self.transition_up_seen) and grade or 0.0
+	local return_descent=self.transition_up_seen
+		and not self.transition_hold and velocity.y < -ramp_air_fall_speed
+	if return_descent and not grounded then
+		grade=min(55*DEG,math.atan(-velocity.y/max(sqrt(velocity.x*velocity.x+velocity.z*velocity.z),0.5)))
+	end
+	self.downhill_grade = (self.transition and (not self.transition_up_seen or return_descent)) and grade or 0.0
 	if self.downhill_grade > 0.0 then
 		self.downhill_time = self.downhill_time + dt
 	elseif not self.transition then
 		self.downhill_time = 0.0
 	end
-	if not self.transition or self.transition_up_seen then
+	if not self.transition or (self.transition_up_seen and not return_descent) then
 		self.downhill_rise = false
 	elseif self.downhill_grade > 0.0
 		and (self.transition_from_hill or self.downhill_time >= downhill_lift_after
@@ -1400,7 +1506,7 @@ local function ramp_blocked_at(self, query, offset)
 	local h = self.rs_heading + offset
 	local reach = self.rs_reach
 	-- The line goes to a point below the camera; the shoulder's shift is added (built last step).
-	local spot = self.rs_anchor + vcreate(-sin(h) * reach, self.rs_rise - ramp_side_below, cos(h) * reach) + self.last_shift
+	local spot = self.rs_anchor + vcreate(-sin(h) * reach, self.rs_rise - ramp_side_below, cos(h) * reach) + (self.ramp_nominal_shift or self.last_shift)
 	if ramp_line_blocked(self, query, self.rs_pivot, spot) then
 		return true
 	end
@@ -1420,7 +1526,7 @@ end
 local function update_ramp_side(self, query, snap, pivot, root, airborne, anchor, heading, dt)
 	local cs = self.settings
 	local goal = self.ramp_side
-	if snap or not self.transition or not cs.collision.enabled or self.downhill_rise then
+	if snap or not self.transition or not cs.collision.enabled or self.downhill_rise or self.ramp_clearing then
 		goal = 0.0
 		self.ramp_blocked = false
 		self.ramp_probe_clock = 0.0
@@ -1503,8 +1609,11 @@ local function update_ramp_side(self, query, snap, pivot, root, airborne, anchor
 			if found then
 				self.ramp_scan = 0
 			elseif index >= candidates then
-				goal = side * side_max * DEG -- walled in: as wide as it goes, the collision takes over
-				self.ramp_scan = self.ramp_scan >= 100 and 0 or 100 -- and the next scan tries the other side
+				-- Walled in: as wide as it goes, the collision takes over. Having tried the other
+				-- side as well, stay on the first: flipping the target each step shakes the view.
+				goal = (self.ramp_scan >= 100 and -side or side) * side_max * DEG
+				self.ramp_scan = cs.follow.trick_pop and (self.ramp_scan >= 100 and 0 or 100) or 0
+				-- Pop Off keeps its side; collision contracts instead of alternating.
 			else
 				self.ramp_scan = (self.ramp_scan >= 100 and 100 or 0) + index -- out of rays: the next step goes on from here
 				goal = self.ramp_side
@@ -1563,6 +1672,15 @@ local function update_horizontal_follow(self, s, snap, grounded, flat_speed, rig
 	local v = s.velocity
 	local raw_heading = heading_of(vcreate(v.x, 0.0, v.z))
 	local position_heading = self.current.position_heading
+	local air=is_air_state(s.physics_state)
+	if level>0 and air and not snap then
+		if not self.was_air or not self.hf_air_heading then
+			self.hf_air_heading=self.last_view_heading or rig_heading
+		end
+		return self.hf_air_heading
+	end
+	self.hf_air_heading=nil
+
 	if snap then
 		local th = flat_speed > follow_min_speed and raw_heading or wrap_angle(rig_heading - position_heading)
 		self.travel_heading = th
@@ -1575,20 +1693,21 @@ local function update_horizontal_follow(self, s, snap, grounded, flat_speed, rig
 			self.travel_heading = th
 			self.travel_stage = th
 		end
-		if grounded and flat_speed > follow_min_speed then
+		if grounded and s.physics_state~=PS_CROUCH and flat_speed > follow_min_speed then
 			local time = lerp_f(follow_slowest_time, follow_fastest_time, level)
 			local rate = ease_rate(0.5 * time, dt)
 			local max_turn = lerp_f(follow_slowest_turn, follow_fastest_turn, level) * DEG * dt
 			self.travel_stage = blend_angle(self.travel_stage, raw_heading, rate)
 			local step = wrap_angle(blend_angle(self.travel_heading, self.travel_stage, rate) - self.travel_heading)
 			self.travel_heading = wrap_angle(self.travel_heading + clamp(step, -max_turn, max_turn))
+			if level>=0.999 then self.travel_heading,self.travel_stage=raw_heading,raw_heading end
 		end
 		self.hf_w_stage, self.hf_w = ease2(self.hf_w_stage, self.hf_w, level, follow_ease_time, dt)
 	end
 	if not (self.hf_w > 0.0) then
 		return rig_heading
 	end
-	return blend_angle(rig_heading, wrap_angle(self.travel_heading + position_heading), self.hf_w)
+	return wrap_angle(self.travel_heading + position_heading)
 end
 
 -- ---------------------------------------------------------------- collision
@@ -1723,10 +1842,32 @@ local function collide(self, query, pivot, camera, root, board, velocity, snap, 
 
 	self.ray_parity = not self.ray_parity -- (the shoulder's wall look alternates with this)
 	local lift_goal = 0.0
-	local floor_hit = cast(self, query, camera + vcreate(0.0, 1.0, 0.0), camera - vcreate(0.0, ground_clearance, 0.0))
+	-- (The ray reaches the landing dip's depth further down: the dip is applied after this and may only use the room over the ground.)
+	local floor_hit = cast(self, query, camera + vcreate(0.0, 1.0, 0.0), camera - vcreate(0.0, ground_clearance + self.dip_reach, 0.0))
 	if floor_hit ~= nil then
 		lift_goal = max(0.0, floor_hit.y + ground_clearance - camera.y)
 		self.hard_floor_y = floor_hit.y
+	end
+	local context=self.terrain_context_result
+	local predict_floor=self.settings.follow.camera_style~="joint_lock" and
+		(((self.rail_grade_hold or 0)>0 and (self.rail_grade_filtered or 0)>8*DEG)
+		or (context and context.weight>0.0001) or (self.ramp_render_follow or 0)>0.001)
+	local prior=self.collision_free_previous
+	self.collision_free_previous=camera
+	self.layers.coll_floor_ahead=0
+	if predict_floor and prior and not snap and self.step_rays<ray_budget then
+		local motion=self.settings.follow.trick_pop and (self.ramp_render_follow or 0)>0.001
+			and (self.ramp_intent_velocity or velocity) or (camera-prior)/fixed_step
+		if vmag(motion)<max(40,vmag(velocity)*3+10) then
+			local future=camera+motion*0.20
+			local anticipated=cast(self,query,future+vcreate(0,1.5,0),future-vcreate(0,ground_clearance+0.5,0))
+			if anticipated then
+				local need=max(0,anticipated.y+ground_clearance-future.y)
+				if not ((self.rail_grade_hold or 0)>0) then need*=max(context and context.weight or 0,self.ramp_render_follow or 0) end
+				lift_goal=max(lift_goal,need)
+				self.layers.coll_floor_ahead=need
+			end
+		end
 	end
 	if snap then
 		self.coll_lift_stage = lift_goal
@@ -1802,16 +1943,54 @@ end
 
 -- Ballistic prediction from the surface-level point (position - up * clearance).
 local function predict(self, s, query)
+	local prediction_settings=self.settings.trajectory
+	local budget_limited=false
+	if self.extras_query_remaining then
+		local reserve=max(0,ray_budget-self.step_rays)+14*(self.orbit_pending_steps or 0)
+		local slots=math.floor(self.extras_query_remaining()-reserve-3)
+		if slots<2 then
+			if self.air_time==0 then
+				self.prediction,self.prediction_offset,self.prediction_time_base=EMPTY_PREDICTION,0,0
+			end
+			self.prediction_deferred=true
+			return false
+		end
+		if slots<math.ceil(prediction_settings.max_time/prediction_settings.step) then
+			-- Shorten only the search horizon, never its geometric chord size.
+			local limited=self.budget_prediction_settings or {}
+			limited.gravity,limited.step=prediction_settings.gravity,prediction_settings.step
+			limited.max_time=slots*prediction_settings.step
+			self.budget_prediction_settings=limited
+			prediction_settings,budget_limited=limited,true
+		end
+	end
+	self.prediction_deferred=false
 	local launch = self.launch
 	-- The launch point sits last_clearance (the takeoff clearance) under the root, but never below the ground measured now.
 	local gc = s.ground_clearance
 	local live_clearance = isfinite(gc) and gc or self.last_clearance
 	local surface_y = s.position.y - min(self.last_clearance, max(launch_above_ground, live_clearance - launch_above_ground))
+	if not self.settings.follow.trick_pop then
+		local flight=self.vertical_path or self.pop_flight
+		if flight and (flight.travel~=nil or flight.travel_y~=nil) then
+			surface_y=self.takeoff_surface_y+(flight.travel or flight.travel_y)
+		else
+			surface_y=s.position.y+(self.crouch.offset or 0)
+				-(self.crouch.baseline or self.last_clearance)
+		end
+	end
 	launch.position = vcreate(s.position.x, surface_y, s.position.z)
-	launch.velocity = s.velocity
+	local physical = s.physical_velocity
+	launch.velocity = physical and vcreate(s.velocity.x, physical.y, s.velocity.z) or s.velocity
 	launch.launch_normal = self.last_ground_normal
 	launch.camera_distance = self.current.distance
-	self.prediction = Traj.predict(launch, query, self.settings.trajectory)
+	local next_prediction=Traj.predict(launch,query,prediction_settings)
+	if budget_limited and next_prediction.status=="Miss" and self.air_time>0
+		and self.prediction.status=="Landed"
+		and self.air_time<self.prediction_time_base+self.prediction.predicted_air_time then
+		return true -- a short search cannot disprove a still-future cached landing
+	end
+	self.prediction=next_prediction
 	-- Express everything against the takeoff surface.
 	self.prediction_offset = surface_y - self.takeoff_surface_y
 	self.prediction_time_base = self.air_time
@@ -1853,15 +2032,65 @@ local function step_once(self, s, query, snap)
 	local cs = self.settings
 	local dt = fixed_step
 	self.step_rays = 0
+	self.finished_rays = 0
+	self.adaptive_rays = 0
 	local phys = s.physics_state
 	local air = is_air_state(phys)
 	local grounded = not air
 	local grinding = is_grind_state(phys)
-	local vel = s.velocity
+	local vel = s.physical_velocity and vcreate(s.velocity.x, s.physical_velocity.y, s.velocity.z) or s.velocity
 	local normal = normalized(s.ground_normal, UP)
 	local clearance_now = clamp(s.ground_clearance, 0.0, 3.0)
 	local forward_speed = vdot(vel, normalized(s.forward, FWD))
 	local horizontal_speed = sqrt(vel.x * vel.x + vel.z * vel.z)
+	-- Measure the rail's descent from the moving board centre. The rider
+	-- velocity is fitted from an animated root; a crouch or landing compression
+	-- changes its Y component even on a level rail. The ground plane is a
+	-- fallback when the board centre is unavailable (a raised rail may cross
+	-- level ground, so ground height alone cannot describe its descent).
+	if grinding then
+		local source = s.board_valid and finite3(s.board_position) and "board"
+			or s.ground_valid and isfinite(s.ground_height) and "ground" or nil
+		if source then
+			local support = source == "board" and s.board_position or s.position
+			local height = source == "board" and s.board_position.y or s.ground_height
+			local prior, prior_y = self.rail_support_pos, self.rail_support_y
+			if prior and prior_y and source == self.rail_support_source then
+				local dx, dz = support.x - prior.x, support.z - prior.z
+				local travel = sqrt(dx*dx + dz*dz)
+				local descent = prior_y - height
+				if travel > 0.005 and abs(descent) <= travel + 0.05 then
+					self.rail_grade = clamp(math.atan(descent / travel), 0.0, 45*DEG)
+				end
+			elseif horizontal_speed > 0.25 and normal.y > 0.5 then
+				-- The first contact has no displacement sample yet. Its measured
+				-- support normal gives an immediate grade until the board path takes
+				-- over on the next step.
+				self.rail_grade = clamp(math.atan((normal.x*vel.x + normal.z*vel.z)
+					/ (normal.y*horizontal_speed)), 0.0, 45*DEG)
+			end
+			self.rail_support_pos, self.rail_support_y, self.rail_support_source = support, height, source
+		end
+		self.rail_grade_hold=0.25
+		self.rail_departure_heading=horizontal_speed>0.5 and vcreate(vel.x/horizontal_speed,0,vel.z/horizontal_speed) or self.rail_departure_heading
+	else
+		local heading=self.rail_departure_heading
+		local continuing=air and heading and horizontal_speed>0.5
+			and vdot(heading,vcreate(vel.x/horizontal_speed,0,vel.z/horizontal_speed))>0.7
+		if continuing and (self.rail_grade_hold or 0)>0 then
+			-- The rider is still above the departing stair/rail route. Keep its
+			-- measured clearance slope until contact or a genuine direction change.
+			self.rail_grade_hold=0.25
+		else self.rail_grade_hold=max(0,(self.rail_grade_hold or 0)-dt) end
+		if self.rail_grade_hold==0 then
+			self.rail_grade=0.0
+			self.rail_support_pos,self.rail_support_y,self.rail_support_source=nil,nil,nil
+		end
+	end
+	self.rail_grade_filtered=ease_to(self.rail_grade_filtered or 0,(grinding or (air and (self.rail_grade_hold or 0)>0)) and (self.rail_grade or 0) or 0,0.10,dt)
+	if grinding and self.rail_grade_filtered>8*DEG and horizontal_speed>0.5 then
+		self.rail_grade_time=(self.rail_grade_time or 0)+dt
+	else self.rail_grade_time=0 end
 	-- The camera speed (graph blend, debug): |velocity . forward| on the ground; in the air the last grounded value is held.
 	if grounded then
 		self.held_speed = abs(forward_speed)
@@ -1872,6 +2101,84 @@ local function step_once(self, s, query, snap)
 	local rig = self.rig
 	local graph = self.graph
 	local ly = self.layers
+	local joint_mode=cs.follow.camera_style=="joint_lock"
+	if self.joint_mode_prev~=joint_mode then
+		Crouch.reset(self.crouch)
+		self.pop_flight,self.stable_return,self.pop_neutral=nil,nil,nil
+		self.vertical_path,self.collision_free_previous=nil,nil
+		self.pop_crouch_depth=0
+		self.landing_eye_y,self.landing_eye_speed=nil,0.0
+		self.dip_x,self.dip_applied,self.dip_on=0.0,0.0,false
+		Shake.reset(self.shake)
+		self.joint_mode_prev=joint_mode
+	end
+	-- Stair/rail contacts can return a tread or riser as the ground datum.
+	-- During a verified terrain handoff use the supported board/body gap for
+	-- crouch only; never use its drawn pose as airborne physical travel.
+	-- A continuous riding segment uses one body-to-board reference in Pop
+	-- Off. Terrain confidence must never choose the crouch coordinate system.
+	self.crouch.terrain_support=not joint_mode and grounded and s.board_valid
+
+	local crouch_lift = joint_mode and 0.0 or Crouch.update(self.crouch, dt, s, cs.follow, snap)
+	if not self.crouch.baseline and self.crouch.board_baseline then
+		self.crouch.baseline=self.crouch.board_baseline
+	end
+	local crouch_aim_lift=joint_mode and 0.0 or Crouch.aim(self.crouch)
+	if grounded and s.ground_valid and self.crouch.baseline then
+		local board_support=s.board_valid and (self.crouch.terrain_support or grinding or s.manual)
+		local support=board_support and s.board_position.y or s.ground_height
+		local baseline=board_support and (self.crouch.board_baseline or self.crouch.baseline) or self.crouch.baseline
+		self.pop_crouch_support_height=support
+		self.pop_crouch_depth=Crouch.depth(self.crouch,s)
+	end
+	local saved_pop_follow=joint_mode or cs.follow.trick_pop
+	local terrain_weight=0.0
+	local context
+	if not saved_pop_follow and s.onboard and not s.bailing then
+		local pred=self.prediction
+		context=self.terrain_context:update({position=s.position,velocity=vel,state=phys,grinding=grinding,
+			ground_valid=s.ground_valid,ground_height=s.ground_height,ground_normal=normal,
+			transition=self.transition,rail_grade=self.rail_grade_filtered,rail_grade_time=self.rail_grade_time,
+			launch_height=air and (self.was_air and self.takeoff_surface_y or self.pop_crouch_support_height) or nil,
+			predicted_landing_position=air and self.was_air and pred and pred.status=="Landed" and pred.landing_position or nil,
+			predicted_landing_height=air and self.was_air and pred and pred.status=="Landed" and pred.landing_position.y or nil,
+			cut=snap},dt,query and function(a,b) return query(a,b,false) end or nil)
+		terrain_weight=context.weight
+		-- A settled non-ramp trick keeps its established level reference. Ramp
+		-- releases retain their continuous channels across a lip/takeoff.
+		if air and not self.was_air and context.target==0 and context.reason=="flat"
+			and (context.transition_weight or 0)==0 then
+			self.terrain_context:reset()
+			context.weight,context.target,terrain_weight=0,0,0
+			self.pop_w=0
+		end
+
+	else self.terrain_context:reset() end
+	self.terrain_context_result=context
+	-- Context changes the one normal follow target, never the saved toggle or
+	-- takeoff seed. The flat-trick modifier fades out as terrain follow fades in.
+	-- The saved mode owns reference state for the entire flight. Terrain only
+	-- changes numeric weights; crossing a detection threshold never hands the
+	-- Air/rig/aim state machines to another owner.
+	local pop_follow=saved_pop_follow
+	local terrain_follow=saved_pop_follow and 1.0 or terrain_weight
+	local ramp_view=not saved_pop_follow and context and context.transition_weight or 0
+	self.ramp_render_follow=ramp_view
+	self.motion_pop_follow = saved_pop_follow or terrain_weight>0.5 -- diagnostics only
+	local pop_changed=self.pop_setting~=nil and self.pop_setting~=saved_pop_follow
+	self.pop_setting=saved_pop_follow
+	local pop_amount=saved_pop_follow and cs.follow.pop_amount or 0
+	local pop_target=joint_mode and 1.0 or (cs.follow.pop_mode==0 and pop_amount or 0)
+	local pop_pitch_target=joint_mode and 1.0 or (cs.follow.pop_mode==1 and pop_amount or 0)
+	local pop_ease=air and saved_pop_follow and self.pop_flight and self.pop_w<pop_target and 0.20 or 0.18
+	-- Saved strength and measured terrain have separate filter state. Feeding
+	-- their maximum back into the saved-strength filter made release inherit
+	-- hidden terrain history and changed speed midway through the blend.
+	self.pop_setting_w=(joint_mode or snap or self.pop_setting_w==nil) and pop_target or ease_to(self.pop_setting_w,pop_target,pop_ease,dt)
+	self.pop_w=max(self.pop_setting_w,terrain_weight)
+	if abs(self.pop_w-pop_target)<1e-6 and terrain_weight<=pop_target then self.pop_w=pop_target end
+	self.pop_pitch_w=(joint_mode or snap or self.pop_pitch_w==nil) and pop_pitch_target or ease_to(self.pop_pitch_w,pop_pitch_target,0.18,dt)
+	if abs(self.pop_pitch_w-pop_pitch_target)<1e-6 then self.pop_pitch_w=pop_pitch_target end
 
 	if snap then
 		-- A cut has no previous shot, but the framing below needs this frame's shot: resolve the one the graph would pick first.
@@ -1888,6 +2195,36 @@ local function step_once(self, s, query, snap)
 		copy_shot(self.from, self.leaf)
 	end
 	local pos = s.position
+	if air and not saved_pop_follow then
+		local path=self.vertical_path
+		if not self.was_air or snap or not path then
+			local seed=self.pop_seed
+			local seeded=not snap and seed and seed.valid
+			path={root_y=seeded and seed.guard_subject_y or s.position.y+crouch_lift,
+				origin=seeded and seed.physics_height or s.physical_height,travel=0,recovery=0,
+				recovery_goal=cs.follow.crouch_enabled and cs.follow.crouch_mode==0
+					and (self.pop_crouch_depth or 0)*cs.follow.crouch_amount or 0}
+			self.vertical_path=path
+		end
+		path.raw_travel=s.physical_height and path.origin and s.physical_height-path.origin or (path.raw_travel or path.travel)+vel.y*dt
+		path.recovery=ease_to(path.recovery or 0,path.recovery_goal or 0,0.18,dt)
+		-- Never let an independently integrated height drift indefinitely from
+		-- the observed rider. Preserve the existing 0.6m crouch/animation range;
+		-- reconcile only the excess as a scalar input to the existing rig.
+		local observed=s.position.y+crouch_lift
+		local integrated=path.root_y+path.recovery+path.raw_travel
+		local error=observed-integrated
+		local bias=error-clamp(error,-0.6,0.6)
+		path.bias=ease_to(path.bias or 0,bias,0.12,dt)
+		path.travel=path.raw_travel+path.bias
+		if self.pop_flight then self.pop_flight.virtual_root_y=path.root_y+path.recovery end
+		pos=vcreate(pos.x,path.root_y+path.recovery+path.travel,pos.z)
+	else
+		self.vertical_path=nil
+		if not saved_pop_follow and grinding and s.board_valid and self.crouch.board_baseline then
+			pos=vcreate(pos.x,s.board_position.y+self.crouch.board_baseline,pos.z)
+		end
+	end
 	local anchor_pt = pos + vcreate(0.0, cs.points.anchor_height - cs.points.board_drop, 0.0) -- the root-based orbit anchor
 
 	-- ---- forward acceleration -> pump / push
@@ -1927,23 +2264,31 @@ local function step_once(self, s, query, snap)
 	end
 	local entered_air = air and (not self.was_air or snap)
 	if entered_air then
+		self.landing_eye_y = nil
+		self.rail_land_rel = nil
+		self.landing_eye_speed = 0.0
 		self.air_time = 0.0
 		self.flight_max_height = 0.0
 		self.air_peak_y = pos.y
-		self.takeoff_surface_y = pos.y - self.last_clearance
+		self.takeoff_surface_y = not saved_pop_follow and (self.pop_crouch_support_height
+			or (pos.y-(self.crouch.baseline or self.last_clearance))) or pos.y-self.last_clearance
 		self.repredict_timer = 0.0
 		predict(self, s, query)
 	elseif air then
 		self.air_time = self.air_time + dt
 		self.air_peak_y = max(self.air_peak_y, pos.y)
 		self.repredict_timer = self.repredict_timer + dt
-		if pl.repredict_interval > 0.0 and self.repredict_timer >= pl.repredict_interval then
+		if self.prediction_deferred or (pl.repredict_interval > 0.0 and self.repredict_timer >= pl.repredict_interval) then
 			self.repredict_timer = 0.0
 			predict(self, s, query)
 		end
 	end
 	local touchdown = not snap and self.was_air and grounded and self.air_time >= cs.graph.landing_min_air_time
 
+	if self.prediction_deferred and self.prediction.status=="Landed"
+		and self.air_time>self.prediction_time_base+self.prediction.predicted_air_time+fixed_step then
+		self.prediction=EMPTY_PREDICTION -- a budget-starved old contact is not an indefinitely valid target
+	end
 	local prediction = self.prediction
 	local landed = prediction.status == "Landed"
 	local air_in = self.air_in
@@ -1956,7 +2301,28 @@ local function step_once(self, s, query, snap)
 	air_in.velocity = vel
 	air_in.ground_normal = normal
 	air_in.anchor_height = anchor_pt.y
-	air_in.follow_anchor_in_air = self.current.follow_subject_in_air
+	if not pop_follow and not joint_mode then
+		local neutral_root
+		if air then
+			local flight=self.pop_flight
+			local seed=self.pop_seed
+			if flight and flight.travel_y then
+				local travel=s.physical_height and flight.physics_origin
+					and s.physical_height-flight.physics_origin or flight.travel_y+vel.y*dt
+				neutral_root=flight.virtual_root_y+travel
+			elseif entered_air and seed and seed.valid and seed.guard_subject_y then
+				neutral_root=seed.guard_subject_y+vel.y*dt
+			end
+		elseif grounded and s.board_valid and (grinding or s.manual) then
+			neutral_root=s.board_position.y+(self.crouch.board_baseline or cs.points.board_drop)
+		elseif phys>=100 and phys<200 and not s.manual then
+			neutral_root=pos.y+crouch_lift
+		end
+		if neutral_root then
+			air_in.anchor_height=neutral_root+cs.points.anchor_height-cs.points.board_drop
+		end
+	end
+	air_in.follow_anchor_in_air = pop_follow and self.current.follow_subject_in_air
 	air_in.snap_height = snap
 	if snap then
 		Air.reset(self.air, anchor_pt.y, grounded)
@@ -1967,16 +2333,25 @@ local function step_once(self, s, query, snap)
 	if not snap and self.was_air and grounded then
 		self.last_landing_fall = max(0.0, self.air_peak_y - pos.y)
 		self.last_landing_fraction = landing_fraction_of(self, self.last_landing_fall, horizontal_speed)
-		Shake.landing_impulse_fraction(self.shake, self.last_landing_fraction, cs.shake)
-		-- The keep-in-frame layer and the landing look hold still for the kick (1.0.2 test 9). Only after a landing that shakes, and
-		-- not on a ramp or a transition: there he climbs at up to 8 m/s past the view and the layer has to keep him framed.
-		if self.last_landing_fraction > 0.0 and not self.transition and normal.y >= keep_ramp_normal_y then
-			self.landing_hold = landing_hold_time + landing_fade_time
-		else
-			self.landing_hold = 0.0
+		if not joint_mode then Shake.landing_impulse_fraction(self.shake, self.last_landing_fraction, cs.shake) end
+		-- Pop Off already holds a level eye in flight. Keep the saved bounce
+		-- control, but reduce its artificial touchdown drop on that path.
+		if not joint_mode then kick_dip(self, self.last_landing_fraction, saved_pop_follow and 1.0 or 0.35) end
+		if not joint_mode and cs.shake_enabled and not s.bailing then
+			Shake.kick_rattle(self.shake, self.last_landing_fraction, cs.shake)
 		end
 	end
-	if air then self.landing_hold = 0.0 end
+	-- The landing bounce: its depth is a function of the time since the touchdown (landing_bounce_depth), so every frame rate draws the
+	-- same curve. The camera below reads dip_x; it stays at 0 while the bounce is off.
+	if not joint_mode and self.dip_on and cs.native_plus.landing_dip then
+		self.dip_age = self.dip_age + dt
+		self.dip_x = landing_bounce_depth(self.dip_age, self.dip_from, self.dip_peak, cs.native_plus.dip_peak_time)
+		if self.dip_age > BOUNCE_HOLD + BOUNCE_TAIL * bounce_tau(cs.native_plus.dip_peak_time) then
+			self.dip_on, self.dip_x = false, 0.0
+		end
+	else
+		self.dip_on, self.dip_x = false, 0.0
+	end
 	-- ---- prepare 2: incline (after the landing response has read the previous normal)
 	self.incline_degrees = incline_of(s, normal)
 
@@ -1991,6 +2366,15 @@ local function step_once(self, s, query, snap)
 
 	-- ---- air camera (Alpha 4). air_w is the eased "in the air" weight.
 	local ac = cs.air_camera
+	local vert_touchdown=not saved_pop_follow and not joint_mode and grounded and self.was_air
+		and (self.transition_up_seen or self.swing)
+	if vert_touchdown then
+		-- End the build phase in both cascaded states, retaining the displayed
+		-- value. Otherwise a leading stage can keep raising the eye on ground.
+		self.air_w_stage=min(self.air_w_stage,self.air_w)
+		self.rise_w_stage=min(self.rise_w_stage,self.rise_w)
+		self.air_room_w_stage=min(self.air_room_w_stage,self.air_room_w)
+	end
 	local rise_goal = 0.0
 	if air and ac.rise_degrees > 0.0 then
 		local drop_below = landed and -(prediction.predicted_landing_height + self.prediction_offset) or 0.0
@@ -2007,22 +2391,34 @@ local function step_once(self, s, query, snap)
 		local room_goal = 0.0
 		if air then
 			local drop_below = landed and -(prediction.predicted_landing_height + self.prediction_offset) or 0.0
-			room_goal = clamp01((max(flight_max_height, drop_below) - big_air_from) / (big_air_full - big_air_from))
+			room_goal = (self.pop_w or 1.0)*clamp01((max(flight_max_height, drop_below) - big_air_from) / (big_air_full - big_air_from))
 		end
 		self.air_room_w_stage, self.air_room_w = ease2(self.air_room_w_stage, self.air_room_w, room_goal, room_goal > self.air_room_w_stage and build_time or release_time, dt)
 		-- The keep-in-frame weight: a big air, a ramp (the transition, last step's), and an air taken off a steep ramp.
 		local ramp_air = air and self.last_ground_normal.y < keep_ramp_normal_y
 		local keep_goal = max(room_goal, self.transition and 1.0 or 0.0, ramp_air and 1.0 or 0.0)
-		-- (Held through the landing kick: only the release waits, 1.0.2 test 9.)
-		if not landing_held(self) or keep_goal > self.keep_w_stage then
-			self.keep_w_stage, self.keep_w = ease2(self.keep_w_stage, self.keep_w, keep_goal, keep_goal > self.keep_w_stage and keep_in_time or release_time, dt)
-		end
+		self.keep_w_stage, self.keep_w = ease2(self.keep_w_stage, self.keep_w, keep_goal, keep_goal > self.keep_w_stage and keep_in_time or release_time, dt)
 	end
-	local rise_rad = self.rise_w * ac.rise_degrees * DEG
+	-- A predicted lower landing or a live descent well below takeoff is a drop,
+	-- not an ordinary pop. Restore big-air framing progressively before the skater
+	-- can outpace the held eye. Flat tricks never get this safety weight.
+	local predicted_drop=landed and -(prediction.predicted_landing_height+self.prediction_offset) or 0.0
+	local live_drop=self.pop_flight and air and self.pop_flight.root_y-pos.y or 0.0
+	-- Pop Off owns its live eye and body-in-frame pitch. A predicted drop can
+	-- change abruptly as collision rays find a new ledge; it must not blend the
+	-- ordinary air rise and aim back into an Off flight. The live framing window
+	-- below still makes the eye descend when the board actually leaves it.
+	local drop_w=air and terrain_follow*clamp01((max(predicted_drop,live_drop)-1.0)/1.0) or 0.0
+	self.pop_drop_w=drop_w
+	local pop_height_w=max(self.pop_w,drop_w)
+	local rise_rad = joint_mode and 0.0 or (pop_height_w * self.rise_w) * ac.rise_degrees * DEG
 	-- In the air, and while the air weight is still easing out after a landing (the collision's air rules).
 	local in_air_layer = air or self.air_w > 0.02
 	local keep_lead = vel * (1.0 * dt) + vcreate(0.0, min(vel.y, 0.0) * dt, 0.0)
-	local ref_y = held_ref + ac.follow_height * self.air_w * (anchor_pt.y - held_ref)
+	-- Blend targets, not Air's internal ownership. With terrain weight one,
+	-- follow the physical neutral anchor; with zero retain flat-pop reference.
+	local terrain_ref=lerp_f(held_ref,air_in.anchor_height,not saved_pop_follow and terrain_weight or 0)
+	local ref_y = terrain_ref + (pop_height_w * ac.follow_height) * self.air_w * (anchor_pt.y - terrain_ref)
 
 	-- ---- shot blend (previous = interpolated at the change, eased by elapsed / duration)
 	local changed = snap or pick_shot ~= self.id or cs.angle ~= self.angle
@@ -2150,6 +2546,15 @@ local function step_once(self, s, query, snap)
 	-- The rig's anchor: the board + a small fixed height (blended from the root-based one).
 	local rig_point = anchor_pt + (board_real + vcreate(0.0, board_anchor_height, 0.0) - anchor_pt) * board_w
 	local rig_ref_y = ref_y + (rig_point.y - anchor_pt.y)
+	if not pop_follow and board_w>0 then
+		-- Board-anchored shots must compare the board orbit against the same
+		-- neutral reference used by Air, not the animated body anchor.
+		rig_ref_y += board_w*(anchor_pt.y-air_in.anchor_height)
+	end
+	-- The orbit point is a body/board blend. Only its body share can contain
+	-- crouch animation, so compensate that same share in the eye and aim.
+	crouch_lift *= 1.0-board_w
+	crouch_aim_lift *= 1.0-board_w
 	-- reference_now: the weighted mean of the points with the blended weights (the board if the weights vanish): framing only.
 	local reference_now
 	do
@@ -2184,14 +2589,21 @@ local function step_once(self, s, query, snap)
 	-- ---- FOV extras: shot, speed and air terms, eased by one exponential filter.
 	local fv = cs.fov
 	local fov_target = 0.0
-	if fv.shot_fov then
+	local fixed_chase=active_ride(self).mode==FIXED and phys>=100 and phys<200 and not s.manual and not s.bailing
+	if fv.shot_fov and not fixed_chase then
 		fov_target = fov_target + lens_field_of_view_degrees(current.lens_length, self.aspect) - lens_field_of_view_degrees(self.chase_lens, self.aspect)
 	end
-	if fv.speed_fov then
+	if fv.speed_fov and not fixed_chase then
 		fov_target = fov_target + fv.speed_fov_degrees * clamp01((horizontal_speed - fv.speed_fov_min) / max(fv.speed_fov_max - fv.speed_fov_min, 1e-3))
 	end
 	if fv.air_fov and air then
 		fov_target = fov_target + fv.air_fov_degrees * clamp01(flight_max_height / max(fv.air_fov_full_height, 1e-3))
+	end
+	if not saved_pop_follow and air then
+		-- Do not accumulate hidden air-lens changes behind the held output.
+		-- Landing must not expose an extra that the player never asked to see.
+		fov_target=self.curr_out.fov_extra
+		self.fov_extra_stage,self.fov_extra=fov_target,fov_target
 	end
 	if not snap then
 		self.fov_extra_stage, self.fov_extra = ease2(self.fov_extra_stage, self.fov_extra, fov_target, fv.smoothing_time, dt)
@@ -2254,7 +2666,31 @@ local function step_once(self, s, query, snap)
 	out.localpos = ZERO
 	out.anchor = ZERO
 	out.skater_anchor = ZERO
-	out.subject = pos
+	out.impact = 0.0
+	out.subject = s.position
+	out.physical_height=s.physical_height
+	out.support_height=grinding and s.board_valid and s.board_position.y or nil
+	out.crouch_lift = crouch_lift
+	-- All measured vert airs share body framing, including low airs. The
+	-- overhead lift below remains reserved for achieved high air. This never
+	-- changes the saved Pop/Crouch mode or takes over a flat trick.
+	local bounds=not joint_mode and self.frame_bounds or nil
+	-- Physical-height integration may stabilize the orbit; measured joints
+	-- still belong to the observed API root. Correct aim coordinates only.
+	self.framing_root_delta=air and not saved_pop_follow and self.vertical_path and (s.position.y-pos.y) or 0
+	local body_offset=vcreate(0,self.framing_root_delta,0)
+	local body_ground=self.body_tracking and bounds and bounds.measured and grounded and normal.y>0.9
+		and not self.transition and not self.swing and (self.transition_w or 0)<0.001
+		and pick_shot>=ShotId.Chase and not grinding and not s.manual and not s.bailing
+	self.body_ground_active=body_ground==true
+	local goal=bounds and air and not s.bailing and max(ramp_view,self.transition_w or 0) or 0
+	if snap then self.vert_frame_stage,self.vert_frame_w=goal,goal
+	else
+		if grounded and self.was_air then self.vert_frame_stage=min(self.vert_frame_stage or 0,self.vert_frame_w or 0) end
+		self.vert_frame_stage,self.vert_frame_w=ease2(self.vert_frame_stage or 0,self.vert_frame_w or 0,
+			goal,goal>(self.vert_frame_stage or 0) and 0.16 or 0.4,dt)
+	end
+	local vert_frame=bounds and self.vert_frame_w or 0
 	local roll_step = min(1.0, cs.orientation.roll_response * dt)
 
 	-- Follow strength: k scales the shot's smoothing (s -> s^k) and shortens the anchor lag. Boosted with speed when follow.dynamic.
@@ -2264,13 +2700,26 @@ local function step_once(self, s, query, snap)
 	local ri = self.rig_in
 	local ria = ri.anchor
 	ria.position = rig_point
-	ria.reference_height = rig_ref_y
+	-- Compensate the framing target before its existing tracker, not the output after it has lagged.
+	local framing_ref_y = rig_ref_y + (saved_pop_follow and crouch_lift or 0)
+	ria.reference_height = framing_ref_y
 	ria.velocity = vel
 	ria.push_state = push_state
 	ria.push_kick = push_kick
 	ria.pump_acceleration = accel_filtered
-	ria.no_lag = no_lag
-	update_transition(self, snap, grounded, normal, vel, dt)
+	ria.no_lag = no_lag or (not cs.follow.trick_pop and self.swing)
+	-- A rail is not a quarter-pipe: adjacent banks and the deck's grind pose must not
+	-- latch a ramp hold/swing over the rail's travel heading. Keep actual collision normals.
+	if grinding then
+		self.transition = false
+		self.transition_hold = false
+		self.swing = false
+	end
+	update_transition(self, snap, grounded, grinding and UP or normal, vel, dt)
+	-- Render alignment and pitch protection belong to the physical ramp,
+	-- independently of whether small trick pops are followed.
+	self.ramp_render_follow=joint_mode and 0 or max(ramp_view,saved_pop_follow and self.transition_w or 0)
+	local ramp_safety=saved_pop_follow and not joint_mode and (self.transition or self.swing or self.transition_w>0.001)
 	local ric = ri.compass
 	ric.hold = self.transition_hold
 	ric.position = pos
@@ -2302,7 +2751,7 @@ local function step_once(self, s, query, snap)
 	local follow_inverse = (1.0 - transition_lag_cut * self.transition_w) / max(follow_k, 0.2)
 	rig_anchor = vcreate(rig_point.x + (rig_anchor.x - rig_point.x) * follow_inverse, rig_anchor.y,
 		rig_point.z + (rig_anchor.z - rig_point.z) * follow_inverse)
-	self.last_rig_anchor_lag = vmag(vcreate(rig_point.x, rig_ref_y, rig_point.z) - rig_anchor)
+	self.last_rig_anchor_lag = vmag(vcreate(rig_point.x, framing_ref_y, rig_point.z) - rig_anchor)
 	self.last_rig_heading = rig_heading
 	self.last_rig_elevation = rig_elevation
 	self.last_rig_distance = rig_distance
@@ -2312,7 +2761,7 @@ local function step_once(self, s, query, snap)
 	local swinging = self.swing -- the swing may end this step; it still moves the camera this one
 	local follow_heading = apply_swing(self, snap, update_horizontal_follow(self, s, snap, grounded and not self.transition_hold, horizontal_speed, rig_heading, dt), vel, dt)
 	local look_base = reference_now + vcreate(0.0, current.board_offset, 0.0)
-	update_trick_yaw(self, query, s, snap, dt, look_base, follow_heading, shoulder_metres)
+	update_trick_yaw(self, s, snap, dt)
 	local trick_value = self.trick_yaw.value
 	-- Ramps: slide the camera round to the side until the line to it is clear.
 	update_ramp_side(self, query, snap, look_base, pos, air, rig_anchor, follow_heading - trick_value, dt)
@@ -2345,9 +2794,94 @@ local function step_once(self, s, query, snap)
 	else
 		grade_used = self.hill_grade
 	end
+	local crest_grade=0.0
+	self.hill_near_drop=self.hill_near_drop or 0
+	if grounded and not grinding and not s.manual and not s.bailing and not self.transition and not snap and query
+		and s.physics_state>=100 and s.physics_state<200 and s.ground_valid and cs.collision.enabled and horizontal_speed>hill_probe_min_speed then
+		-- One ray a step, near and far in turn. The orbit starts rising before the crest, because
+		-- once the rider is over it the ground between him and the eye is already in the way.
+		local far=self.hill_probe_far_turn==true
+		self.hill_probe_far_turn=not far
+		local travel=vcreate(vel.x,0,vel.z)*(1/horizontal_speed)
+		local reach=horizontal_speed*(far and hill_probe_far or hill_probe_near)
+		local spot=vcreate(pos.x+travel.x*reach,s.ground_height+1.2,pos.z+travel.z*reach)
+		local hit=cast(self,query,spot,spot-vcreate(0,1.2+reach*math.tan(hill_probe_max_deg*DEG)+0.5,0))
+		local drop=hit and s.ground_height-hit.y or nil
+		if not far then
+			self.hill_near_drop=drop or 0
+		elseif drop and drop>=hill_probe_min_drop and self.hill_near_drop>=max(0.08,drop*hill_probe_near_share) and drop>self.hill_near_drop*hill_probe_growth then
+			local grade=math.atan((drop-self.hill_near_drop)/(reach*(1-hill_probe_near/hill_probe_far)))
+			if grade>=hill_probe_min_deg*DEG and grade<=hill_probe_max_deg*DEG then
+				self.hill_ahead,self.hill_ahead_for=grade,hill_probe_hold
+			end
+		end
+	end
+	self.hill_ahead_for=max(0,(self.hill_ahead_for or 0)-dt)
+	self.hill_ground_time=grounded and (self.hill_ground_time or 0)+dt or 0
+	if self.hill_ahead_for>0 and not self.transition and self.hill_ground_time>=hill_probe_after_landing then crest_grade=self.hill_ahead or 0 end
+	if crest_grade>grade_used and not grinding then grade_used=crest_grade end
+	if grounded and s.ground_valid then self.ride_anchor_height=rig_anchor.y-s.ground_height end
+	-- Coming down onto a slope: the ground behind the landing point rises into the eye before contact.
+	local land_grade=0.0
+	local until_landing=air and landed and self.prediction_time_base+prediction.predicted_air_time-self.air_time or nil
+	if until_landing and until_landing>=0 and until_landing<land_probe_time and vel.y<-1.0 and query and not snap and cs.collision.enabled and not s.bailing and (self.rail_grade_hold or 0)<=0 and horizontal_speed>hill_probe_min_speed then
+		local travel=vcreate(vel.x,0,vel.z)*(1/horizontal_speed)
+		if not self.transition or vdot(travel,self.ramp_down)<0.2 then
+			local far=self.land_probe_far_turn==true
+			self.land_probe_far_turn=not far
+			local back=far and land_probe_far or land_probe_near
+			local at=prediction.landing_position
+			local spot=vcreate(at.x-travel.x*back,at.y+back*math.tan(hill_probe_max_deg*DEG)+0.5,at.z-travel.z*back)
+			local hit=cast(self,query,spot,spot-vcreate(0,back*math.tan(hill_probe_max_deg*DEG)+1.0,0))
+			local rise=hit and hit.y-at.y or nil
+			if not far then
+				self.land_near_rise=rise or 0
+			elseif rise and rise>=hill_probe_min_drop and (self.land_near_rise or 0)>=rise*land_probe_near_share and rise>(self.land_near_rise or 0)*hill_probe_growth then
+				local grade=math.atan(rise/land_probe_far)
+				if grade>=hill_probe_min_deg*DEG then self.land_grade,self.land_grade_for=grade,hill_probe_hold end
+			end
+		end
+	end
+	self.land_grade_for=max(0,(self.land_grade_for or 0)-dt)
+	if air and self.land_grade_for>0 then land_grade=self.land_grade or 0 end
 	local lift_goal = 0.0
-	if grade_used > 0.0 then
+	if land_grade>0 then
+		-- The same clearance the ground rule asks for once he is down, so the two meet without a step.
+		local radius=clamp(rig_distance,distance_min(self),max(distance_min(self),distance_max(self)))
+		local slope=math.tan(land_grade)
+		local anchor_height=self.ride_anchor_height or 1.0
+		local required=land_grade+asin(clamp((ground_clearance_of(self)-anchor_height)/max(radius*sqrt(1+slope*slope),0.01),-1,1))
+		lift_goal=clamp(required-base_elevation,0,downhill_lift_max*DEG)
+		self.landing_onto_grade=land_grade
+	end
+	-- During a grind the contact normal and board pose can describe the bank or
+	-- a nose/crook animation, not the rail's direction. Travel velocity gives a
+	-- stable downhill grade and puts the eye above the floor rising behind it.
+	if (grinding or (air and (self.rail_grade_hold or 0)>0)) and (self.rail_grade or 0)>0 then
+		grade_used = self.rail_grade
+	end
+	if grade_used > 0.0 and land_grade<=0 then
 		lift_goal = clamp(grade_used + downhill_lift_margin * DEG - base_elevation, 0.0, downhill_lift_max * DEG)
+		if grounded and not grinding and not s.manual and not s.bailing
+			and s.physics_state>=100 and s.physics_state<200 and s.ground_valid and normal.y>0.2 then
+			-- Grounded downhill travel needs clearance, not an eye parallel
+			-- to the slope plus a second downward slope-look offset. Account
+			-- for the existing anchor height and actual orbit direction when
+			-- solving the minimum eye angle above the measured support plane.
+			local radius=clamp(rig_distance,distance_min(self),max(distance_min(self),distance_max(self)))
+			local side=vcreate(-sin(heading_used),0,cos(heading_used))
+			local slope=-(normal.x*side.x+normal.z*side.z)/normal.y
+			local anchor_height=rig_anchor.y-s.ground_height
+			local required=math.atan(slope)+asin(clamp((ground_clearance_of(self)-anchor_height)
+				/max(radius*sqrt(1+slope*slope),0.01),-1,1))
+			lift_goal=clamp(required-base_elevation,0,downhill_lift_max*DEG)
+			if not self.transition then
+				-- Only the clearance lift above. At a crest the ground between rider and eye is the obstacle, so it rises first.
+				if crest_grade>math.atan(max(slope,0))+hill_crest_margin*DEG then
+					lift_goal=max(lift_goal,clamp(crest_grade,0,downhill_lift_max*DEG))
+				end
+			end
+		end
 	end
 	if snap then
 		self.downhill_lift = lift_goal
@@ -2392,8 +2926,50 @@ local function step_once(self, s, query, snap)
 		self.air_room_extra = self.air_room_extra + clamp(room_goal - self.air_room_extra, -big_air_room_rate * dt, big_air_room_rate * dt)
 	end
 	distance_now = distance_now + self.air_room_extra
-	self.air_room_max = self.air_room_extra > 0.0 and max(max(distance_max(self), dmin), distance_now) or 0.0
+	-- A scalar spacing target shares the rig's existing distance path. Root
+	-- translation stays direct; only extra room required by joints/FOV eases.
+	local body_radius=body_ground and (bounds.top-bounds.bottom)
+		/(2*math.tan(0.45*fov_base_deg(self)*DEG)*max(cos(elevation_used),0.3)) or 0
+	-- Solve the actual projected head/feet angle from the authored eye
+	-- height and shoulder, rather than assuming an eye at torso midpoint.
+	-- That assumption over-expanded Low shoulder views into nearby geometry.
+	-- Centred chase retains midpoint room while its tilt tracker catches up.
+	if body_ground and abs(shoulder_metres)>0.02 then
+		local lo,hi=0,body_radius
+		local target=0.9*fov_base_deg(self)*DEG
+		for _=1,10 do
+			local r=(lo+hi)*0.5
+			local depth=sqrt((r*cos(elevation_used))^2+shoulder_metres^2)
+			local eye_y=rig_anchor.y-pos.y-crouch_lift+r*sin(elevation_used)
+			local angle=math.atan2(bounds.top-eye_y,max(depth,0.01))
+				-math.atan2(bounds.bottom-eye_y,max(depth,0.01))
+			if angle>target then lo=r else hi=r end
+		end
+		body_radius=hi
+	end
+	local body_room=true
+	if body_radius>distance_now+1e-4 and cs.collision.enabled and query then
+		-- Test the complete shoulder-shifted arm, including its finite width.
+		-- Extra framing room is optional; collision keeps the nominal target.
+		local side=vcreate(-sin(heading_used),0,cos(heading_used))
+		local right=vcreate(-cos(heading_used),0,-sin(heading_used))
+		local wanted=rig_anchor+side*(body_radius*cos(elevation_used))
+			+vcreate(0,body_radius*sin(elevation_used),0)+right*shoulder_metres
+		local radius=cs.collision.automatic and AUTO_COLLISION.radius or cs.collision.radius
+		body_room=self.step_rays<=ray_budget-3
+		if body_room then
+			for _,offset in {ZERO,right*radius,-right*radius} do
+				if cast(self,query,rig_anchor+offset,wanted+offset) then body_room=false;break end
+			end
+		end
+		if not body_room then body_radius=0 end
+	end
+	if snap then self.body_spacing=body_radius
+	else self.body_spacing=ease_to(self.body_spacing or 0,body_radius,0.16,dt) end
+	if body_ground and body_room then distance_now=max(distance_now,self.body_spacing) end
+	self.air_room_max = (self.air_room_extra > 0.0 or body_ground) and max(max(distance_max(self), dmin), distance_now) or 0.0
 	self.distance_used = distance_now
+	out.distance = distance_now
 	local cos_e, sin_e = cos(elevation_used), sin(elevation_used)
 	local offset_dir = vcreate(-sin(heading_used), 0.0, cos(heading_used))
 	local camera = rig_anchor + offset_dir * (distance_now * cos_e) + vcreate(0.0, distance_now * sin_e, 0.0)
@@ -2419,6 +2995,9 @@ local function step_once(self, s, query, snap)
 	local landing_goal = 0.0
 	if landing_known then
 		local predicted_point = prediction.landing_position + vcreate(0.0, self.last_clearance - cs.points.board_drop, 0.0)
+		if not saved_pop_follow and (ramp_view>0 or self.transition or self.swing or flight_max_height>4) then
+			predicted_point=vcreate(predicted_point.x,max(predicted_point.y,pos.y-cs.points.board_drop),predicted_point.z)
+		end
 		if self.landing_w < 0.01 or snap then
 			self.landing_point = predicted_point
 			self.landing_point_stage = predicted_point
@@ -2427,16 +3006,24 @@ local function step_once(self, s, query, snap)
 		end
 		local drop = prediction.predicted_landing_height + self.prediction_offset
 		if lk.landing_look and drop < 0.0 then
-			landing_goal = lk.landing_look_strength * clamp01(-drop / max(lk.landing_look_full_drop, 0.1))
+			landing_goal = terrain_follow * (1-ramp_view) * lk.landing_look_strength * clamp01(-drop / max(lk.landing_look_full_drop, 0.1))
 		end
 	end
 	-- b) slope look: on the ground the pitch follows the incline (+ uphill, so downhill looks down).
-	local slope_goal = (lk.slope_look and grounded) and lk.slope_look_strength * self.incline_degrees * DEG or 0.0
+	local slope_goal = (lk.slope_look and grounded and not grinding) and lk.slope_look_strength * self.incline_degrees * DEG or 0.0
+	-- The orbit's rise over a hill already tilts the view down it. Only what it has not covered may
+	-- be added, or the two stack and the rider climbs out of the top of the frame.
+	if grounded and self.incline_degrees <= -hill_look_min_deg then
+		self.hill_descent = (self.hill_descent or 0.0) + dt
+	else
+		self.hill_descent = 0.0
+	end
+	if slope_goal < 0.0 and not s.manual and not s.bailing and phys >= 100 and phys < 200 then
+		local replaced = self.transition and 1.0 or clamp01((self.hill_descent - hill_look_after) / hill_look_ramp)
+		slope_goal = min(0.0, slope_goal + self.downhill_lift * replaced)
+	end
 	if not snap then
-		-- The landing look lets go only after the landing kick (1.0.2 test 9); a new landing is followed at once.
-		if not landing_held(self) or landing_goal > self.landing_w_stage then
-			self.landing_w_stage, self.landing_w = ease2(self.landing_w_stage, self.landing_w, landing_goal, response_time(self), dt)
-		end
+		self.landing_w_stage, self.landing_w = ease2(self.landing_w_stage, self.landing_w, landing_goal, response_time(self), dt)
 		self.look_pitch_stage, self.look_pitch = ease2(self.look_pitch_stage, self.look_pitch, slope_goal, response_time(self), dt)
 	end
 	local focused_base = self.focus_value >= 1.0 and look_base or (board_point + (look_base - board_point) * self.focus_value)
@@ -2444,6 +3031,9 @@ local function step_once(self, s, query, snap)
 	-- c) vertical follow
 	local held_y = ref_y
 	look_target = vcreate(look_target.x, held_y + lk.vertical_follow * (look_target.y - held_y), look_target.z)
+	if crouch_aim_lift ~= 0.0 then
+		look_target += vcreate(0, crouch_aim_lift * (saved_pop_follow and 1.0 or lk.vertical_follow), 0)
+	end
 
 	-- ---- shoulder: slide the camera along its own right.
 	local to_pre = look_target - camera
@@ -2455,6 +3045,8 @@ local function step_once(self, s, query, snap)
 	local yaw_now = snap and wrap_angle(yaw_pre + framing3[2]) or self.pan.position
 	local shoulder_dir = vcreate(-cos(yaw_now), 0.0, -sin(yaw_now))
 	local shift = shoulder_dir * limited_shoulder(self, query, camera, shoulder_dir, vel, shoulder_metres, snap, horizontal_speed)
+	self.motion_shoulder_requested = shoulder_metres -- diagnostics only
+	self.motion_shoulder_applied = vdot(shift, shoulder_dir)
 	camera = camera + shift
 	-- Fixed distance: measured from the skater's own anchor, at the distance the orbit uses.
 	local fixed_goal = active_ride(self).mode == FIXED and 1.0 or 0.0
@@ -2472,17 +3064,236 @@ local function step_once(self, s, query, snap)
 		local dir = span > 1e-4 and off * (1.0 / span) or offset_dir
 		camera = camera + (own + dir * self.distance_used - camera) * fixed_w
 	end
-	camera = limiter_update(self.ramp_limit, camera, pos, snap, self.transition or self.swing, rel_max_speed, rel_accel, fixed_step, rel_max_orbit)
+	if saved_pop_follow and not ramp_safety then
+		camera = limiter_update(self.ramp_limit, camera, pos, snap, self.transition or self.swing, rel_max_speed, rel_accel, fixed_step, rel_max_orbit)
+	end
+	-- Pop Off holds the selected eye during an upward trick. Real downward
+	-- travel can move it once the rider would leave the lower view.
+	-- Seed from the displayed predecessor, including elevated grinds. Crouch
+	-- release is independent of pop height; downward travel cannot strand the
+	-- camera at the takeoff level.
+	if snap then self.pop_flight=nil end
+	local off_air=air and (not saved_pop_follow or self.pop_w<1) and not s.bailing
+	if off_air then
+		if entered_air or pop_changed or not self.pop_flight then
+			local previous=self.curr_out
+			local seed=self.pop_seed
+			local use_seed=not snap and entered_air and seed and seed.valid and seed.world_position and seed.root
+			local eye=use_seed and seed.world_position or (snap and camera or previous.pos)
+			local root=use_seed and seed.root or (snap and pos or previous.subject)
+			local reach=use_seed and seed.reach or vmag(vcreate(eye.x-root.x,0,eye.z-root.z))
+			local lens=(use_seed and seed.fov) or ((not snap and self.frame.valid) and self.frame.fov_deg or (fov_base_deg(self)+self.fov_extra))
+			local window=clamp(reach*math.tan(0.35*lens*DEG),0.35,0.8)
+			local from_rail=(self.rail_grade_hold or 0)>0
+			local rail_pitch=use_seed and seed.forward and asin(clamp(seed.forward.y,-1,1)) or (snap and self.tilt.position or previous.pitch)
+			local pitch=from_rail and rail_pitch or self.tilt.position
+			local release=0.0
+			local neutral=self.pop_neutral
+			if not pop_follow and cs.follow.crouch_enabled and cs.follow.crouch_mode==0
+				and terrain_follow<0.001 and not self.transition and not self.swing
+				and use_seed and neutral and neutral.angle==cs.angle and self.crouch.last_ground_height then
+				local support=self.pop_crouch_support_height or self.crouch.last_ground_height
+				local compression=self.pop_crouch_depth or 0
+				release=min(compression,max(0,support+neutral.eye-eye.y))
+			end
+			-- The seed is a composed display view. Keep the base tilt continuous;
+			-- keep-in-frame, shake and clearance must not be applied twice.
+			-- Rail close-ups retain their explicit board-view handoff.
+			if from_rail and not pop_follow and not (cs.follow.crouch_enabled and cs.follow.crouch_amount>0 and cs.follow.crouch_mode==0) then
+				T.angle_reset(self.tilt,pitch)
+			end
 
+			self.pop_flight={root_y=self.vertical_path and self.vertical_path.root_y or root.y,virtual_root_y=self.vertical_path and (self.vertical_path.root_y+(self.vertical_path.recovery or 0)) or ((use_seed and seed.guard_subject_y) or root.y),
+				travel_y=0.0,physics_origin=self.vertical_path and self.vertical_path.origin or ((use_seed and seed.physics_height) or self.cur_snap.physical_height),
+				eye_y=eye.y+release,guard_eye_y=eye.y,height=eye.y,reach=max(reach,0.3),release=release,
+				limit_y=eye.y+release-(camera.y-rig_anchor.y),
+				pitch=pitch,fov=lens,
+				down=min(window,0.65)}
+		end
+		local flight=self.pop_flight
+		-- The deck place is a drawn bone, so integrate the host's physics-step
+		-- vertical velocity for the flight instead of treating trick animation
+		-- in the deck/root as height gained or lost.
+		if self.vertical_path then
+			flight.travel_y=self.vertical_path.travel
+		elseif s.physical_height and flight.physics_origin then
+			flight.travel_y=s.physical_height-flight.physics_origin
+		else flight.travel_y=flight.travel_y+vel.y*dt end
+		local displacement=flight.travel_y
+		-- Upward trick displacement does not move the stable eye.
+		local held=displacement>=0 and displacement or max(displacement,-flight.down)
+		local excess=displacement-held
+		local goal=flight.eye_y+excess
+		flight.height=ease_to(flight.height,goal,flight.release>0 and 0.18 or 0.08,dt)
+		-- A falling rider must not leave the view during a long render frame.
+		if displacement<0 then
+			flight.height=min(flight.eye_y+displacement+flight.down,flight.height)
+		end
+		local direction=normalized(vcreate(camera.x-pos.x,0,camera.z-pos.z),-s.forward)
+		local level=vcreate(pos.x,flight.height,pos.z)+direction*flight.reach
+		camera=level+(camera-level)*pop_height_w
+		self.pop_vertical_weight=pop_height_w+(1-pop_height_w)*clamp(abs(excess)/0.2,0,1)
+		local held_anchor=vcreate(rig_anchor.x,flight.limit_y+flight.height-flight.eye_y,rig_anchor.z)
+		local neutral_anchor=held_anchor+(rig_anchor-held_anchor)*pop_height_w
+		self.air_room_max=max(self.air_room_max,vmag(camera-neutral_anchor),
+			vmag(camera-vcreate(rig_point.x,neutral_anchor.y,rig_point.z)))
+	else
+		self.pop_vertical_weight=1
+		if not air then self.pop_flight=nil end
+	end
+	-- Keep one support-relative pose/velocity through grounded shot changes.
+	-- The rider's horizontal travel is added directly; only the changing shot
+	-- offset is damped. This never trails a moving rider in world space.
+	if not joint_mode and not saved_pop_follow and grounded and not s.bailing then
+		local neutral=pos+vcreate(0,crouch_lift,0)
+		local goal=camera-neutral
+		local st=self.stable_return
+		if snap or not st then
+			local seed=self.pop_seed
+			local start=goal
+			if not snap and self.was_air and seed and seed.valid then
+				start=seed.world_position-seed.root-vcreate(0,crouch_lift,0)
+			end
+			st={offset=start,velocity=ZERO,vert=vert_touchdown};self.stable_return=st
+		end
+		local difference=goal-st.offset
+		local wanted=difference/0.12
+		local speed=vmag(wanted)
+		if speed>3 then wanted*=3/speed end
+		local acceleration=wanted-st.velocity
+		local amount=vmag(acceleration)
+		if amount>20*dt then acceleration*=20*dt/amount end
+		st.velocity+=acceleration
+		local change=st.velocity*dt
+		if vdot(change,difference)>vdot(difference,difference) then change=difference;st.velocity=ZERO end
+		st.offset+=change
+		if st.vert then
+			-- The existing orbit limiter owns horizontal recovery. Do not
+			-- queue its turn behind another full-vector return filter.
+			st.offset=vcreate(goal.x,st.offset.y,goal.z)
+			st.velocity=vcreate(0,st.velocity.y,0)
+			if not self.transition and not self.swing and abs(goal.y-st.offset.y)<0.01 then st.vert=false end
+		end
+		camera=neutral+st.offset
+		-- Returning from a higher support must not be radially cut by the
+		-- ordinary shot's smaller distance envelope on its following frame.
+		self.air_room_max=max(self.air_room_max,vmag(camera-rig_anchor),
+			vmag(camera-vcreate(rig_point.x,rig_anchor.y,rig_point.z)))
+	else
+		self.stable_return=nil
+	end
+	if vert_frame>1e-5 then
+		-- Raise the requested eye, not the final display: the existing sweep,
+		-- wall/floor resolution and relative motion limiter own its safety.
+		local top=pos.y+bounds.top+0.75
+		local lift=clamp01(((self.air_peak_y-self.takeoff_surface_y-self.last_clearance)-4.0)/4.0)
+		camera+=vcreate(0,max(0,top-camera.y)*vert_frame*lift,0)
+		self.air_room_max=max(self.air_room_max,vmag(camera-rig_anchor))
+		-- Keep the body as the aim anchor; trajectory points can be metres below
+		-- or beyond a returning rider. The lower screen remains the landing view.
+		local body_target=pos+vcreate(0,bounds.centre,0)+body_offset
+		look_target=look_target+(body_target-look_target)*vert_frame
+	end
+	-- Full body follow can put a Low view below the floor at maximum crouch.
+	-- Ease the target into its existing clearance before collision/recovery,
+	-- instead of repeatedly raising and re-aiming the displayed camera.
+	if not joint_mode and grounded and not grinding and not s.manual
+		and (not saved_pop_follow or (self.crouch.compression or 0)>0.001)
+		and cs.follow.crouch_enabled and cs.follow.crouch_amount>=0.999 and cs.follow.crouch_mode==0
+		and cs.collision.enabled and s.ground_valid and normal.y>0.995 then
+		local floor=s.ground_height+ground_clearance_of(self)
+		local gap=camera.y-floor
+		local knee=0.12
+		if gap<knee then
+			local safe=gap<=-knee and 0 or (gap+knee)*(gap+knee)/(4*knee)
+			camera=vcreate(camera.x,floor+safe,camera.z)
+		end
+	end
+	local collision_base=look_base+vcreate(0,crouch_lift,0)
+	if grounded and not joint_mode and s.ground_valid and normal.y>0.2
+		and (self.ramp_render_follow or 0)>0.001 then
+		-- Air's eased aim reference may still be below the support after a
+		-- fast return. A ray starting inside the floor pushes the eye to the
+		-- buried side of that floor. Keep collision origin above the support;
+		-- leave the authored aim/rig references alone.
+		local floor=s.ground_height-(normal.x*(collision_base.x-pos.x)+normal.z*(collision_base.z-pos.z))/normal.y
+		collision_base=vcreate(collision_base.x,max(collision_base.y,floor+0.1),collision_base.z)
+	end
+	-- Coordinate the FINISHED pre-collision pose, after fixed radius, ramp
+	-- limiter and held-height transforms. Testing the earlier raw orbit could
+	-- report clearance for an eye that would never actually be shown.
+	self.ramp_nominal_shift=shift
+	local actual_shoulder=vdot(shift,shoulder_dir)
+	if cs.collision.enabled and query and not joint_mode
+		and (abs(trick_value)>1e-4 or abs(shoulder_metres)>0.02
+			or abs(self.adaptive_orbit.yaw)>1e-4 or abs(self.adaptive_orbit.shoulder)>0.02) then
+		local unshifted=camera-shift
+		local relative=vcreate(unshifted.x-rig_anchor.x,0,unshifted.z-rig_anchor.z)
+		local reach=max(vmag(relative),0.01)
+		local base=atan2(-relative.x,relative.z)+trick_value
+		-- Predict the requested path, not last frame's avoidance/dip output.
+		-- Feeding corrections back as intent makes opposing wall probes chase
+		-- one another. Actual-eye sweeps below still enforce contact safety.
+		local prior_goal=self.adaptive_goal_last
+		local camera_step=prior_goal and camera-prior_goal or ZERO
+		self.adaptive_goal_last=camera
+		local ramp_forecast=self.transition or self.swing or (context and context.transition_weight>0)
+		if not ramp_forecast then camera_step=self.curr_out.pos-self.prev_out.pos end
+		local camera_motion=not snap and (prior_goal or not ramp_forecast) and vmag(camera_step)<10 and camera_step/fixed_step or vel
+		self.ramp_intent_velocity=camera_motion
+		local lead=camera_motion*coll_lookahead_time
+		local lead_len=vmag(lead)
+		if lead_len>coll_lookahead_max then lead*=coll_lookahead_max/lead_len end
+		local radius=cs.collision.automatic and AUTO_COLLISION.radius or cs.collision.radius
+		local available=7-self.adaptive_rays
+		-- Older direct camera snapshots supply clearance/normal without the
+		-- SDK adapter's ground-valid flag. Preserve that support-plane contract.
+		local support_known=s.ground_valid or (not self.extras_query_remaining
+			and isfinite(s.ground_clearance) and s.ground_clearance>=0)
+		self.adaptive_ground_origin=support_known and pos or nil
+		self.adaptive_ground_normal=support_known and normal or nil
+		self.adaptive_ground_height=s.ground_valid and s.ground_height or s.position.y-s.ground_clearance
+		if self.extras_query_remaining then
+			available=min(available,max(0,self.extras_query_remaining()-(ray_budget-self.step_rays)-14*(self.orbit_pending_steps or 0)))
+		end
+		local yaw_used,shoulder_used=AdaptiveOrbit.solve(self.adaptive_orbit,self,query,adaptive_cast,
+			collision_base,rig_anchor,base,camera.y,reach,trick_value,actual_shoulder,radius,lead,dt,snap,available,shoulder_dir,
+			self.pop_seed and self.pop_seed.valid and self.pop_seed.world_position or (self.curr_out.pos-self.finish_offset))
+		if yaw_used~=trick_value or shoulder_used~=actual_shoulder then
+			local h=base-yaw_used
+			shift=shoulder_dir*shoulder_used
+			camera=vcreate(rig_anchor.x-sin(h)*reach,camera.y,rig_anchor.z+cos(h)*reach)+shift
+		end
+		trick_value=yaw_used
+	else
+		self.adaptive_goal_last,self.ramp_intent_velocity=nil,nil
+		AdaptiveOrbit.reset(self.adaptive_orbit)
+		self.adaptive_orbit.yaw,self.adaptive_orbit.shoulder=trick_value,actual_shoulder
+	end
+	self.motion_shoulder_applied=vdot(shift,shoulder_dir)
 	-- ---- collision
-	local free_camera = camera
 	self.last_shift = shift
 	self.orbit_reach = sqrt(self.distance_used * self.distance_used + vdot(shift, shift))
 	local pulled
+	self.dip_reach = (cs.native_plus.landing_dip and not snap) and max(self.dip_x, 0.0) or 0.0
+	look_base=collision_base
+	if self.collision_pre and cs.collision.enabled and cs.collision.automatic then
+		camera = self.collision_pre(camera, look_base, vmag(camera-look_base), vel, fixed_step)
+	end
+	local free_camera = camera
 	pulled, camera = collide(self, query, look_base, camera, pos, board_point, vel, snap, in_air_layer, horizontal_speed)
-	camera = clamp_distance(self, camera, rig_anchor, offset_dir)
+	-- An Off pop does not change the chosen orbit radius when the rider rises.
+	-- Measure the distance limits from the held support frame, while the core
+	-- collision still checks the real skater, board and world geometry.
+	local limit_anchor=rig_anchor
+	if off_air and self.pop_flight then
+		local flight=self.pop_flight
+		local held_anchor=vcreate(rig_anchor.x,flight.limit_y+flight.height-flight.eye_y,rig_anchor.z)
+		limit_anchor=held_anchor+(rig_anchor-held_anchor)*pop_height_w
+	end
+	camera = clamp_distance(self, camera, limit_anchor, offset_dir)
 	-- On the ground the maximum also holds from the skater's own anchor.
-	local skater_anchor = vcreate(rig_point.x, rig_anchor.y, rig_point.z)
+	local skater_anchor = vcreate(rig_point.x, limit_anchor.y, rig_point.z)
 	do
 		local held = clamp_distance(self, camera, skater_anchor, offset_dir)
 		local cut = held - camera
@@ -2496,14 +3307,208 @@ local function step_once(self, s, query, snap)
 		local toward = cut_len > 1e-4 and cut * (1.0 / cut_len) or normalized(skater_anchor - camera, ZERO)
 		camera = camera + toward * self.rider_hold
 	end
-	camera = apply_hard_collision(self, camera, snap)
+	if saved_pop_follow then
+	-- The air reference and Pop Off eye are replaced by the riding reference at
+	-- touchdown. If they disagree, carry the previous eye offset into the first
+	-- ground steps, then catch the riding target at a bounded relative speed.
+	-- This follows the skater on a drop; it never holds a fixed world height.
+	local same_level_handoff=self.last_landing_fall < 0.8
+		and abs((pos.y - clearance_now) - self.takeoff_surface_y) < 0.25
+	local rail_handoff=grinding and self.last_landing_fall < 1.5
+	if not joint_mode and not snap and self.was_air and grounded
+		and (same_level_handoff or rail_handoff) then
+		local prior=self.curr_out
+		local prior_y=prior.pos.y+prior.impact-prior.subject.y
+		local eye_error=abs(prior_y-(camera.y-pos.y))
+		if eye_error > landing_eye_rate * dt and (same_level_handoff or eye_error < 0.8) then
+			self.landing_eye_y = prior_y
+			self.landing_eye_speed = 0.0
+		end
+	end
+	if s.bailing or not s.onboard then self.landing_eye_y, self.landing_eye_speed = nil, 0.0 end
+	if grounded and self.landing_eye_y then
+		local goal_y = camera.y - pos.y
+		local difference = goal_y - self.landing_eye_y
+		local target_speed = clamp(difference / dt, -landing_eye_rate, landing_eye_rate)
+		self.landing_eye_speed = self.landing_eye_speed + clamp(target_speed - self.landing_eye_speed,
+			-landing_eye_accel * dt, landing_eye_accel * dt)
+		if self.landing_eye_speed * difference < 0.0 then self.landing_eye_speed = 0.0 end
+		local held_y = self.landing_eye_y + self.landing_eye_speed * dt
+		if difference >= 0.0 then held_y = min(held_y, goal_y) else held_y = max(held_y, goal_y) end
+		local floor_y = max(self.hard_floor_y > -1.0e8 and self.hard_floor_y + ground_clearance_of(self) or -1.0e9,
+			pl.floor_clearance > 0.0 and s.ground_clearance < 3.0 and pos.y - clearance_now + pl.floor_clearance or -1.0e9)
+		local handoff_camera = vcreate(camera.x, max(pos.y + held_y, floor_y), camera.z)
+		if vmag(handoff_camera - camera) <= 1e-5 then
+			-- No move to validate.
+		elseif self.step_rays < ray_budget then
+			local hit = cast(self, query, camera, handoff_camera)
+			if hit then
+				local travel = handoff_camera - camera
+				local length = vmag(travel)
+				if length > 1e-5 then
+					local radius = cs.collision.automatic and AUTO_COLLISION.radius or cs.collision.radius
+					local safe = max(0.0, vmag(hit - camera) - radius)
+					handoff_camera = camera + travel * (min(safe, length) / length)
+				end
+			end
+		else
+			handoff_camera = camera -- never assume a blocked sweep is clear when the ray budget is exhausted
+		end
+		camera = handoff_camera
+		self.landing_eye_y = camera.y - pos.y
+		if abs(self.landing_eye_y - goal_y) < 1e-3 then self.landing_eye_y, self.landing_eye_speed = nil, 0.0 end
+	end
+	end
+	-- The landing dip: the camera goes straight down by the spring's depth and aims at the same look target from there, so the view dips
+	-- with it. Straight down: the horizontal distance to the skater is not touched (it never moves toward him). Only as far as the ground
+	-- and the camera's ground clearance allow, so a low camera does not go into the ground: the room is measured by the collision's ground
+	-- ray (which reaches the dip's depth below the camera) and by the floor under the skater. After the distance limits and before the
+	-- hard collision, so the limits and the wall pull act on the camera as they were without it.
+	self.dip_applied = 0.0
+	if not joint_mode and cs.native_plus.landing_dip and abs(self.dip_x) > 1e-5 then
+		local room = 1.0e9
+		if self.hard_floor_y > -1.0e8 then
+			room = camera.y - (self.hard_floor_y + ground_clearance_of(self))
+		end
+		if pl.floor_clearance > 0.0 and s.ground_clearance < 3.0 then
+			room = min(room, camera.y - (pos.y - clearance_now + pl.floor_clearance))
+		end
+		-- (the rebound over the rest position, a negative depth, lifts the camera a little: it has no ground to meet)
+		self.dip_applied = self.dip_x < 0.0 and self.dip_x or clamp(self.dip_x, 0.0, max(room, 0.0))
+		camera = vcreate(camera.x, camera.y - self.dip_applied, camera.z)
+	end
+	if body_ground and cs.collision.enabled and self.hard_floor_y>-1e8
+		and self.hard_floor_y-s.ground_height<0.35 then
+		-- Compose local floor clearance before aim tracking. The safety pass
+		-- must not repeatedly raise an under-cleared eye and re-aim it later.
+		local floor=self.hard_floor_y+ground_clearance_of(self)
+		local gap=camera.y-floor
+		local knee=0.12
+		if gap<knee then
+			local safe=gap<=-knee and 0 or (gap+knee)^2/(4*knee)
+			camera=vcreate(camera.x,floor+safe,camera.z)
+		end
+	end
+	local limited_ramp_camera
+	if not saved_pop_follow or ramp_safety then
+		-- Cached collision release belongs to the target before motion limiting;
+		-- its scalar must not kick the final eye when the collision ray turns.
+		camera=apply_hard_collision(self,camera,snap)
+		-- One existing motion limiter owns the finished soft-collision target,
+		-- not an early orbit which later transforms could move by a metre.
+		camera=limiter_update(self.ramp_limit,camera,pos,snap,
+			self.transition or self.swing or self.adaptive_orbit.constrained,
+			rel_max_speed,rel_accel,fixed_step,rel_max_orbit,self.adaptive_orbit.constrained,
+			lerp_f(sqrt(rel_max_speed^2+rel_max_orbit^2),5.5,clamp01(self.ramp_render_follow or 0)))
+		limited_ramp_camera=camera
+	else
+		camera = apply_hard_collision(self, camera, snap)
+	end
 	-- The lifts and the maximum above can still bring the camera a few cm inside the personal space: pushed out radially.
 	camera = keep_out_of(camera, pos, min(personal_root(self) + personal_margin, vmag(free_camera - pos)))
 	camera = keep_out_of(camera, board_point, min(personal_board(self) + personal_margin, vmag(free_camera - board_point)))
 
+
+	-- The one core collision owner validates the finished candidate after
+	-- personal-space and distance limits. Geometry wins if those limits conflict,
+	-- but the answer arrives through one bounded offset: a surface found this
+	-- frame must not move the eye metres in a frame.
+	local finish_from=camera
+	local function short_of(hit,radius)
+		local ray=camera-look_base
+		local full=vmag(ray)
+		if full<1e-3 then return camera end
+		return look_base+ray*(min(full,max(vmag(hit-look_base)-radius,finish_near))/full)
+	end
+	if self.pop_w<1 and not pop_follow and not joint_mode and cs.collision.enabled and query and self.step_rays<ray_budget then
+		local hit=cast(self,query,look_base,camera)
+		if hit then camera=short_of(hit,cs.collision.automatic and AUTO_COLLISION.radius or cs.collision.radius) end
+	end
+	-- Validate a finite-width finished eye. Once a broad surface is found,
+	-- infer its plane from two nearby point rays and slide off its normal.
+	-- A radial pull at the first wall contact changed height and distance at
+	-- once, even though only a small sideways correction was needed.
+	if (not saved_pop_follow or ramp_safety) and not joint_mode and cs.collision.enabled and query
+		and (ramp_view>0 or ramp_safety or self.adaptive_orbit.constrained) then
+		local radius=cs.collision.automatic and AUTO_COLLISION.radius or cs.collision.radius
+		local function check(a,b)
+			local hit,known
+			if self.extras_final_query then hit,known=self.extras_final_query(a,b,14*(self.orbit_pending_steps or 0)+8)
+			else hit,known=query(a,b,false),true end
+			if known then self.finished_rays+=1 end
+			if hit and not finite3(hit) then return nil,false end
+			if hit and s.ground_valid and normal.y>0.2 then
+				local floor=s.ground_height-(normal.x*(hit.x-pos.x)+normal.z*(hit.z-pos.z))/normal.y
+				if abs(hit.y-floor)<0.04 then hit=nil end
+			end
+			return hit,known
+		end
+		local ray=camera-look_base
+		local side=normalized(vcreate(-ray.z,0,ray.x),vcreate(1,0,0))
+		local hit,known=check(look_base,camera)
+		local centre_hit=hit
+		local offset=ZERO
+		if known and not hit then
+			offset=side*radius
+			hit,known=check(look_base+offset,camera+offset)
+			if known and not hit then
+				offset=-offset
+				hit,known=check(look_base+offset,camera+offset)
+			end
+		end
+		if known and hit then
+			local up_probe=vcreate(0,0.05,0)
+			local side_probe=side*0.05
+			local h1,k1=check(look_base+offset+up_probe,camera+offset+up_probe)
+			local h2,k2=check(look_base+offset+side_probe,camera+offset+side_probe)
+			local plane=k1 and k2 and h1 and h2 and vector.cross(h1-hit,h2-hit) or nil
+			if plane and vmag(plane)>1e-5 then
+				plane=normalized(plane,UP)
+				if vdot(plane,look_base-hit)<0 then plane=-plane end
+				local depth=radius-vdot(camera-hit,plane)
+				if depth>0 then camera+=plane*depth end
+			elseif centre_hit then
+				camera=short_of(centre_hit,radius)
+			end
+		end
+	end
+	do
+		local wanted=camera-finish_from
+		if snap then
+			self.finish_offset,self.finish_velocity=wanted,ZERO
+		else
+			local before=self.finish_offset
+			local grow=vmag(wanted)>vmag(before)
+			local value,velocity=critically_damped(before,self.finish_velocity,wanted,grow and finish_in_time or finish_out_time,fixed_step)
+			local step=value-before
+			local most=finish_max_speed*fixed_step
+			local length=vmag(step)
+			if length>most then
+				value=before+step*(most/length)
+				velocity=step*(finish_max_speed/length)
+			end
+			self.finish_offset,self.finish_velocity=value,velocity
+		end
+		camera=finish_from+self.finish_offset
+	end
+	if limited_ramp_camera and vmag(finish_from-limited_ramp_camera)>1e-4 then
+		-- A necessary hard correction becomes next step's actual starting pose.
+		self.ramp_limit.rel,self.ramp_limit.velocity=finish_from-pos,ZERO
+	end
 	-- Look at the actual reference point (not the lagged anchor). The up-tilt is capped (frame_composer.rs).
-	local to_ref = look_target + shift - camera
+	-- (The aim's own pitch is that of the camera without the bounce's drop: the tilt tracker eases it. The drop's own change of the aim is
+	-- added below at once, so the view pitches up with the impact the frame the camera drops, and not a few frames later.)
+	local aim_from = vcreate(camera.x, camera.y + self.dip_applied, camera.z)
+	local to_ref = look_target + shift - aim_from
 	local to_len = vmag(to_ref)
+	local dip_pitch = 0.0
+	if self.dip_applied ~= 0.0 then
+		local dropped = look_target + shift - camera
+		local dropped_len = vmag(dropped)
+		if to_len > 1e-4 and dropped_len > 1e-4 then
+			dip_pitch = asin(clamp(dropped.y / dropped_len, -1.0, 1.0)) - asin(clamp(to_ref.y / to_len, -1.0, 1.0))
+		end
+	end
 	local pan, tilt = self.pan, self.tilt
 	local yaw_target = pan.position
 	local pitch_target = tilt.position
@@ -2521,6 +3526,66 @@ local function step_once(self, s, query, snap)
 	pitch_target = clamp(pitch_target + framing3[3] + self.look_pitch + view_pitch_offset, -89.0 * DEG, 89.0 * DEG)
 	-- Manuals and grinds never look up: the pitch above the player's own offset is taken off by the floor's eased weight.
 	pitch_target = pitch_target - floor_w * max(0.0, pitch_target - max(view_pitch_offset, 0.0))
+	if grinding then
+		-- Collision may still lift the camera above a steep ledge. Aim ahead rather than
+		-- down at the deck from there. Respect the player's own grind pitch adjustment.
+		local rail_pitch_floor=-25.0*DEG
+		if (self.rail_grade_time or 0)>=0.08 then rail_pitch_floor=min(rail_pitch_floor,-self.rail_grade_filtered-5*DEG) end
+		pitch_target = max(pitch_target, clamp(rail_pitch_floor + framing_pitch, -65.0 * DEG, 0.0))
+	end
+	if off_air and self.pop_flight then
+		local flight=self.pop_flight
+		if flight.travel_y>=-flight.down and pulled<=1e-5 then
+			-- Flat tricks retain the chosen aim regardless of root/board animation.
+			pitch_target=lerp_f(flight.pitch,pitch_target,max(self.pop_pitch_w,pop_height_w))
+		else
+			-- Once the rider actually descends out of the held view, aim from the
+			-- collision-resolved eye using the ordinary, bounded tilt tracker.
+			local drop_target=elevation_to(camera,vcreate(pos.x,flight.virtual_root_y+flight.travel_y,pos.z))+view_pitch_offset
+			local descent_w=clamp01((-flight.travel_y-flight.down)/0.4)
+			local held_pitch=lerp_f(flight.pitch,drop_target,max(self.pop_pitch_w,descent_w))
+			-- Real descent keeps the rider/landing corridor in view rather than
+			-- aiming at a ballistic look point far below him. Terrain entry/exit
+			-- still blends the normal view continuously while within that window.
+			local rail_view=clamp01(((self.rail_grade_filtered or 0)-8*DEG)/(12*DEG))
+				*clamp01((self.rail_grade_hold or 0)/0.2)
+			pitch_target=lerp_f(held_pitch,pitch_target,pop_height_w*(1-descent_w*(1-max(rail_view,ramp_view))))
+		end
+	end
+	if vert_frame>1e-5 then
+		local head=elevation_to(camera,pos+(bounds.head or vcreate(0,bounds.top,0))+body_offset)
+		local feet=elevation_to(camera,pos+vcreate(0,bounds.bottom,0)+body_offset)
+		local half=0.45*clamp(fov_base_deg(self)+self.fov_extra,1,170)*DEG
+		local lo=max(head,feet)-half
+		local hi=min(head,feet)+half
+		-- The launch plane is a steady return corridor when the bounded
+		-- trajectory search cannot yet reach a landing. Never aim at a raw floor
+		-- hit, or steer yaw toward a remote/changed prediction.
+		local corridor=vcreate(pos.x,self.takeoff_surface_y,pos.z)
+		local down=elevation_to(camera,corridor)
+		local wanted=max(down+half,head-half)
+		local framed=lo<=hi and clamp(wanted,lo,hi) or 0.5*(head+feet)
+		pitch_target=lerp_f(pitch_target,framed,vert_frame)
+	end
+	if body_ground then
+		-- Framing uses smoothed joint positions, not board rotation. Project
+		-- the torso envelope from the finished collision-resolved eye, then
+		-- let the existing tilt tracker own the change (no final-pose filter).
+		local flat=normalized(vcreate(pos.x-camera.x,0,pos.z-camera.z),s.forward)
+		local neutral=pos+vcreate(0,crouch_lift,0)
+		local head=neutral+(bounds.head or vcreate(0,bounds.top,0))
+		local depth=max(vdot(neutral-camera,flat),0.1)
+		local head_depth=max(vdot(head-camera,flat),0.1)
+		local half=0.45*fov_base_deg(self)*DEG
+		local low=math.atan2(head.y-camera.y,head_depth)-half
+		local high=math.atan2(neutral.y+bounds.bottom-camera.y,depth)+half
+		pitch_target=low<=high and clamp(pitch_target,low,high) or (low+high)*0.5
+	end
+	-- The aim tracker and the keep-in-frame correction share a pitch budget
+	-- during measured terrain follow; their separate speed caps used to add.
+	local ramp_pitch=joint_mode and 0 or max(ramp_view,saved_pop_follow and self.transition_w or 0)
+	self.terrain_pitch_rate=ramp_pitch>0.001
+		and lerp_f(aim_max_pitch_rate,120.0,ramp_pitch) or nil
 	if snap then
 		T.angle_reset(pan, yaw_target)
 		T.angle_reset(tilt, pitch_target)
@@ -2531,7 +3596,13 @@ local function step_once(self, s, query, snap)
 		local fast_orbit = (swinging or ramp_side ~= 0.0 or orbit_rate > pan_lock_rate * DEG)
 			and sqrt(to_ref.x * to_ref.x + to_ref.z * to_ref.z) > pan_lock_min_span
 		local pan_set = self.pan_set
-		fill_tracker(pan_set, cs.orientation.pan, clamp01(cur_smoothing[3]) ^ follow_k, cs.orientation)
+		local cruise_turn=grounded and not grinding and not s.manual and not self.transition and cs.follow.horizontal>0
+		fill_tracker(pan_set, cs.orientation.pan, clamp01(cur_smoothing[3]) ^ (cruise_turn and 1 or follow_k), cs.orientation)
+		if grounded and not grinding and not s.manual and not self.transition
+			and cs.follow.horizontal>=9.99 and horizontal_speed>follow_min_speed then
+			pan_set.smoothing_min,pan_set.smoothing_max=0,0
+			pan_set.acceleration_min_degrees,pan_set.acceleration_max_degrees=aim_fast_acceleration,aim_fast_acceleration
+		end
 		if fast_orbit then
 			pan_set.smoothing_min = 0.0
 			pan_set.smoothing_max = 0.0
@@ -2548,7 +3619,16 @@ local function step_once(self, s, query, snap)
 		end
 		local tilt_set = self.tilt_set
 		fill_tracker(tilt_set, cs.orientation.tilt, clamp01(cur_smoothing[4]) ^ follow_k, cs.orientation)
-		tilt_set.speed_clamp_degrees = min(tilt_set.speed_clamp_degrees, aim_max_pitch_rate)
+		tilt_set.speed_clamp_degrees = min(tilt_set.speed_clamp_degrees, self.terrain_pitch_rate or aim_max_pitch_rate)
+		if off_air and self.pop_flight and self.pop_flight.travel_y < -self.pop_flight.down then
+			-- A real drop needs a responsive landing view, through the same tilt
+			-- tracker. No second aim reset or body-fit controller is applied.
+			tilt_set.smoothing_min=0
+			tilt_set.smoothing_max=min(tilt_set.smoothing_max,0.15)
+			tilt_set.speed_clamp_degrees=min(72,tilt_set.speed_clamp_degrees)
+			tilt_set.acceleration_min_degrees=max(720,tilt_set.acceleration_min_degrees)
+			tilt_set.acceleration_max_degrees=max(720,tilt_set.acceleration_max_degrees)
+		end
 		T.angle_update(pan, yaw_target, dt, pan_set)
 		T.angle_update(tilt, pitch_target, dt, tilt_set)
 		self.roll = self.roll + (framing3[1] - self.roll) * roll_step
@@ -2556,15 +3636,35 @@ local function step_once(self, s, query, snap)
 	-- Keep the skater in the vertical view in the air, and on a ramp. The head too.
 	local kp = self.keep_points
 	kp[1] = look_base + keep_lead
+	if bounds and vert_frame>0 then
+		-- Hold the actual envelope, not a future horizontal aim point: a lead
+		-- farther from the eye understates the body's vertical screen extent.
+		local head=pos+(bounds.head or vcreate(0,bounds.top,0))+body_offset+vcreate(0,max(0,keep_lead.y),0)
+		kp[1]=kp[1]+(head-kp[1])*vert_frame
+	end
 	kp[2] = board_point + keep_lead
-	kp[3] = pos + keep_lead
-	kp[4] = pos + vcreate(0.0, big_air_head, 0.0) + keep_lead
-	local keep_w = self.keep_w * (1.0 - floor_w)
-	local keep_pitch = update_keep_in_frame(self, camera, tilt.position + self.last_shake_pitch, kp, 4, 3, keep_w, snap, landing_hold_weight(self))
+	if bounds and vert_frame>0 then
+		local feet=pos+vcreate(0,bounds.bottom+min(0,keep_lead.y),0)+body_offset
+		kp[2]=kp[2]+(feet-kp[2])*vert_frame
+	end
+	kp[3] = pos + keep_lead + body_offset*vert_frame
+	kp[4] = pos + vcreate(0.0, bounds and lerp_f(big_air_head,bounds.top,vert_frame) or big_air_head, 0.0) + keep_lead + body_offset*vert_frame
+	local keep_w = max(pop_height_w*self.keep_w,vert_frame)*(1.0-floor_w)
+	local keep_pitch = update_keep_in_frame(self, camera, tilt.position + self.last_shake_pitch + dip_pitch, kp, 4, 3, keep_w, snap)
+	if grounded and not grinding and not s.manual and s.ground_valid and self.crouch.baseline
+		and abs(pos.y-s.ground_height-self.crouch.baseline)<0.03 then
+		self.pop_neutral={eye=camera.y-s.ground_height,angle=cs.angle}
+	end
 	out.pos = camera
 	out.yaw = pan.position
-	out.pitch = tilt.position + keep_pitch
+	out.pitch = tilt.position + keep_pitch + dip_pitch
+	out.impact = self.dip_applied
 	out.roll = self.roll
+	if off_air and snap and self.pop_flight then
+		local flight=self.pop_flight
+		flight.eye_y,flight.height,flight.pitch=camera.y,camera.y,out.pitch
+		flight.reach=max(0.3,vmag(vcreate(camera.x-pos.x,0,camera.z-pos.z)))
+	end
 	ly.look_target = look_target
 	ly.keep_weight = keep_w
 	ly.camera_free = free_camera
@@ -2577,7 +3677,7 @@ local function step_once(self, s, query, snap)
 	ly.landing_look_weight = self.landing_w
 	ly.look_pitch_offset = self.look_pitch
 	ly.follow_strength = follow_k
-	ly.trick_yaw = self.trick_yaw.value
+	ly.trick_yaw = self.adaptive_orbit.yaw
 	ly.air_follow_weight = self.air_w
 	ly.air_reference_height = ref_y
 	ly.air_rise = rise_rad
@@ -2618,7 +3718,6 @@ local function step_once(self, s, query, snap)
 
 	-- ---- write (a non-finite step is dropped: the previous output stays)
 	self.was_air = air
-	self.landing_hold = max(0.0, self.landing_hold - dt)
 	self.last_pick_chase_blend = pick_blend
 	self.last_pick_landing_active = pick_landing
 	self.last_speed = speed
@@ -2631,13 +3730,27 @@ local function step_once(self, s, query, snap)
 		self.prev_out = self.curr_out
 		self.curr_out = out
 		self.out = old_prev
+		if entered_air and off_air and self.pop_seed and self.pop_seed.valid then
+			-- The first airborne render can interpolate toward a ground step that
+			-- predates the pose actually shown at takeoff. Start this flight from
+			-- the seeded takeoff pose instead of replaying that stale step.
+			copy_step_out(self.prev_out,self.curr_out)
+		end
 	end
-	self.update_rays = self.update_rays + self.step_rays
-	self.update_rays_max = max(self.update_rays_max, self.step_rays)
+	local counted_rays=self.step_rays+self.adaptive_rays+self.finished_rays+(context and context.rays or 0)
+	self.update_rays = self.update_rays + counted_rays
+	self.update_rays_max = max(self.update_rays_max, counted_rays)
 end
 
 -- Camera cut: every tracker lands on this frame's targets with zero velocity, shake and dip clear.
 local function cut_to(self, s, query)
+	self.body_spacing=0
+	self.stable_return,self.pop_neutral,self.pop_crouch_depth=nil,nil,0
+	self.pop_crouch_support_height=nil
+	self.terrain_context:reset()
+	self.vertical_path=nil
+	self.collision_free_previous=nil
+	self.rail_grade_filtered,self.rail_grade_time,self.rail_departure_heading=0,0,nil
 	copy_snapshot(self.cur_snap, s)
 	self.acc = 0.0
 	Graph.reset(self.graph)
@@ -2681,6 +3794,7 @@ local function cut_to(self, s, query)
 	self.coll_wall = 0.0
 	self.coll_wall_stage = 0.0
 	trick_yaw_reset(self.trick_yaw)
+	AdaptiveOrbit.reset(self.adaptive_orbit)
 	self.hf_w = 0.0
 	self.hf_w_stage = 0.0
 	self.travel_heading = 0.0
@@ -2700,6 +3814,11 @@ local function cut_to(self, s, query)
 	self.downhill_lift_stage = 0.0
 	self.downhill_time = 0.0
 	self.hill_grade = 0.0
+	self.rail_grade = 0.0
+	self.rail_grade_hold = 0.0
+	self.rail_support_pos = nil
+	self.rail_support_y = nil
+	self.rail_support_source = nil
 	self.transition_from_hill = false
 	self.downhill_rise = false
 	self.fixed_w = 0.0
@@ -2718,6 +3837,7 @@ local function cut_to(self, s, query)
 	self.ramp_probe_clock = 0.0
 	self.ramp_zero_clear = false
 	self.last_shift = ZERO
+	self.ramp_nominal_shift,self.adaptive_goal_last,self.ramp_intent_velocity=nil,nil,nil
 	local l = self.ramp_limit
 	l.valid = false
 	l.engaged = false
@@ -2725,6 +3845,7 @@ local function cut_to(self, s, query)
 	self.floor_w_stage = 0.0
 	self.height_off = 0.0
 	self.height_stage = 0.0
+	self.finish_offset, self.finish_velocity = ZERO, ZERO
 	self.board_w = 0.0
 	self.board_w_stage = 0.0
 	self.board_rel = ZERO
@@ -2734,7 +3855,10 @@ local function cut_to(self, s, query)
 	self.air_peak_y = 0.0
 	self.last_landing_fall = 0.0
 	self.last_landing_fraction = 0.0
-	self.landing_hold = 0.0
+	self.dip_x, self.dip_applied, self.dip_on = 0.0, 0.0, false
+	self.landing_eye_y = nil
+	self.landing_eye_speed = 0.0
+	self.rail_land_rel = nil
 	layers_reset(self.layers)
 	self.no_lag_timer = self.settings.pipeline.no_lag_after_reset
 	step_once(self, s, query, true)
@@ -2765,18 +3889,50 @@ local function publish(self, was_reset, steps, extras_unused)
 	local o_skater = po.skater_anchor + (co.skater_anchor - po.skater_anchor) * alpha
 	local o_fov_extra = lerp_f(po.fov_extra, co.fov_extra, alpha)
 	local o_shoulder = lerp_f(po.shoulder, co.shoulder, alpha)
+	local o_impact = lerp_f(po.impact, co.impact, alpha)
 	-- The interpolated pose is the one of a step ago; the game draws him where he is now, so it moves with him by that step,
 	-- its place relative to him unchanged.
 	local cur = self.cur_snap
+	local vertical_weight=self.pop_vertical_weight or self.pop_w
+	if is_air_state(cur.physics_state) and self.pop_w<1 and not self.pop_flight then vertical_weight=self.pop_w end
 	local carried = cur.position - (po.subject + (co.subject - po.subject) * alpha)
+	local current_lift = Crouch.sample(self.crouch, cur) or co.crouch_lift
+	if po.crouch_lift ~= 0.0 or co.crouch_lift ~= 0.0 or current_lift ~= 0.0 then
+		-- Carry the virtual framing too, so standing up cannot add the body bob back.
+		local lift_delta = current_lift - (po.crouch_lift + (co.crouch_lift - po.crouch_lift) * alpha)
+		carried = vcreate(carried.x, carried.y + lift_delta, carried.z)
+	end
+	if is_air_state(cur.physics_state) and not cs.follow.trick_pop and cur.physical_height
+		and po.physical_height and co.physical_height then
+		carried=vcreate(carried.x,cur.physical_height-lerp_f(po.physical_height,co.physical_height,alpha),carried.z)
+	end
+	if is_grind_state(cur.physics_state) and not cs.follow.trick_pop and cur.board_valid
+		and po.support_height and co.support_height then
+		carried=vcreate(carried.x,cur.board_position.y-lerp_f(po.support_height,co.support_height,alpha),carried.z)
+	end
 	-- At most what his speed covers in 1.5 steps.
 	local most = vmag(cur.velocity) * 1.5 * fixed_step + 0.01
 	local cl = vmag(carried)
 	if cl > most then
 		carried = carried * (most / cl)
 	end
-	-- Not down: the step held the camera above the ground and the deck.
-	carried = vcreate(carried.x, max(carried.y, 0.0), carried.z)
+	-- Interpolation is one physics step behind the sampled rider. The carried
+	-- root has already had the crouch compensation added above. Preserve its
+	-- signed travel for Pop Off, since discarding downward travel strands the
+	-- eye over a descending rider. The deck's place is a drawn bone, so it is
+	-- not a physical vertical datum for this render alignment.
+	local carry_y=max(carried.y,0)
+	if self.pop_w<1 and not is_air_state(cur.physics_state) then
+		carry_y=carried.y
+	elseif is_air_state(cur.physics_state) then
+		carry_y=carried.y>=0 and carried.y*vertical_weight or carried.y*vertical_weight*(1-self.pop_w)
+	end
+	-- Measured ramp follow aligns downward travel too; retain the existing
+	-- flat-pop/rail carry outside that continuous ramp share.
+	local ramp_carry=self.ramp_render_follow or 0
+	local signed_carry=carried.y*(is_air_state(cur.physics_state) and vertical_weight or 1)
+	carry_y=lerp_f(carry_y,signed_carry,ramp_carry)
+	carried = vcreate(carried.x, carry_y, carried.z)
 	local carried_by = ZERO
 	if finite3(carried) then
 		o_pos = o_pos + carried
@@ -2788,7 +3944,29 @@ local function publish(self, was_reset, steps, extras_unused)
 	local fov_base = fov_base_deg(self)
 	local right, up, back = basis_from_angles(o_yaw, o_pitch, o_roll)
 	local position = o_pos + right * o_local.x + up * o_local.y + back * o_local.z
+	-- The shake moves the camera across the line to the skater, never along it: the view axis does not point at his root (the camera
+	-- looks over him), so a push along the camera's own axes still came a few cm closer or further (2-3 cm in a landing kick), which
+	-- reads as the camera hitting him. The part of the shake's move along the line to the root is taken out.
+	do
+		local line = cur.position - o_pos
+		local line_length = vmag(line)
+		if line_length > 0.3 then
+			local toward = line * (1.0 / line_length)
+			position = position - toward * vdot(position - o_pos, toward)
+		end
+	end
+	-- The landing rattle turns the view only: the position above is already made, from the pose without it. It is evaluated at the time
+	-- this frame shows (the pose is the interpolation of the last two steps, so the step's time less what is left of it).
+	local rattle_lead = (1.0 - alpha) * fixed_step
+	local rattle = Shake.rattle(self.shake, cs.shake, rattle_lead)
+	if rattle.x ~= 0.0 or rattle.y ~= 0.0 or rattle.z ~= 0.0 then
+		right, up, back = basis_from_angles(o_yaw + rattle.y, o_pitch + rattle.x, o_roll + rattle.z)
+	end
 	local fov = clamp(fov_base + o_fov_extra, 1.0, 170.0)
+	if is_air_state(cur.physics_state) and self.pop_w<1 then
+		local held=self.pop_flight and self.pop_flight.fov or (self.frame.valid and self.frame.fov_deg or fov)
+		fov=lerp_f(held,fov,self.pop_w)
+	end
 	if not finite3(right) or not finite3(up) or not finite3(back) or not finite3(position) or not isfinite(fov) then
 		hold(self)
 		return
@@ -2826,9 +4004,14 @@ local function publish(self, was_reset, steps, extras_unused)
 	d.anchor_lag = self.last_rig_anchor_lag
 	d.heading = self.last_rig_heading
 	d.elevation = self.last_elevation_used -- with the rise, so camera = anchor + distance * sin(elevation)
-	d.distance = self.distance_used -- with the exit ease
+	d.distance = self.distance_used -- latest simulation step, for diagnostics
+	d.render_distance = lerp_f(po.distance, co.distance, alpha) -- same clock as the rendered pose
 	d.impulse = self.shake.impulse
-	d.landing_dip = 0.0
+	d.rattle_pitch, d.rattle_yaw, d.rattle_roll = rattle.x, rattle.y, rattle.z -- radians, the landing rattle's rotation in this frame
+	d.rattle_time = Shake.rattle_age(self.shake, rattle_lead) -- s since the landing kick that is running, as of this frame (large: none)
+	d.landing_dip = self.dip_x -- the spring; the camera may take less of it (dip_applied) when the ground is in the way
+	d.impact_y = o_impact -- m the bounce took the camera down in this frame (up: negative); the snap guard does not judge it
+	d.shake_pitch = self.last_shake_pitch -- radians, the shake's own pitch this step
 	d.speed = self.last_speed
 	d.incline_degrees = self.incline_degrees
 	d.forward_acceleration = self.accel_filtered
@@ -2851,7 +4034,39 @@ local function publish(self, was_reset, steps, extras_unused)
 	d.air_follow_weight = ly.air_follow_weight
 	d.air_reference_height = ly.air_reference_height
 	d.air_rise = ly.air_rise
+	d.framing_root_delta=self.framing_root_delta or 0
+	d.downhill_lift = self.downhill_lift
 	d.keep_pitch_offset = ly.keep_pitch_offset
+	d.pop_active=is_air_state(cur.physics_state) and self.pop_w<1 and self.pop_flight~=nil
+	d.terrain_weight=self.terrain_context_result and self.terrain_context_result.weight or 0
+	d.terrain_transition_weight=self.ramp_render_follow or 0
+	d.terrain_reason=self.terrain_context_result and self.terrain_context_result.reason or "none"
+	d.terrain_target=self.terrain_context_result and self.terrain_context_result.target or 0
+	-- Observations from the latest simulation step; pose fields above are rendered.
+	d.motion_pop_follow = self.motion_pop_follow == true
+	d.motion_recovery_gap=self.ramp_limit.valid and vmag(self.ramp_limit.target-self.ramp_limit.rel) or 0
+	d.motion_shoulder_requested = self.motion_shoulder_requested or 0
+	d.motion_shoulder_applied = self.motion_shoulder_applied or 0
+	d.motion_trick_target = self.trick_yaw.target
+		d.motion_trick_value = self.adaptive_orbit.yaw
+	d.motion_trick_hold = self.trick_yaw.hold_left
+	d.motion_trick_side = self.trick_yaw.side_used
+	d.motion_trick_duration = self.trick_yaw.duration
+	d.motion_probe_side = self.motion_probe_side or 0
+	d.motion_probe_blocked = self.motion_probe_blocked == true
+	d.motion_probe_sequence = self.motion_probe_sequence or 0
+	d.collision_floor_ahead=ly.coll_floor_ahead or 0
+	d.collision_lift=self.coll_lift or 0
+	d.collision_wall=self.coll_wall or 0
+	d.collision_lift_fast=self.coll_lift_fast or 0
+	d.pop_height_weight = self.pop_w or 1
+	d.pop_pitch_weight = self.pop_pitch_w or 0
+	d.pop_drop_weight = self.pop_drop_w or 0
+	d.landing_eye_active = self.landing_eye_y ~= nil
+	d.rail_handoff_active = self.rail_land_rel ~= nil
+	d.pop_vertical_weight=is_air_state(cur.physics_state) and vertical_weight or 1
+	d.pop_anchor_y=self.pop_flight and self.pop_flight.height or nil
+	d.pop_reach=self.pop_flight and self.pop_flight.reach or nil
 	d.focus_weight = ly.focus_weight
 	d.look_target = ly.look_target
 	d.landing_fall = self.last_landing_fall
@@ -2872,6 +4087,8 @@ local function publish(self, was_reset, steps, extras_unused)
 	d.carried = carried_by
 	d.collision_rays = self.update_rays
 	d.collision_rays_max = self.update_rays_max
+	d.crouch_compensation = po.crouch_lift + (co.crouch_lift - po.crouch_lift) * alpha
+	d.crouch_baseline = self.crouch.baseline or 0.0
 end
 
 -- ---------------------------------------------------------------- update
@@ -2891,9 +4108,15 @@ local function blend_snapshot(self, a, b, f)
 	out.time = lerp_f(a.time, b.time, f)
 	out.position = a.position + (b.position - a.position) * f
 	out.velocity = a.velocity + (b.velocity - a.velocity) * f
+	out.physical_velocity = a.physical_velocity and b.physical_velocity
+		and a.physical_velocity + (b.physical_velocity - a.physical_velocity) * f or src.physical_velocity
+	out.physical_height = a.physical_height and b.physical_height
+		and lerp_f(a.physical_height,b.physical_height,f) or src.physical_height
 	out.forward = normalized(a.forward + (b.forward - a.forward) * f, b.forward)
 	out.ground_normal = normalized(a.ground_normal + (b.ground_normal - a.ground_normal) * f, b.ground_normal)
 	out.ground_clearance = lerp_f(a.ground_clearance, b.ground_clearance, f)
+	out.ground_valid = a.ground_valid == true and b.ground_valid == true
+	out.ground_height = out.ground_valid and lerp_f(a.ground_height, b.ground_height, f) or 0.0
 	if a.board_valid and b.board_valid then
 		out.board_position = a.board_position + (b.board_position - a.board_position) * f
 	end
@@ -2918,6 +4141,12 @@ function Camera:update(dt, subject, query, extras)
 	end
 	-- What the steps need of the extras: the keep-in-frame layer reads the lens (fov_base_deg).
 	self.extras_base_fov = extras and extras.base_fov_deg or 0.0
+	self.pop_seed = extras and extras.pop_seed or nil
+	self.frame_bounds=extras and extras.frame_bounds or nil
+	self.body_tracking=extras and extras.body_tracking==true
+	self.collision_pre = extras and extras.collision_pre or nil
+	self.extras_query_remaining = extras and extras.query_remaining or nil
+	self.extras_final_query = extras and extras.final_query or nil
 
 	local pipe = cs.pipeline
 	local cut = self.reset_requested or not self.initialized or self.last_preset ~= cs.preset
@@ -2926,6 +4155,7 @@ function Camera:update(dt, subject, query, extras)
 	self.invalid_time = 0.0
 
 	self.kick_in_update = false
+	self.orbit_pending_steps = 0
 	self.update_rays = 0
 	self.update_rays_max = 0
 	local steps = 0
@@ -2964,6 +4194,7 @@ function Camera:update(dt, subject, query, extras)
 			else
 				f = 1.0
 			end
+			self.orbit_pending_steps = steps - i
 			step_once(self, blend_snapshot(self, cur, subject, f), query, false)
 		end
 		acc = f32(self.acc - f32(steps * step))

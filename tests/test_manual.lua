@@ -44,7 +44,7 @@ end
 -- a. Ollie -> 201 -> 101 "Powerslide", "Revert" named at 101: no manual at any point.
 do
 	local m = Manual.new()
-	expect(m.source == "trick list", "the source is the trick list")
+	expect(m.source == "score / trick list", "the source includes score and trick list")
 	local _, e1, t = run(m, 0, 1, 100)
 	m:on_notes({ name(99732, "Ollie") }, t)
 	local _, e2, t2 = run(m, t, 0.5, 201)
@@ -279,7 +279,7 @@ do
 	m:update(0.01, 100, true, false, false, nil)
 	m:on_notes({ name(1, "Manual") }, 0.02)
 	m:reset()
-	expect(m.source == "trick list" and not m.on, "reset forgets the manual and keeps the source")
+	expect(m.source == "score / trick list" and not m.on, "reset forgets the manual and keeps the source")
 	m:update(0.5, 100, true, false, false, nil)
 	m:on_notes({ name(1, "Manual") }, 1)
 	expect(m.on, "and the old entry is new again")
@@ -313,6 +313,73 @@ do
 	expect(warns == 1 and bad_app.manual ~= nil, "a refused feed logs one warning and the app still starts")
 	local _, ever = run(bad_app.manual, 0, 0.5, 101)
 	expect(not ever, "and state 101 starts nothing")
+end
+
+-- p. The board lying level ends a manual. The game writes the manual's landing note only when the whole trick line ends, so a manual
+-- used to stay on (with its close-up) until the next ollie, sometimes a second or two after the board was level. Once it has been on
+-- for 0.5 s, |board pitch| under 4 degrees for 0.4 s in a row ends it. Pop-setup spikes and a manual into an ollie are not level.
+do
+	-- Ticks at 60 Hz from t0 for `seconds`; `pitch` is a number or a function of the time since t0 (nil = unreadable).
+	-- Returns whether it is still on, when it went off (seconds since t0) and the end time.
+	local function run_pitch(m, t0, seconds, pitch, state)
+		local on, off_at = true, nil
+		local n = math.floor(seconds * 60 + 0.5)
+		for i = 1, n do
+			local t = t0 + i / 60
+			local p = pitch
+			if type(pitch) == "function" then p = pitch(t - t0) end
+			local st = state or 100
+			on = m:update(t, st, true, st == 201 or st == 200, false, p)
+			if not on and not off_at then off_at = t - t0 end
+		end
+		return on, off_at, t0 + n / 60
+	end
+	local function started()
+		local m = Manual.new()
+		m:update(0.0, 100, true, false, false, nil)
+		m:on_notes({ name(99732, "Manual") }, 0.01)
+		expect(m.on, "(a manual is on)")
+		return m
+	end
+
+	local m = started()
+	local on, off_at = run_pitch(m, 0.01, 1.0, function(t) return t < 0.3 and 15 or 1 end)
+	expect(not on and off_at ~= nil, "level for 0.4 s ends it")
+	expect(off_at ~= nil and off_at > 0.65 and off_at < 0.8, "nose up for 0.3 s, then 0.4 s level: it ends at about 0.7 s (" .. tostring(off_at) .. ")")
+	expect(string.find(m.last_event, "board level", 1, true) ~= nil, "the reason is 'board level' (" .. m.last_event .. ")")
+
+	local m2 = started()
+	local on2 = run_pitch(m2, 0.01, 0.9, function(t) return t < 0.6 and 15 or 1 end)
+	expect(on2, "level for only 0.3 s does not end it")
+	expect(run_pitch(m2, 0.91, 0.05, 15), "and a tilt in between starts the count again")
+	local on2c, off2c = run_pitch(m2, 0.96, 0.35, 0)
+	expect(on2c and off2c == nil, "0.35 s level after it is still short")
+	expect(run_pitch(m2, 1.31, 0.2, 0) == false, "and 0.4 s in a row ends it")
+
+	local m3 = started()
+	expect(run_pitch(m3, 0.01, 0.45, 0), "on for under 0.5 s: a level board does not end it")
+	local on3b, off3b = run_pitch(m3, 0.46, 0.5, 0)
+	expect(not on3b and off3b ~= nil and off3b < 0.1, "it ends as soon as it has been on for 0.5 s (" .. tostring(off3b) .. ")")
+
+	expect(run_pitch(started(), 0.01, 3.0, nil), "an unreadable pitch never ends it")
+	expect(run_pitch(started(), 0.01, 2.0, function(t) return (math.floor(t * 60 + 0.5) % 12 < 6) and 0 or nil end),
+		"and a pitch that keeps dropping out never gives 0.4 s in a row")
+
+	-- a manual straight into an ollie: the nose stays up (10-20 degrees), then the air
+	local m5 = started()
+	expect(run_pitch(m5, 0.01, 2.0, function(t) return 15 + 5 * math.sin(t * 3) end), "a manual that stays nose-up stays on")
+	local on5b = run_pitch(m5, 2.01, 0.1, 15, 201)
+	expect(not on5b and string.find(m5.last_event, "left the ground", 1, true) ~= nil, "and into an ollie it ends at leaving the ground (" .. m5.last_event .. ")")
+
+	expect(run_pitch(started(), 0.01, 1.5, function(t) return (t % 0.5 < 0.25) and 35 or -32 end), "pitch spikes of 30+ degrees are not level")
+
+	-- a new manual after a level end starts normally and counts again
+	local m8 = started()
+	run_pitch(m8, 0.01, 1.5, 0)
+	expect(not m8.on, "ended by the level board")
+	m8:on_notes({ name(99900, "Manual") }, 1.6)
+	expect(m8.on and m8.count == 2, "a new Manual note starts the next one")
+	expect(run_pitch(m8, 1.61, 0.45, 0), "and it is not ended before it has been on for 0.5 s")
 end
 
 T.done()
