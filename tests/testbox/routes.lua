@@ -52,6 +52,10 @@ local function make_ray(w)
 	return function(a, b)
 		local best
 		if w.profile then best = ray_profile(a, b, w.profile) end
+		if w.surface then
+			local t = w.surface(a, b)
+			if t and (not best or t < best) then best = t end
+		end
 		for _, box in w.boxes or {} do
 			local t = ray_box(a, b, box)
 			if t and (not best or t < best) then best = t end
@@ -175,6 +179,88 @@ local function route_halfpipe(opt)
 		return v(carve * t, p.y, p.z), v(carve, vel.y, vel.z), state, h + forward * turn
 	end
 	return { world = world, pose = pose, duration = half * 3, warm = 1.0, settings = opt.settings }
+end
+
+-- Replays a recorder clip (tools/recorder/clip_to_route.py). The rider's path is exact; the ground is the plane seen at the
+-- nearest frame of the clip and walls are unknown.
+local function route_clip(opt)
+	local d, F = opt.data, {}
+	local f1 = d.frames[1]
+	local ox, oy, oz = f1[2] - f1[5] * 1.2, f1[3] - HIP, f1[4] - f1[7] * 1.2 -- the lead-in starts at the origin, where the camera does
+	for i, f in d.frames do
+		local c = table.clone(f)
+		c[2], c[3], c[4], c[12], c[17], c[18], c[19] = f[2] - ox, f[3] - oy, f[4] - oz, f[12] - oy, f[17] - ox, f[18] - oy, f[19] - oz
+		F[i] = c
+	end
+	local n, t0, LEAD = #F, F[1][1], 1.2
+	local span = F[n][1] - t0
+	local function find(t)
+		local lo, hi = 1, n
+		while hi - lo > 1 do
+			local mid = (lo + hi) // 2
+			if F[mid][1] - t0 <= t then lo = mid else hi = mid end
+		end
+		return lo, hi
+	end
+	local function lerp(t)
+		t = math.clamp(t, 0, span)
+		local i, j = find(t)
+		local a, b = F[i], F[j]
+		local u = b[1] > a[1] and math.clamp((t + t0 - a[1]) / (b[1] - a[1]), 0, 1) or 0
+		return a, b, u
+	end
+	local CELL, cells = 2, {}
+	local function key(x, z) return math.floor(x / CELL) * 100000 + math.floor(z / CELL) end
+	for _, f in F do
+		if f[14] > 0.15 then
+			local y = f[16] == 1 and f[12] or f[3] - f[11]
+			local s = { v(f[2], y, f[4]), v(f[13], f[14], f[15]) }
+			local k = key(f[2], f[4])
+			cells[k] = cells[k] or {}
+			table.insert(cells[k], s)
+		end
+	end
+	local function nearest(q)
+		local best, bd = nil, 25
+		for dx = -CELL, CELL, CELL do for dz = -CELL, CELL, CELL do
+			for _, s in cells[key(q.x + dx, q.z + dz)] or {} do
+				local e = s[1] - q
+				local dist = e.x * e.x + e.z * e.z
+				if dist < bd then best, bd = s, dist end
+			end
+		end end
+		return best
+	end
+	local function surface(a, b)
+		local prev_side, prev_t
+		for i = 0, 16 do
+			local t = i / 16
+			local q = a + (b - a) * t
+			local s = nearest(q)
+			if s then
+				local side = vector.dot(q - s[1], s[2])
+				if prev_side and prev_side >= 0 and side < 0 then return prev_t + (t - prev_t) * prev_side / (prev_side - side) end
+				prev_side, prev_t = side, t
+			end
+		end
+		return nil
+	end
+	local function pose(t)
+		if t < LEAD then
+			local f = F[1]
+			local back = LEAD - t
+			return v(f[2] - f[5] * back, f[3], f[4] - f[7] * back), v(f[5], 0, f[7]), 100, math.atan2(f[9], f[10])
+		end
+		local a, b, u = lerp(t - LEAD)
+		local mix = function(ia, ib, ic) return v(a[ia] + (b[ia] - a[ia]) * u, a[ib] + (b[ib] - a[ib]) * u, a[ic] + (b[ic] - a[ic]) * u) end
+		return mix(2, 3, 4), mix(5, 6, 7), a[8], math.atan2(a[9], a[10])
+	end
+	local function clip_eye(t)
+		if t < LEAD or t - LEAD > span then return nil end
+		local a, b, u = lerp(t - LEAD)
+		return v(a[17] + (b[17] - a[17]) * u, a[18] + (b[18] - a[18]) * u, a[19] + (b[19] - a[19]) * u)
+	end
+	return { world = { surface = surface }, pose = pose, duration = LEAD + span, warm = LEAD, settings = d.settings, clip_eye = clip_eye }
 end
 
 -- Ollie onto a ledge, roll along it, drop off the end, roll away.
@@ -846,6 +932,19 @@ local function run(route, host, fps, jitter, anim)
 			if g.cam and g.cam.adaptive_orbit and g.cam.adaptive_orbit.constrained then out.conframes += 1 end
 			if g.cam and g.cam.adaptive_orbit then out.orbmax = math.max(out.orbmax, math.abs(math.deg(g.cam.adaptive_orbit.yaw or 0))) end
 			out.mindepth = math.min(out.mindepth, depth)
+			if route.clip_eye then
+				local e = route.clip_eye(sample)
+				if e then
+					local gap = mag(p - e)
+					out.clip_n = (out.clip_n or 0) + 1
+					out.clip_sum = (out.clip_sum or 0) + gap * gap
+					out.clip_max = math.max(out.clip_max or 0, gap)
+					if sample > 3.0 + 1.2 - 0.5 then
+						out.clip_late_n = (out.clip_late_n or 0) + 1
+						out.clip_late = (out.clip_late or 0) + gap * gap
+					end
+				end
+			end
 			if depth <= 0.3 then out.behind += 1 end
 			if depth > 0.05 then
 				local right = vector.normalize(vector.cross(f, shown.up))
@@ -903,10 +1002,19 @@ local function run(route, host, fps, jitter, anim)
 		end
 		prev_root = root
 	end
+	if arg and arg[6] == "dumpclip" then
+		out.dump = {}
+		for path, text in pairs(m.files) do if string.sub(path, 1, 9) == "recorder/" then out.dump[path] = text end end
+	end
 	return out
 end
 
 local rows = {}
+if filter == "=clip" then
+	local ok, data = pcall(require, "clip_data")
+	assert(ok, "no clip_data: run tools/recorder/clip_to_route.py first")
+	table.insert(ROUTES, { "clip", route_clip, { data = data } })
+end
 print(table.concat({ "route", "host", "fps", "frames", "airHFmm", "airHFrelmm", "airRev", "gndHFmm", "pumpcm", "gndRev", "stepcm", "yawdeg", "pitchdeg", "sweep", "floor", "restore", "hard", "guardpct", "recovS", "minclr", "screen", "maxback", "rays", "errs", "snaps", "anim", "dipcm", "dist0", "dist1", "vpitch", "sy", "liftdeg", "lookdeg", "pull", "liftstep", "offdeg", "offland", "yawrev", "sx", "sidemax", "relstep_m", "relstep_t", "relstep_i", "yawstep_deg", "yawstep_t", "yawstep_i", "ycorr_deg", "ycorr_t", "ycorr_i", "minhz", "minhz_t", "minhz_i", "mindepth", "behind", "orbmax", "conframes" }, "\t"))
 for _, r in ROUTES do
 	local name, build, opt = r[1], r[2], r[3]
@@ -914,6 +1022,8 @@ for _, r in ROUTES do
 		for _, host in HOSTS do
 			for _, anim in ANIM_NAMES do for _, rate in RATES do
 				local o = run(build(opt), host, rate[1], rate[2], anim)
+				if o.clip_n then print(string.format("CLIP %s %s %d %s: eye vs recorded rms %.3f m, max %.3f m, %d frames; from 0.5 s before the trigger on rms %.3f m", name, host, rate[1], anim, math.sqrt(o.clip_sum / o.clip_n), o.clip_max, o.clip_n, math.sqrt((o.clip_late or 0) / math.max(o.clip_late_n or 1, 1)))) end
+				if o.dump then for path, text in pairs(o.dump) do print("CLIPFILE " .. path); print(text); print("CLIPEND") end end
 				print(table.concat({ name, host, rate[1], o.frames,
 					string.format("%.2f", o.airhf * 1000), string.format("%.2f", o.airhfrel * 1000), o.airrev,
 					string.format("%.2f", o.gnd_hf * 1000), string.format("%.2f", o.pump * 100), o.pumpn,

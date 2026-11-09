@@ -10,11 +10,12 @@ local Glue = require("glue")
 local DiagModule = require("diag")
 local Menu = require("menu")
 local Commands = require("commands")
+local Recorder = require("recorder")
 local ManualModule = require("manual")
 local CustomUI = require("custom_ui")
 
 local App = {}
-App.VERSION = "1.2.32"
+App.VERSION = "1.2.33"
 
 -- Settings > Binds lists these as "<plugin id>: <action>", so the names do not repeat the plugin's. ReSkate 2.1.2 lists an action
 -- only when it is bound to a real key (a nil key is refused), so each has a default key; the player can record another or clear it.
@@ -69,6 +70,7 @@ function App.steps(deps)
 	-- 2. The glue, and the manual detector it reads (the trick list tells it when a manual starts and ends).
 	steps[#steps + 1] = function()
 		glue = Glue.new{ store = store, camera = camera, diag = diag }
+		glue.recorder = Recorder.new(App.VERSION)
 		app.glue = glue
 		app.manual = ManualModule.new()
 		glue.manual_detector = app.manual
@@ -140,6 +142,10 @@ function App.steps(deps)
 		reskate.on("tick", guarded("tick", function(dt)
 			local started=os.clock()
 			app.ui:tick();glue.custom_ui_open=app.ui.open;glue:tick(dt)
+			if glue.recorder then
+				local okr,why=pcall(glue.recorder.pump,glue.recorder,reskate.time.now()/1000,store.settings)
+				if not okr then glue.recorder=nil;pcall(reskate.log,"dyncam: recorder stopped: "..tostring(why),"warn") end
+			end
 			glue.tick_cost_max=math.max(glue.tick_cost_max or 0,(os.clock()-started)*1000)
 		end))
 		local draws = pcall(reskate.on, "draw", guarded("draw", function(d) glue:draw_return(d) end))

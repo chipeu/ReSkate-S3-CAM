@@ -361,6 +361,11 @@ function Glue:trace_camera_frame(now, original, before_guard, after_guard, final
   end
   tr.hips_off,tr.head_off=hips_off,head_off
  end
+ if self.recorder then
+  -- Only observes. A fault here switches the recorder off and never touches the camera.
+  local okr,why=pcall(self.recorder.frame,self.recorder,self,now,continuous,cause,correction,original,before_guard,after_guard,final,forward,shown_up or vcreate(0,1,0),shown_fov,core_yaw,core_pitch,yaw,pitch,effects,tr.hips_off)
+  if not okr then self.recorder=nil;pcall(reskate.log,"dyncam: recorder stopped: "..tostring(why),"warn") end
+ end
  tr.at,tr.relative,tr.pitch,tr.yaw=now,relative,pitch,yaw
  tr.core_pitch,tr.pitch_offset,tr.effects=core_pitch,pitch-core_pitch,effects
  tr.core_yaw,tr.yaw_offset=core_yaw,yaw_offset

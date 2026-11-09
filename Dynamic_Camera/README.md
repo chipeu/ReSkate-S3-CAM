@@ -1,7 +1,7 @@
 Dynamic Camera
 ==============
 
-Build 1.2.32 for ReSkate 2.1.4-4. Check this line to confirm the installed release. Import the patch ZIP in Mod Manager and choose Replace for aescher-Dynamic_Camera.
+Build 1.2.33 for ReSkate 2.1.4-4. Check this line to confirm the installed release. Import the patch ZIP in Mod Manager and choose Replace for aescher-Dynamic_Camera.
 The archive retains the existing installation folder so saved camera settings and presets remain in place; no folder renaming is needed.
 The game's Controls page still prefixes actions with that folder name, which may clip the short action labels.
 Enable the changed plugin in ReSkate's Plugin Manager when prompted. Keep the same installed mod folder name to retain settings.

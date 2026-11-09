@@ -99,7 +99,7 @@ def main():
         ('test_glue.lua', ['real']), ('test_manual.lua', []), ('test_offboard.lua', []),
         ('test_snapguard.lua', []), ('test_snaps.lua', []), ('test_diag.lua', []),
         ('test_motion_diag_128.lua', []), ('test_tick_io_132.lua', []),
-        ('test_final_pose_1219.lua', []), ('test_hill_framing_1222.lua', []), ('test_slope_landing_1225.lua', []), ('test_landing_bound_1229.lua', []), ('test_vert_lookdown_1231.lua', []), ('test_orbit_reversal_1232.lua', []),
+        ('test_final_pose_1219.lua', []), ('test_hill_framing_1222.lua', []), ('test_slope_landing_1225.lua', []), ('test_landing_bound_1229.lua', []), ('test_vert_lookdown_1231.lua', []), ('test_orbit_reversal_1232.lua', []), ('test_recorder_1233.lua', []),
         ('test_dyncam4.lua', []), ('run_parity.lua', ['self']), ('run_parity.lua', ['strict', 'unchanged']),
         ('run_adaptive_parity_129.lua', []),
         # Retired predictive route integration remains tested against its actual shipped source.

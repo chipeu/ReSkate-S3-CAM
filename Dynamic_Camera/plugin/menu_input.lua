@@ -7,7 +7,7 @@ local KEY="menu_shortcut"
 local reserved={Escape=true,Insert=true,Enter=true,Space=true,Tab=true,
  -- Reserved function keys; preserve the existing shortcut exclusions.
  F5=true,F6=true,F7=true,F8=true,F9=true,F10=true,
- ["Ctrl+Shift+D"]=true,["Ctrl+Shift+V"]=true,["Ctrl+Shift+End"]=true,["Alt+F4"]=true}
+ ["Ctrl+Shift+D"]=true,["Ctrl+Shift+V"]=true,["Ctrl+Shift+End"]=true,["Ctrl+Shift+R"]=true,["Alt+F4"]=true}
 local keys={}
 for i=0,9 do keys[#keys+1]=tostring(i) end
 for i=65,90 do keys[#keys+1]=string.char(i) end

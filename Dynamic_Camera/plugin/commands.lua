@@ -171,6 +171,28 @@ function Commands.install(deps)
 		end
 	end)
 
+	register("dyncam_rec", "Dynamic Camera flight recorder: saves the seconds around a camera fault to recorder/ in the data folder: dyncam_rec 0|1|clip", function(args)
+		local rec = glue.recorder
+		if not rec then
+			say("The recorder is not running.")
+			return
+		end
+		if args[1] == nil then
+			say("dyncam_rec = " .. rec:status())
+			return
+		end
+		if string.lower(args[1]) == "clip" then
+			say(rec:trigger(reskate.time.now() / 1000, "console", 1) and "Saving the seconds around now." or "Not saved: the recorder is busy or off.")
+			return
+		end
+		local v = parse_bool(args[1])
+		if v == nil then
+			err("dyncam_rec 0|1|clip")
+			return
+		end
+		rec:set_off(not v)
+		say("dyncam_rec = " .. rec:status())
+	end)
 	register("dyncam_side", "Dynamic Camera shoulder side: switch (Ctrl+Shift+S, or the 'switch shoulder side' action on the Binds page), left or right: dyncam_side swap|left|right",
 		function(args)
 			local word = args[1] and string.lower(args[1])
