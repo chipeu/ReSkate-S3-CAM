@@ -4,11 +4,19 @@
   clip.py show <file> [seconds]   summary and a per-frame timeline around the trigger (default 0.35 s each side)
   clip.py watch [folder]          print a summary of each new clip as it appears; stops with Ctrl+C
   clip.py latest [folder]         the same summary for the newest clip
+
+The folder is <game>/Mods/.reskate_plugin_data/aescher-Dynamic_Camera/recorder. Without one, DYNCAM_CLIP_DIR is used.
 """
 import glob, math, os, sys, time
 
-DEFAULT = r"F:/Games/ReSkate Live/Mods/.reskate_plugin_data/aescher-Dynamic_Camera/recorder"
 TEXT = {"shot", "cause"}
+
+
+def clip_folder():
+    folder = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("DYNCAM_CLIP_DIR")
+    if not folder:
+        sys.exit("Give the recorder folder as an argument or in DYNCAM_CLIP_DIR")
+    return folder
 
 
 def load(path):
@@ -88,13 +96,13 @@ def main():
     if cmd == "show":
         summary(sys.argv[2], float(sys.argv[3]) if len(sys.argv) > 3 else 0.35)
     elif cmd == "latest":
-        found = clips(sys.argv[2] if len(sys.argv) > 2 else DEFAULT)
+        found = clips(clip_folder())
         if found:
             summary(found[-1])
         else:
             print("no clips")
     elif cmd == "watch":
-        folder = sys.argv[2] if len(sys.argv) > 2 else DEFAULT
+        folder = clip_folder()
         seen = set(clips(folder))
         print("watching", folder, "| existing clips", len(seen), flush=True)
         while True:
