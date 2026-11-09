@@ -1,15 +1,15 @@
 # Golden traces: format and commands
 
-The C++ camera (F:\Dev\ReSkate, read only) is run through scripted scenarios by `trace_gen.cpp`. Each scenario becomes one
+The C++ camera (a ReSkate source checkout, read only) is run through scripted scenarios by `trace_gen.cpp`. Each scenario becomes one
 trace the Luau camera is replayed against (`tests\replay.lua`).
 
 ## Commands
 
-Regenerate (builds `trace_gen.exe` against F:\Dev\ReSkate with MSVC, clears `out\`, runs every scenario):
+Regenerate (builds `trace_gen.exe` against the ReSkate source with MSVC, clears `out\`, runs every scenario):
 
-    powershell -NoProfile -ExecutionPolicy Bypass -File F:\Dev\DynCam-Plugin\tools\trace\regen.ps1
+    powershell -NoProfile -ExecutionPolicy Bypass -File tools\trace\regen.ps1 -EngineRoot <ReSkate source folder>
 
-Run the parity test (from F:\Dev\DynCam-Plugin):
+Run the parity test (from the repository root):
 
     tools\luau_run.exe -I Dynamic_Camera\plugin -I tests -I tools\trace\out tests\run_parity.lua
     tools\luau_run.exe -I Dynamic_Camera\plugin -I tests -I tools\trace\out tests\run_parity.lua only mixed_high

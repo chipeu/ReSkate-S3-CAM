@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Golden-trace generator for the Dynamic Camera Luau port.
 //
-// Runs the C++ reference camera (F:\Dev\ReSkate\Engine\Game\Camera, read only) through scripted scenarios and writes, per
+// Runs the C++ reference camera (Engine\Game\Camera in the ReSkate source, read only) through scripted scenarios and writes, per
 // scenario, every input it was given (dt, subject snapshot, extras), every world ray it cast in order (from, to, hit),
 // and the output pose plus the key FrameDebug values. The Luau side (tests\replay.lua) feeds the same inputs to the port,
 // answers its rays from the recording and compares. Format: tools\trace\FORMAT.md.
